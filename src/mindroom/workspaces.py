@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import threading
 from dataclasses import dataclass
+from errno import EACCES, EINVAL, ENODATA, ENOTSUP, EPERM
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from mindroom.atomic_file import atomic_write_file_at
 from mindroom.constants import RuntimePaths, config_relative_path
-from mindroom.path_confinement import resolve_path_within_root
+from mindroom.path_confinement import (
+    open_directory_within_root,
+    open_regular_file_within_root,
+    resolve_path_within_root,
+)
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 
 if TYPE_CHECKING:
@@ -22,6 +30,28 @@ _MIND_TEMPLATE_DIR = Path(__file__).resolve().parent / "cli" / "templates" / "mi
 # Agent builds now run on worker threads (#1260), so concurrent scaffolding of
 # the same workspace must not interleave template copies or link reconciliation.
 _WORKSPACE_MUTATION_LOCK = threading.Lock()
+
+
+def _copy_xattrs(source_fd: int, destination_fd: int) -> None:
+    """Best-effort copy extended attributes with the same exclusions as copy2."""
+    list_xattrs = getattr(os, "listxattr", None)
+    get_xattr = getattr(os, "getxattr", None)
+    set_xattr = getattr(os, "setxattr", None)
+    if list_xattrs is None or get_xattr is None or set_xattr is None:
+        return
+    try:
+        names = list_xattrs(source_fd)
+    except OSError as exc:
+        if exc.errno in {ENOTSUP, ENODATA, EINVAL}:
+            return
+        raise
+    for name in names:
+        try:
+            value = get_xattr(source_fd, name)
+            set_xattr(destination_fd, name, value)
+        except OSError as exc:
+            if exc.errno not in {EACCES, EPERM, ENOTSUP, ENODATA, EINVAL}:
+                raise
 
 
 @dataclass(frozen=True)
@@ -97,6 +127,9 @@ def validate_local_copy_source_dir(
         if source_path.is_symlink():
             msg = f"{field_name} must not contain symlinks: {source_path}"
             raise ValueError(msg)
+        if not source_path.is_dir() and not source_path.is_file():
+            msg = f"{field_name} must contain only regular files and directories: {source_path}"
+            raise ValueError(msg)
     return resolved_source_dir
 
 
@@ -170,27 +203,46 @@ def _copy_workspace_template(
     workspace_path.mkdir(parents=True, exist_ok=True)
     resolved_template_dir = validate_workspace_template_dir(template_dir)
 
-    with _WORKSPACE_MUTATION_LOCK:
+    with (
+        _WORKSPACE_MUTATION_LOCK,
+        open_directory_within_root(workspace_path) as workspace_fd,
+        open_directory_within_root(resolved_template_dir) as template_fd,
+    ):
         for source_path, relative_path in _iter_workspace_template_entries(resolved_template_dir):
-            destination_path = resolve_relative_path_within_root(
+            resolve_relative_path_within_root(
                 workspace_path,
                 relative_path,
                 field_name="workspace template destination",
                 root_label="workspace root",
             )
             if source_path.is_dir():
-                destination_path.mkdir(parents=True, exist_ok=True)
+                with open_directory_within_root(workspace_fd, relative_path, create=True):
+                    pass
                 continue
-            if destination_path.exists() and not force:
-                continue
-            destination_path.parent.mkdir(parents=True, exist_ok=True)
-            # Publish atomically so concurrent readers never see partial files.
-            temp_path = destination_path.with_name(f".{destination_path.name}.tmp")
-            try:
-                shutil.copy2(source_path, temp_path)
-                temp_path.replace(destination_path)
-            finally:
-                temp_path.unlink(missing_ok=True)
+            with open_directory_within_root(workspace_fd, relative_path.parent, create=True) as parent_fd:
+                if not force:
+                    try:
+                        os.stat(relative_path.name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        continue
+                with open_regular_file_within_root(template_fd, relative_path) as source_fd:
+                    source_file = os.fdopen(os.dup(source_fd), "rb")
+                    with source_file:
+                        source_stat = os.fstat(source_file.fileno())
+                        with atomic_write_file_at(
+                            parent_fd,
+                            relative_path.name,
+                            file_mode=stat.S_IMODE(source_stat.st_mode),
+                        ) as output_file:
+                            shutil.copyfileobj(source_file, output_file)
+                            output_file.flush()
+                            os.utime(
+                                output_file.fileno(),
+                                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+                            )
+                            _copy_xattrs(source_file.fileno(), output_file.fileno())
 
 
 def ensure_workspace_template(
