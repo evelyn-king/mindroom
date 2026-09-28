@@ -1443,6 +1443,89 @@ class TestAgentBot(AgentBotTestBase):
         assert watched_paths == [resolved_config_path]
 
     @pytest.mark.asyncio
+    async def test_orchestrator_main_starts_provisioning_heartbeat(self, tmp_path: Path) -> None:
+        """Startup runs the paired-install heartbeat as a background task and cancels it at shutdown."""
+        reset_runtime_state()
+        runtime_paths = self._runtime_paths(tmp_path)
+        heartbeat_paths: list[RuntimePaths] = []
+        heartbeat_started = asyncio.Event()
+        heartbeat_cancelled = asyncio.Event()
+        mock_orchestrator = _mock_runtime_orchestrator()
+        mock_orchestrator.stop = AsyncMock()
+
+        async def _heartbeat(paths: RuntimePaths) -> None:
+            heartbeat_paths.append(paths)
+            heartbeat_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                heartbeat_cancelled.set()
+                raise
+
+        async def _start() -> None:
+            await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
+            msg = "stop after heartbeat start"
+            raise RuntimeError(msg)
+
+        mock_orchestrator.start = AsyncMock(side_effect=_start)
+
+        with (
+            patch("mindroom.orchestrator.setup_logging"),
+            patch("mindroom.orchestrator.sync_env_to_credentials"),
+            patch("mindroom.orchestrator._MultiAgentOrchestrator", return_value=mock_orchestrator),
+            patch("mindroom.orchestrator._run_auxiliary_task_forever", new=AsyncMock()),
+            patch("mindroom.orchestrator.run_provisioning_heartbeat", side_effect=_heartbeat),
+            pytest.raises(RuntimeError, match="stop after heartbeat start"),
+        ):
+            await main(log_level="INFO", runtime_paths=runtime_paths, api=False)
+
+        assert heartbeat_paths == [runtime_paths]
+        assert heartbeat_cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_main_cleanup_survives_failed_heartbeat(self, tmp_path: Path) -> None:
+        """A failed heartbeat is logged when it dies, then neither skips cleanup nor replaces the runtime's error."""
+        reset_runtime_state()
+        mock_orchestrator = _mock_runtime_orchestrator()
+        mock_orchestrator.stop = AsyncMock()
+        shutdown_worker_manager = MagicMock()
+        background_logger = MagicMock()
+        failure_logged = asyncio.Event()
+        background_logger.exception.side_effect = lambda *_args, **_kwargs: failure_logged.set()
+
+        async def _heartbeat(_paths: RuntimePaths) -> None:
+            msg = "stale SSL_CERT_FILE"
+            raise FileNotFoundError(msg)
+
+        async def _start() -> None:
+            await asyncio.wait_for(failure_logged.wait(), timeout=1)
+            assert not shutdown_worker_manager.called
+            msg = "orchestrator failed"
+            raise RuntimeError(msg)
+
+        mock_orchestrator.start = AsyncMock(side_effect=_start)
+
+        with (
+            patch("mindroom.background_tasks.logger", new=background_logger),
+            patch("mindroom.orchestrator.setup_logging"),
+            patch("mindroom.orchestrator.sync_env_to_credentials"),
+            patch("mindroom.orchestrator._MultiAgentOrchestrator", return_value=mock_orchestrator),
+            patch("mindroom.orchestrator._run_auxiliary_task_forever", new=AsyncMock()),
+            patch("mindroom.orchestrator.run_provisioning_heartbeat", side_effect=_heartbeat),
+            patch("mindroom.orchestrator.shutdown_primary_worker_manager", new=shutdown_worker_manager),
+            pytest.raises(RuntimeError, match="orchestrator failed"),
+        ):
+            await main(log_level="INFO", runtime_paths=self._runtime_paths(tmp_path), api=False)
+
+        background_logger.exception.assert_called_once_with(
+            "Background task failed",
+            task_name="provisioning_heartbeat",
+            error="stale SSL_CERT_FILE",
+        )
+        mock_orchestrator.stop.assert_awaited_once()
+        shutdown_worker_manager.assert_called_once_with()
+
+    @pytest.mark.asyncio
     async def test_orchestrator_main_commits_runtime_storage_root_before_logging_and_credential_sync(
         self,
         tmp_path: Path,
