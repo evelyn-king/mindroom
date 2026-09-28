@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING, Self
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -13,7 +14,9 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import scripts.local_mindroom_provisioning_service as provisioning
+from mindroom.cli import connect as cli_connect
 from mindroom.matrix import provisioning as matrix_provisioning
+from tests.test_cli_connect import _CONNECTED, _START, _fake_transport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -759,6 +762,31 @@ def test_client_error_detail_constants_match_service() -> None:
     """The runtime client classifies register-agent 403s by these exact strings."""
     assert matrix_provisioning._CONNECTION_REVOKED_DETAIL == provisioning.CONNECTION_REVOKED_DETAIL
     assert matrix_provisioning._NAMESPACE_MISMATCH_DETAIL == provisioning.NAMESPACE_MISMATCH_DETAIL
+
+
+def test_cli_device_pairing_messages_match_service_models(tmp_path: Path) -> None:
+    """The CLI's device-pairing requests and its response fixtures satisfy the service schemas."""
+    calls: list[tuple[str, dict[str, object]]] = []
+    post = _fake_transport([httpx.Response(200, json=_START), httpx.Response(200, json=_CONNECTED)], calls)
+
+    cli_connect.run_device_pairing(
+        provisioning_url="https://provisioning.example",
+        client_name="devbox",
+        client_fingerprint=cli_connect.local_client_fingerprint(config_path=tmp_path / "config.yaml"),
+        matrix_ssl_verify=True,
+        announce=lambda _session: None,
+        post_request=post,
+        sleep=lambda _seconds: None,
+    )
+
+    (start_url, start_payload), (poll_url, poll_payload) = calls
+    service_paths = {route.path for route in provisioning.create_app(_service_config(tmp_path / "state.json")).routes}
+    assert urlparse(start_url).path in service_paths
+    assert urlparse(poll_url).path in service_paths
+    provisioning.DevicePairStartRequest.model_validate(start_payload)
+    provisioning.DevicePairPollRequest.model_validate(poll_payload)
+    provisioning.DevicePairStartResponse.model_validate(_START)
+    provisioning.DevicePairPollResponse.model_validate(_CONNECTED)
 
 
 def test_device_start_retries_colliding_pair_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
