@@ -23,7 +23,7 @@ from mindroom.constants import PROVIDER_ENV_KEYS, RuntimePaths, runtime_env_path
 from mindroom.credential_policy import is_oauth_token_service
 from mindroom.credentials import get_runtime_shared_credentials_manager, validate_service_name
 from mindroom.logging_config import get_logger
-from mindroom.runtime_env_policy import CREDENTIAL_SEEDS_FILE_ENV, CREDENTIAL_SEEDS_JSON_ENV
+from mindroom.runtime_env_policy import CREDENTIAL_SEEDS_FILE_ENV, CREDENTIAL_SEEDS_JSON_ENV, is_unset_env_value
 
 logger = get_logger(__name__)
 
@@ -55,12 +55,13 @@ class _CredentialSeedDeclaration:
 def _read_secret_from_env(name: str, runtime_paths: RuntimePaths) -> tuple[str, str] | None:
     """Read a secret from NAME or NAME_FILE and return it with the variable that supplied it.
 
-    A non-empty `NAME` wins without touching `NAME_FILE`. Otherwise, if
-    `NAME_FILE` points to a readable file with non-blank contents, return its
-    stripped contents. Else return None.
+    A usable `NAME` wins without touching `NAME_FILE`. Otherwise, if `NAME_FILE`
+    points to a readable file with usable contents, return its stripped contents.
+    Else return None. Blank values and unedited starter-template placeholders
+    count as unset in both places.
     """
     val = runtime_paths.env_value(name)
-    if val:
+    if val is not None and not is_unset_env_value(name, val):
         return val, name
     file_var = f"{name}_FILE"
     file_path = runtime_env_path(runtime_paths, file_var)
@@ -70,12 +71,12 @@ def _read_secret_from_env(name: str, runtime_paths: RuntimePaths) -> tuple[str, 
         except Exception:
             # Avoid noisy logs here; callers can handle None gracefully
             return None
-        return (content, file_var) if content else None
+        return None if is_unset_env_value(name, content) else (content, file_var)
     return None
 
 
 def get_secret_from_env(name: str, runtime_paths: RuntimePaths) -> str | None:
-    """Read a secret from NAME or NAME_FILE; None when NAME is empty and NAME_FILE supplies no non-blank contents."""
+    """Read a secret from NAME or NAME_FILE; None when neither supplies a usable (non-blank, non-placeholder) value."""
     secret = _read_secret_from_env(name, runtime_paths)
     return secret[0] if secret else None
 

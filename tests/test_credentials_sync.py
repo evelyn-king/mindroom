@@ -23,7 +23,9 @@ from mindroom.credentials_sync import (
     get_secret_from_env,
     sync_env_to_credentials,
 )
+from mindroom.model_loading import missing_model_api_key_provider
 from mindroom.runtime_env_policy import CREDENTIALS_ENCRYPTION_KEY_ENV, SHARED_CREDENTIALS_PATH_ENV
+from tests.conftest import load_config_yaml
 
 
 def _runtime_paths(
@@ -88,6 +90,59 @@ class TestCredentialsSync:
     def credentials_manager(self, temp_credentials_dir: Path) -> CredentialsManager:
         """Create a CredentialsManager with a temporary directory."""
         return CredentialsManager(base_path=temp_credentials_dir)
+
+    @pytest.mark.parametrize(
+        ("env_file_text", "exported"),
+        [
+            ("OPENAI_API_KEY=your-openai-key-here\n", None),
+            ("OPENAI_API_KEY=your-openai-key-here # replace with your key\n", None),
+            ("", "your-openai-key-here"),
+        ],
+        ids=["env-file", "env-file-inline-comment", "exported"],
+    )
+    def test_template_placeholder_is_not_synced(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        env_file_text: str,
+        exported: str | None,
+    ) -> None:
+        """A starter-template placeholder never becomes a stored key, so the dashboard still reports the provider."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        if exported is not None:
+            monkeypatch.setenv("OPENAI_API_KEY", exported)
+        (tmp_path / ".env").write_text(env_file_text, encoding="utf-8")
+        runtime_paths = _runtime_paths(tmp_path)
+        assert get_secret_from_env("OPENAI_API_KEY", runtime_paths) is None
+
+        sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert get_api_key_for_provider("openai", runtime_paths) is None
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "agents: {}\nmodels:\n  default:\n    provider: openai\n    id: gpt-6-astra\nrouter:\n  model: default\n",
+            encoding="utf-8",
+        )
+        assert missing_model_api_key_provider(load_config_yaml(config_path), runtime_paths, "default") == "openai"
+
+    @pytest.mark.parametrize(
+        ("file_text", "expected"),
+        [("sk-from-file\n", "sk-from-file"), ("your-openai-key-here\n", None), ("  \n", None)],
+    )
+    def test_unset_name_falls_through_to_name_file_with_the_same_rule(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        file_text: str,
+        expected: str | None,
+    ) -> None:
+        """A placeholder in NAME does not block NAME_FILE, whose contents follow the same unset rule."""
+        secret_file = tmp_path / "openai-key"
+        secret_file.write_text(file_text, encoding="utf-8")
+        monkeypatch.setenv("OPENAI_API_KEY", "your-openai-key-here")
+        monkeypatch.setenv("OPENAI_API_KEY_FILE", str(secret_file))
+
+        assert get_secret_from_env("OPENAI_API_KEY", _runtime_paths(tmp_path)) == expected
 
     def test_sync_env_to_credentials_new_keys(
         self,
