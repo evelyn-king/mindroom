@@ -5635,7 +5635,12 @@ expose = [
     "require_runtime_paths_arg",
 ]
 from = ["mindroom.matrix.client_session"]
-visibility = ["mindroom.matrix._owned_session", "mindroom.matrix.typing", "mindroom.desktop.session"]
+visibility = [
+    "mindroom.matrix._owned_session",
+    "mindroom.matrix.typing",
+    "mindroom.desktop.session",
+    "mindroom.orchestration.runtime",
+]
 
 [[interfaces]]
 expose = [
