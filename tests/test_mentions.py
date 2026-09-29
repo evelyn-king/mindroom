@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from time import process_time
 from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
@@ -20,6 +21,29 @@ from mindroom.tool_system.events import _TOOL_TRACE_KEY, ToolTraceEntry
 from tests.identity_helpers import actual_entity_usernames, persist_entity_accounts
 
 _BOUND_RUNTIME_PATHS: dict[int, constants_mod.RuntimePaths] = {}
+
+
+def test_bulk_mentions_bound_overlap_and_deduplication_work() -> None:
+    """Bulk mention scanning and ordered deduplication finish within a bounded CPU budget."""
+    distinct_user_ids = [f"@a{index}:b" for index in range(10_000)]
+    for user_ids, expected_user_ids in (
+        (["@a:b"] * 12_000, ["@a:b"]),
+        ([*distinct_user_ids, *distinct_user_ids[:2]], distinct_user_ids),
+    ):
+        text = " ".join(user_ids) + " "
+        started = process_time()
+        tokens = mentions_module._scan_mention_tokens(text)
+        assert process_time() - started < 0.5
+        assert [token.explicit_user_id for token in tokens] == user_ids
+
+        replacements = [
+            mentions_module._MentionReplacement(start=0, end=0, plain_text="", markdown_text="", user_id=user_id)
+            for user_id in user_ids
+        ]
+        started = process_time()
+        mentioned_user_ids = mentions_module._mentioned_user_ids_from_replacements(replacements)
+        assert process_time() - started < 0.5
+        assert mentioned_user_ids == expected_user_ids
 
 
 def _default_runtime_paths() -> constants_mod.RuntimePaths:
