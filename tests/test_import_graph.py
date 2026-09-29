@@ -148,19 +148,12 @@ _ALLOWED_THIRD_PARTY_ROOTS: dict[str, frozenset[str]] = {
         {
             "annotated_doc",
             "authlib",
-            "bcrypt",
-            "chardet",
-            "charset_normalizer",
             "email_validator",
             "fastapi",
-            "joserfc",
             "orjson",
             "pydantic_extra_types",
             "python_multipart",
-            "requests",
-            "socks",
             "starlette",
-            "urllib3",
         },
     ),
 }
@@ -344,6 +337,11 @@ def test_service_status_pairing_check_does_not_load_matrix_or_http_clients(tmp_p
 def test_primary_runtime_defers_heavy_optional_dependencies() -> None:
     """The orchestrator import must leave provider, storage, and ML/data engines unloaded."""
     _assert_probe_clean("mindroom.orchestrator", _HEAVY_OPTIONAL_RUNTIME_ROOTS)
+
+
+def test_api_app_defers_heavy_optional_dependencies() -> None:
+    """The API app import must leave the same engines and the authlib OAuth clients unloaded."""
+    _assert_probe_clean("mindroom.api.main", (*_HEAVY_OPTIONAL_RUNTIME_ROOTS, "authlib.integrations", "joserfc"))
 
 
 def test_worker_retirement_is_a_standard_library_leaf() -> None:
