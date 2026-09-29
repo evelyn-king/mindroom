@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import time
 from pathlib import Path
@@ -667,7 +668,10 @@ async def test_bridge_pins_controller_before_consuming_durable_input(  # noqa: C
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """CLI attaches durable admission before the transport runs and closes both owners."""
+    """CLI attaches durable admission before the transport runs and closes both owners.
+
+    This app-only run is the Windows target, so it must not load the POSIX-only shell modules.
+    """
     client = nio.AsyncClient("https://matrix.example.org", config=nio.AsyncClientConfig(encryption_enabled=False))
     lifecycle = []
     admitted = asyncio.Event()
@@ -741,6 +745,8 @@ async def test_bridge_pins_controller_before_consuming_durable_input(  # noqa: C
         bridge_options.update(kwargs)
         return Bridge()
 
+    monkeypatch.setitem(sys.modules, "mindroom.desktop.shell_prompt", None)
+    monkeypatch.setitem(sys.modules, "mindroom.desktop.login_environment", None)
     monkeypatch.setattr("mindroom.desktop.session.open_desktop_client", open_client)
     monkeypatch.setattr("mindroom.desktop.session.prepare_desktop_client", prepare_client)
     monkeypatch.setattr("mindroom.matrix.olm_to_device.resolve_pinned_device", resolve_device)
@@ -888,7 +894,7 @@ async def test_folder_and_shell_bridge_needs_no_gui_and_revokes_shell_access_on_
     monkeypatch.setattr("mindroom.desktop.bridge_components.PyAutoGuiDesktopProvider", forbidden)
     monkeypatch.setattr(desktop_cli, "_request_required_desktop_permissions", forbidden)
     monkeypatch.setattr(
-        "mindroom.desktop.bridge_components.capture_login_environment",
+        "mindroom.desktop.login_environment.capture_login_environment",
         AsyncMock(return_value={"PATH": "/usr/bin:/bin"}),
     )
     monkeypatch.setattr(desktop_cli, "_terminal_input_fd", lambda: None)

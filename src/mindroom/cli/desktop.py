@@ -449,8 +449,6 @@ def desktop_setup(
 ) -> None:
     """Pair and save the connection shared with the macOS app."""
     from mindroom.constants import runtime_matrix_homeserver  # noqa: PLC0415
-
-    # Native configuration uses Unix file locks; CLI help must remain portable.
     from mindroom.desktop.native_config import (  # noqa: PLC0415
         NativeBrowserConfig,
         NativeCaptureConfig,
@@ -630,10 +628,10 @@ def desktop_access(
     ),
 ) -> None:
     """Save read-only folders and shell requests shared with the macOS app; omitted options keep saved values."""
-    # Native configuration uses Unix file locks; CLI help must remain portable.
     from mindroom.desktop.native_config import (  # noqa: PLC0415
         NativeConfigError,
         native_config_path,
+        require_supported_local_access,
         save_native_config,
     )
 
@@ -646,6 +644,7 @@ def desktop_access(
     try:
         config = _saved_enabled_config(path)
         edited = _edited_local_access(config, allow_folder, clear_folders=clear_folders, shell=shell)
+        require_supported_local_access(edited)
         if edited != config:
             config = save_native_config(path, edited, expected_revision=config.revision)
             changed = True
@@ -886,7 +885,6 @@ def _resolve_run_config(
     browser_timeout_seconds: int | None,
 ) -> NativeDesktopConfig:
     """Resolve one run without combining a new controller with saved authority."""
-    # Native configuration uses Unix file locks; CLI help must remain portable.
     from mindroom.desktop.native_config import (  # noqa: PLC0415
         NativeBrowserConfig,
         NativeCaptureConfig,
@@ -1008,7 +1006,6 @@ async def _run_bridge(
         open_desktop_client,
         prepare_desktop_client,
     )
-    from mindroom.desktop.shell_prompt import serve_terminal_shell_approvals  # noqa: PLC0415
     from mindroom.desktop.transport import DesktopTransport  # noqa: PLC0415
     from mindroom.matrix.olm_to_device import resolve_pinned_device  # noqa: PLC0415
 
@@ -1053,6 +1050,9 @@ async def _run_bridge(
             ),
         )
         if config.shell.enabled:
+            # Terminal approval needs termios; the bridge builder already refused shell access without POSIX.
+            from mindroom.desktop.shell_prompt import serve_terminal_shell_approvals  # noqa: PLC0415
+
             approvals = asyncio.create_task(
                 serve_terminal_shell_approvals(bridge, input_fd=_terminal_input_fd(), output=sys.stdout),
                 name="desktop_shell_approvals",
