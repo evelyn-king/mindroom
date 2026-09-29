@@ -278,6 +278,17 @@ class UpdateAccountStatusRequest(BaseModel):
     reason: str | None = None
 
 
+def _update_account_auth_ban(sb: Any, account_id: str, status: str | None) -> None:
+    """Apply a saved account status to Auth; failed updates can be retried."""
+    if status is not None:
+        try:
+            sb.auth.admin.update_user_by_id(
+                account_id, {"ban_duration": "876000h" if status == "suspended" else "none"}
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Failed to update account authentication") from exc
+
+
 @router.put("/admin/accounts/{account_id}/status", response_model=UpdateAccountStatusResponse)
 async def update_account_status(
     account_id: str,
@@ -321,6 +332,7 @@ async def update_account_status(
             resource_id=account_id,
             details={"status": request.status, "reason": request.reason},
         )
+        _update_account_auth_ban(sb, result.data[0]["id"], request.status)
 
         return {"status": "success", "account_id": account_id, "new_status": request.status}  # noqa: TRY300
     except HTTPException:
@@ -558,8 +570,6 @@ async def admin_update(
     try:
         data.pop("id", None)
         result = sb.table(resource).update(data).eq("id", resource_id).execute()
-        if resource == "accounts" and result.data:
-            invalidate_account_auth_cache(result.data[0]["id"])
 
         # Log admin update
         audit_log_entry(
@@ -569,8 +579,13 @@ async def admin_update(
             resource_id=resource_id,
             details={"data": data},
         )
+        if resource == "accounts" and result.data:
+            invalidate_account_auth_cache(result.data[0]["id"])
+            _update_account_auth_ban(sb, result.data[0]["id"], data.get("status"))
 
         return {"data": result.data[0] if result.data else None}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Error updating resource")
         raise HTTPException(status_code=400, detail="Invalid request") from None
