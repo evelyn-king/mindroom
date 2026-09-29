@@ -28,6 +28,7 @@ from mindroom.coalescing_batch import (
     build_prepared_turn,
     is_active_follow_up_coalescing_key,
     requester_coalescing_key,
+    tagged_coalesced_prompt,
 )
 from mindroom.config.main import Config
 from mindroom.dispatch_handoff import PendingDispatchMetadata, PreparedIngress
@@ -42,6 +43,7 @@ from mindroom.execution_preparation import _messages_with_current_prompt
 from mindroom.ingress_lanes import LaneDelivery, ReceiptLaneKey
 from mindroom.runtime_shutdown import SYNC_RESTART_SHUTDOWN
 from mindroom.timestamp_formatting import format_timestamp_ms
+from mindroom.turn_record import SourceEventMetadata
 from tests.conftest import make_pending_event
 
 if TYPE_CHECKING:
@@ -167,6 +169,52 @@ def test_coalesced_message_tags_carry_current_member_display_names() -> None:
         '<msg event_id="$a1:localhost" from="@user:localhost" display_name="Banana Man" ts="2026-03-20 08:15 PDT">'
     ) in turn.event.body
     assert '<msg event_id="$a2:localhost" from="@unnamed:localhost" ts="2026-03-20 08:16 PDT">' in turn.event.body
+
+
+def test_coalesced_agent_replies_keep_their_author_while_running_as_their_human() -> None:
+    """Replies an agent wrote for a human are tagged as the agent's words, and the batch runs as that human."""
+    room = nio.MatrixRoom("!room:localhost", "@mindroom:localhost")
+    agent = "@mindroom_research:localhost"
+    pending_events = []
+    for event_id, body, timestamp in (
+        ("$r1:localhost", "first", 1_774_019_700_000),
+        ("$r2:localhost", "second", 1_774_019_760_000),
+    ):
+        event = _text_event(event_id, body, timestamp)
+        event.sender = agent
+        pending = make_pending_event(event, room, source_kind="message", requester_user_id="@owner:localhost")
+        pending_events.append(replace(pending, event=replace(pending.event, acts_for_requester=True)))
+
+    turn = build_prepared_turn(
+        CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner(agent)),
+        pending_events,
+        timestamp_formatter=lambda timestamp_ms: format_timestamp_ms(timestamp_ms, timezone="America/Los_Angeles"),
+    )
+
+    assert turn.requester_user_id == "@owner:localhost"
+    assert turn.current_prompt_is_structured is True
+    assert '<msg event_id="$r1:localhost" from="@mindroom_research:localhost"' in turn.event.body
+    assert '<msg event_id="$r2:localhost" from="@mindroom_research:localhost"' in turn.event.body
+    assert "@owner:localhost" not in turn.event.body
+
+    # The persisted record keeps both identities: the human owns each source, the agent stays its speaker.
+    record = turn.handled_turn
+    assert record.source_event_metadata is not None
+    persisted = {
+        event_id: SourceEventMetadata._from_raw(metadata._to_record())
+        for event_id, metadata in record.source_event_metadata.items()
+    }
+    assert all(record.requester_id_for_source(event_id) == "@owner:localhost" for event_id in persisted)
+    regenerated = tagged_coalesced_prompt(
+        record.source_event_ids,
+        dict(record.source_event_prompts or {}),
+        {event_id: metadata for event_id, metadata in persisted.items() if metadata is not None},
+        timestamp_formatter=lambda _timestamp_ms: None,
+        member_display_names={},
+    )
+    assert regenerated is not None
+    assert '<msg event_id="$r1:localhost" from="@mindroom_research:localhost">' in regenerated
+    assert "@owner:localhost" not in regenerated
 
 
 def test_prepared_turn_carries_structured_flag_and_metadata() -> None:
@@ -828,6 +876,45 @@ async def test_thread_messages_inside_debounce_window_still_coalesce() -> None:
         ["$first:localhost", "$second:localhost"],
     ]
     assert "quick succession" in batches[0].event.body
+
+
+@pytest.mark.asyncio
+async def test_one_agents_messages_for_different_requesters_dispatch_as_separate_turns() -> None:
+    """Replies one agent wrote for different humans, or for itself, never form one mixed-requester batch."""
+    batches: list[PreparedTurn] = []
+    failures: list[list[str]] = []
+
+    async def dispatch_batch(batch: PreparedTurn) -> None:
+        batches.append(batch)
+
+    gate = CoalescingGate(
+        dispatch_turn=dispatch_batch,
+        debounce_seconds=lambda: 1.0,
+        is_shutting_down=lambda: False,
+        on_dispatch_failure=lambda failed: failures.append([pending.event.event_id for pending in failed]),
+    )
+    agent = "@mindroom_research:localhost"
+    key = CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner(agent))
+    room = nio.MatrixRoom("!room:localhost", "@mindroom:localhost")
+    for event_id, requester, timestamp in (
+        ("$e1:localhost", "@alice:localhost", 1_000_000),
+        ("$e2:localhost", "@bob:localhost", 1_000_200),
+        ("$e3:localhost", agent, 1_000_400),
+    ):
+        event = _text_event(event_id, event_id, timestamp)
+        event.sender = agent
+        pending = make_pending_event(event, room, source_kind="message", requester_user_id=requester)
+        pending = replace(pending, event=replace(pending.event, acts_for_requester=requester != agent))
+        await _admit_ready(gate, key, pending)
+
+    await gate.drain_all()
+
+    assert failures == []
+    assert [(batch.requester_user_id, list(batch.handled_turn.source_event_ids)) for batch in batches] == [
+        ("@alice:localhost", ["$e1:localhost"]),
+        ("@bob:localhost", ["$e2:localhost"]),
+        (agent, ["$e3:localhost"]),
+    ]
 
 
 @pytest.mark.asyncio

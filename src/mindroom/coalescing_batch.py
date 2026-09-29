@@ -152,12 +152,13 @@ def _tagged_pending_message(
     timestamp_formatter: TimestampFormatter | None,
     member_display_names: Mapping[str, str],
 ) -> str:
-    sender = pending_event.event.requester_user_id or pending_event.event.sender
+    event = pending_event.event
+    sender = event.sender if event.acts_for_requester else event.requester_user_id or event.sender
     return render_msg_tag(
         sender=sender,
-        body=dispatch_prompt_for_event(pending_event.event),
-        event_id=pending_event.event.event_id,
-        ts=_format_event_timestamp(pending_event.event.server_timestamp, timestamp_formatter),
+        body=dispatch_prompt_for_event(event),
+        event_id=event.event_id,
+        ts=_format_event_timestamp(event.server_timestamp, timestamp_formatter),
         display_name=member_display_names.get(sender),
     )
 
@@ -218,13 +219,14 @@ def tagged_coalesced_prompt(
         metadata = source_event_metadata.get(source_event_id)
         if prompt is None or metadata is None:
             return None
+        speaker = metadata.speaker or metadata.sender
         rendered_messages.append(
             render_msg_tag(
-                sender=metadata.sender,
+                sender=speaker,
                 body=prompt,
                 event_id=source_event_id,
                 ts=timestamp_formatter(metadata.timestamp_ms),
-                display_name=member_display_names.get(metadata.sender),
+                display_name=member_display_names.get(speaker),
             ),
         )
     return _messages_envelope(
@@ -347,7 +349,7 @@ def _batch_dispatch_policy_source_kind(ordered_pending_events: list[PendingEvent
     raise ValueError(msg)
 
 
-def pending_event_requester_user_id(key: CoalescingKey, pending_event: PendingEvent) -> str:
+def _pending_event_requester_user_id(key: CoalescingKey, pending_event: PendingEvent) -> str:
     """Resolve one event's effective requester, falling back to a requester owner.
 
     A follow-up owner carries no requester, so a requester-less event falls
@@ -360,6 +362,16 @@ def pending_event_requester_user_id(key: CoalescingKey, pending_event: PendingEv
     return pending_event.event.sender
 
 
+def pending_event_run_identity(key: CoalescingKey, pending_event: PendingEvent) -> tuple[str, str | None]:
+    """Return who one queued event runs as, plus its author when an entity wrote it for that requester.
+
+    A batch runs as one requester and takes its origin from its latest event, so a
+    reply an entity wrote for a human never shares a batch with that human's messages.
+    """
+    event = pending_event.event
+    return _pending_event_requester_user_id(key, pending_event), event.sender if event.acts_for_requester else None
+
+
 def _batch_requester_user_id(key: CoalescingKey, ordered_pending_events: list[PendingEvent]) -> str:
     """Resolve the one requester every event in the batch executes as.
 
@@ -368,7 +380,7 @@ def _batch_requester_user_id(key: CoalescingKey, ordered_pending_events: list[Pe
     under another sender's identity.
     """
     requester_user_ids = {
-        pending_event_requester_user_id(key, pending_event) for pending_event in ordered_pending_events
+        _pending_event_requester_user_id(key, pending_event) for pending_event in ordered_pending_events
     }
     if len(requester_user_ids) == 1:
         return next(iter(requester_user_ids))
@@ -420,6 +432,7 @@ def _batch_source_event_metadata(ordered_pending_events: list[PendingEvent]) -> 
             sender=pending_event.event.requester_user_id or pending_event.event.sender,
             timestamp_ms=normalize_timestamp_ms(pending_event.event.server_timestamp),
             discovery_event_id=pending_event.event.discovery_event_id,
+            speaker=pending_event.event.sender if pending_event.event.acts_for_requester else None,
         )
         for pending_event in ordered_pending_events
     }
@@ -453,7 +466,11 @@ def build_prepared_turn(
             source_event_ids,
             discovery_event_ids=routed_aliases,
             source_event_prompts=source_event_prompts,
-            source_event_metadata=source_event_metadata if len(source_event_ids) > 1 or routed_aliases else None,
+            source_event_metadata=(
+                source_event_metadata
+                if len(source_event_ids) > 1 or routed_aliases or primary_pending_event.event.acts_for_requester
+                else None
+            ),
             requester_id=requester_user_id,
         ),
         ingress=DispatchIngressMetadata(
