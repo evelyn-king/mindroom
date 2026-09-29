@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
-from backend.config import ENABLE_CLEANUP_SCHEDULER, INSTANCE_TEARDOWN_GRACE_DAYS, logger, stripe
+from backend.config import ENABLE_CLEANUP_SCHEDULER, INSTANCE_TEARDOWN_GRACE_DAYS, logger
 from backend.deps import ACTIVE_ACCOUNT_STATUS, ensure_supabase, invalidate_account_auth_cache, limiter, verify_admin
 from backend.models import (
     ActionResult,
@@ -173,11 +173,16 @@ async def admin_provision_instance(
     if instance.get("status") not in ["deprovisioned", "error"]:
         raise HTTPException(status_code=400, detail="Instance must be deprovisioned or in error state to provision")
 
+    # The subscription's tier, not the instance's copy of an older one, decides the resources and AI budget.
+    subscriptions = sb.table("subscriptions").select("tier").eq("id", instance["subscription_id"]).limit(1).execute()
+    if not subscriptions.data:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
     # Call the provisioner service with existing instance data
     data = {
         "subscription_id": instance.get("subscription_id"),
         "account_id": instance.get("account_id"),
-        "tier": instance.get("tier", "free"),
+        "tier": subscriptions.data[0]["tier"],
         "instance_id": instance_id,  # Re-use existing instance ID
     }
 
@@ -187,7 +192,7 @@ async def admin_provision_instance(
         action="provision",
         resource_type="instance",
         resource_id=str(instance_id),
-        details={"account_id": instance.get("account_id"), "tier": instance.get("tier")},
+        details={"account_id": instance.get("account_id"), "tier": data["tier"]},
     )
     return result
 
@@ -588,63 +593,69 @@ async def admin_delete_account_complete(
         raise HTTPException(status_code=404, detail="Account not found")
 
     account = account_result.data[0]
+    # The stored id is canonical, whatever spelling the path used, so cache and auth lookups match it.
+    account_id = account["id"]
     logger.info(
         f"Admin {admin['user_id']} initiating complete deletion of account {account_id} ({account.get('email')})"
     )
 
-    # 1. First, get all instances for this account
+    # 1. Mark the account pending deletion, so nothing provisions, starts, or bills it again during teardown, and
+    # claim it for teardown, so the customer can no longer restore it and hard_delete_account accepts it.
+    sb.rpc(
+        "soft_delete_account",
+        {"target_account_id": account_id, "reason": "admin_complete_deletion", "requested_by": admin["user_id"]},
+    ).execute()
+    invalidate_account_auth_cache(account_id)
+    claimed = (
+        sb.table("accounts")
+        .update({"hard_delete_started_at": datetime.now(UTC).isoformat()})
+        .eq("id", account_id)
+        .not_.is_("deleted_at", "null")
+        .execute()
+        .data
+    )
+    if not claimed:
+        detail = "The account could not be marked pending deletion, so nothing was deleted; retry the deletion"
+        raise HTTPException(status_code=500, detail=detail)
+
+    # 2. Cancel Stripe billing and uninstall every instance; the rows are the only record of what to tear down,
+    # so they stay until this succeeds.
     instances = instances_data.get_instances_for_account(sb, account_id)
-
-    # 2. Deprovision all instances
-    for instance in instances:
-        instance_id = instance.get("instance_id")
-        if instance.get("status") not in ["deprovisioned", "terminated"]:
-            logger.info(f"Deprovisioning instance {instance_id} for account {account_id}")
-            try:
-                await provisioner_service.uninstall_instance(instance_id)
-            except Exception as e:
-                logger.error(f"Failed to deprovision instance {instance_id}: {e}")
-                # Continue with other instances even if one fails
-
-    # 3. Cancel any active Stripe subscriptions
-    if account.get("stripe_customer_id"):
-        try:
-            # List and cancel all subscriptions for this customer
-            subscriptions = stripe.Subscription.list(customer=account["stripe_customer_id"], status="active")
-            for subscription in subscriptions.data:
-                logger.info(f"Canceling Stripe subscription {subscription.id}")
-                stripe.Subscription.cancel(subscription.id)
-
-            # Delete the Stripe customer (optional - you may want to keep for records)
-            # stripe.Customer.delete(account["stripe_customer_id"])
-
-        except Exception as e:
-            logger.error(f"Failed to cancel Stripe subscriptions: {e}")
-            # Continue with deletion even if Stripe fails
-
-    # 4. Delete the account (cascade deletion will handle related records)
     try:
-        sb.table("accounts").delete().eq("id", account_id).execute()
-        invalidate_account_auth_cache(account["id"])
-
-        # Log the complete deletion
-        audit_log_entry(
-            account_id=admin["user_id"],
-            action="delete_complete",
-            resource_type="accounts",
-            resource_id=account_id,
-            details={
-                "deleted_email": account.get("email"),
-                "instances_deprovisioned": len(instances),
-                "had_stripe_customer": bool(account.get("stripe_customer_id")),
-            },
-        )
-
-        logger.info(f"Successfully deleted account {account_id} and all associated resources")
-
+        await instance_lifecycle.tear_down_account(account_id)
     except Exception as e:
-        logger.exception(f"Error deleting account {account_id}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}") from None
+        logger.exception("Tearing down account %s failed; its rows are kept", account_id)
+        detail = (
+            "Teardown failed, so the account rows were kept, but Stripe billing may already be cancelled and "
+            f"some instances uninstalled; retry the deletion: {e!s}"
+        )
+        raise HTTPException(status_code=500, detail=detail) from e
+
+    # 3. Delete the account's instance, subscription, and audit rows, then the login, whose account row goes with it.
+    try:
+        sb.rpc("hard_delete_account", {"target_account_id": account_id}).execute()
+        await instance_lifecycle.delete_auth_user(account_id)
+        invalidate_account_auth_cache(account_id)
+    except Exception as e:
+        logger.exception("Deleting the rows or auth user of account %s failed; its account row is kept", account_id)
+        detail = (
+            "Billing and instances are torn down, but deleting the account's rows or login failed, so the account "
+            f"row was kept; retry the deletion: {e!s}"
+        )
+        raise HTTPException(status_code=500, detail=detail) from e
+
+    audit_log_entry(
+        account_id=admin["user_id"],
+        action="delete_complete",
+        resource_type="accounts",
+        resource_id=account_id,
+        details={
+            "deleted_email": account.get("email"),
+            "instances_deprovisioned": len(instances),
+            "had_stripe_customer": bool(account.get("stripe_customer_id")),
+        },
+    )
+    logger.info(f"Successfully deleted account {account_id} and all associated resources")
 
     return {"data": {"id": account_id}}
 

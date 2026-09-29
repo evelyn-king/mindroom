@@ -1,7 +1,7 @@
 """Comprehensive HTTP API tests for admin endpoints."""
 
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -206,13 +206,19 @@ class TestAdminEndpoints:
         """Test admin provisioning an instance."""
         # Setup - Mock instance query
         mock_supabase.table().select().eq().execute.return_value = Mock(
-            data=[{"instance_id": "123", "status": "deprovisioned", "account_id": "acc_123"}]
+            data=[
+                {
+                    "instance_id": "123",
+                    "status": "deprovisioned",
+                    "account_id": "acc_123",
+                    "subscription_id": "sub_123",
+                    "tier": "pro",
+                }
+            ]
         )
 
-        # Mock subscription query for provision_instance
-        mock_supabase.table().select().eq().single().execute.return_value = Mock(
-            data={"id": "sub_123", "account_id": "acc_123", "tier": "byok"}
-        )
+        # The subscription moved to byok since the instance was last deployed as pro.
+        mock_supabase.table().select().eq().limit().execute.return_value = Mock(data=[{"tier": "byok"}])
 
         with patch("backend.services.provisioner_service.provision_instance") as mock_provision:
             mock_provision.return_value = {
@@ -231,6 +237,7 @@ class TestAdminEndpoints:
             assert response.status_code == 200
             data = response.json()
             assert data["success"] is True
+            assert mock_provision.call_args.kwargs["data"]["tier"] == "byok"
 
     def test_admin_sync_instances(self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock):
         """Test admin syncing instances."""
@@ -398,7 +405,11 @@ class TestAdminEndpoints:
                 user_data={"user_id": cached_id, "account_id": cached_id, "account": {"status": "active"}},
             )
 
-        with patch("backend.routes.admin.instances_data.get_instances_for_account", return_value=[]):
+        with (
+            patch("backend.routes.admin.instances_data.get_instances_for_account", return_value=[]),
+            patch("backend.routes.admin.instance_lifecycle.tear_down_account", new=AsyncMock()),
+            patch("backend.routes.admin.instance_lifecycle.delete_auth_user", new=AsyncMock()),
+        ):
             response = client.request(method, path, json=body)
 
         assert response.status_code == 200

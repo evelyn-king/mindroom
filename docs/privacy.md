@@ -159,9 +159,10 @@ The MindRoom iOS app provides an in-app account deactivation path:
 Actual deletion/deactivation behavior depends on the capabilities and policies of your Matrix homeserver.
 
 Hosted MindRoom service account deletion is a separate control-plane flow with a 7-day grace period and is not triggered by Matrix account deactivation.
-The current hard-delete procedure targets application-database account, subscription, instance, audit-log, and subscription-linked usage records.
-Payment and webhook-event rows are not removed by that procedure and can prevent deletion while they still reference the account.
-It does not itself delete the upstream authentication user, Stripe customer or subscription data, Matrix account data, or installation persistent volumes; those processors and operators have separate deletion boundaries.
+Requesting deletion stops the account's hosted instances right away and lets its paid Stripe subscriptions end at the end of their current billing period; cancelling the deletion within the grace period keeps them.
+After the grace period, the hard-delete procedure cancels any remaining subscription, uninstalls the account's hosted instances, including their Matrix homeserver data, persistent volumes, and platform-paid AI keys, then targets application-database subscription, instance, audit-log, and subscription-linked usage records, and finally deletes the authentication user, which removes the account record.
+Payment and webhook-event rows are kept for accounting with only their account link cleared; they keep Stripe customer and subscription identifiers, and webhook payloads can include the account ID and invoice contact details.
+It does not delete Stripe customer or subscription records or copies of Matrix data held by other homeservers; those processors and operators have separate deletion boundaries.
 
 ## Security
 
