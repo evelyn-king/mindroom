@@ -22,7 +22,8 @@ from agno.run.agent import RunOutput
 from mindroom.agent_storage import create_session_storage
 from mindroom.background_tasks import create_background_task, run_blocking_until_complete
 from mindroom.constants import SKILL_REVIEW_NOTICE_CONTENT_KEY, SKIP_MENTIONS_KEY
-from mindroom.logging_config import get_logger
+from mindroom.llm_request_logging import bind_llm_request_log_context
+from mindroom.logging_config import bound_log_context, get_logger
 from mindroom.matrix.client_delivery import send_message_result
 from mindroom.matrix.message_builder import build_message_content
 from mindroom.runtime_resolution import resolve_agent_execution, resolve_agent_runtime
@@ -84,6 +85,22 @@ def _response_replies(
     return count_model_replies(run if isinstance(run, RunOutput) else None)
 
 
+def _review_log_context(scope: _ReviewScope, correlation_id: str) -> dict[str, str]:
+    """Return the log fields of the reviewed conversation and the response that made it due."""
+    identity = scope.identity
+    fields = {
+        "agent_id": scope.agent,
+        "session_id": scope.session,
+        "requester_id": identity.requester_id if identity is not None else None,
+        "room_id": identity.room_id if identity is not None else None,
+        "thread_id": identity.resolved_thread_id if identity is not None else None,
+        "correlation_id": correlation_id,
+        # Like the review's usage rows.
+        "kind": "skill_learning",
+    }
+    return {key: value for key, value in fields.items() if value is not None}
+
+
 def _skills_root(config: Config, runtime_paths: RuntimePaths, scope: _ReviewScope) -> Path:
     """Return the workspace skills directory that this conversation's reviews maintain."""
     runtime = resolve_agent_runtime(scope.agent, config, runtime_paths, execution_identity=scope.identity)
@@ -122,10 +139,12 @@ class SkillReviewRunner:
         identity: ToolExecutionIdentity | None,
         run_id: str,
         captured: CapturedRequest | None,
+        correlation_id: str,
     ) -> None:
         """Add a person's completed response to its conversation's count, and start a review once the count is due.
 
-        ``captured`` is the response's final model request, which the review forks when it belongs to ``run_id``.
+        ``captured`` is the response's final model request, which the review forks when it belongs to ``run_id``, and
+        ``correlation_id`` is the response's, which the review's logs carry.
         """
         scope = _ReviewScope(agent_name, session_id, identity)
         replies, restarted = await asyncio.to_thread(_response_replies, config, self.runtime_paths, scope, run_id)
@@ -142,7 +161,12 @@ class SkillReviewRunner:
         # Like Hermes, the count restarts when a review starts.
         self._replies[key] = 0
         task = create_background_task(
-            self._review(config, scope, captured if captured is not None and captured.run_id == run_id else None),
+            self._review(
+                config,
+                scope,
+                captured if captured is not None and captured.run_id == run_id else None,
+                correlation_id,
+            ),
             name=f"skill_review:{scope.agent}",
             # The response's context carries its queued-message and mid-turn state, which the reused model's hooks
             # would otherwise apply to the review's requests.
@@ -159,7 +183,20 @@ class SkillReviewRunner:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _review(self, config: Config, scope: _ReviewScope, captured: CapturedRequest | None) -> None:
+    async def _review(
+        self,
+        config: Config,
+        scope: _ReviewScope,
+        captured: CapturedRequest | None,
+        correlation_id: str,
+    ) -> None:
+        # The review runs in a fresh context, so it binds its conversation's fields, as the response's turn did, for
+        # its LLM usage, request, and notice logs.
+        log_context = _review_log_context(scope, correlation_id)
+        with bound_log_context(**log_context), bind_llm_request_log_context(**log_context):
+            await self._run_review(config, scope, captured)
+
+    async def _run_review(self, config: Config, scope: _ReviewScope, captured: CapturedRequest | None) -> None:
         settings = config.agents[scope.agent].skill_learning
         progress = ReviewProgress()
         try:
@@ -175,7 +212,7 @@ class SkillReviewRunner:
                     ),
                 )
             if archived:
-                logger.info("Archived unused learned skills", agent=scope.agent, archived=archived)
+                logger.info("Archived unused learned skills", archived=archived)
             await asyncio.wait_for(
                 review_conversation(
                     config=config,
@@ -190,20 +227,15 @@ class SkillReviewRunner:
                 timeout=settings.timeout_seconds,
             )
         except TimeoutError:
-            logger.info("Skill review reached its timeout", agent=scope.agent, session_id=scope.session)
+            logger.info("Skill review reached its timeout")
         except Exception:
-            logger.exception("Skill review failed", agent=scope.agent, session_id=scope.session)
+            logger.exception("Skill review failed")
         finally:
             # The notice runs on its own, so a new response that stops the review after its writes landed cannot stop
             # the notice too; shutdown sends none.
             if settings.notify and progress.changes and not self._stopped:
                 create_background_task(self._notify(scope, progress.changes), name=f"skill_notice:{scope.agent}")
-        logger.info(
-            "Skill review finished",
-            agent=scope.agent,
-            session_id=scope.session,
-            changed=sorted(progress.changes),
-        )
+        logger.info("Skill review finished", changed=sorted(progress.changes))
 
     async def _notify(self, scope: _ReviewScope, changes: dict[str, str]) -> None:
         """Tell the conversation which skills its review changed, like Hermes' self-improvement summary."""
@@ -228,4 +260,4 @@ class SkillReviewRunner:
             },
         )
         if await send_message_result(client, identity.room_id, content) is None:
-            logger.warning("Could not post skill review notice", agent=scope.agent, room_id=identity.room_id)
+            logger.warning("Could not post skill review notice")
