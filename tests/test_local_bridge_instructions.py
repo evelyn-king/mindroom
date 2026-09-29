@@ -35,6 +35,7 @@ def bridge_manager(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     monkeypatch.setattr(socket, "socket", blocked)
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *_args, **_kwargs: False)
     monkeypatch.setitem(sys.modules, "matty", ModuleType("matty"))
+    monkeypatch.syspath_prepend("local/instances/deploy")
     spec = importlib.util.spec_from_file_location("mindroom_bridge_instructions", "local/instances/deploy/bridge.py")
     assert spec is not None
     assert spec.loader is not None
@@ -88,6 +89,44 @@ def test_synapse_instructions_restart_selected_instance(
 
     output = bridge_manager.console.export_text()
     assert "./deploy.py restart alpha --only-matrix" in output
+
+
+@pytest.mark.parametrize("operation", ["write", "protect", "register"])
+def test_bridge_refuses_linked_secrets(
+    bridge_manager: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """Secret updates and Synapse registration refuse planted links without touching their target."""
+    victim = tmp_path / "victim.yaml"
+    victim.write_text("server_name: unchanged\n")
+    victim.chmod(0o640)
+    before = victim.stat()
+    parent = tmp_path / ("synapse" if operation == "register" else "data")
+    parent.mkdir()
+    link = parent / ("homeserver.yaml" if operation == "register" else "config.yaml")
+    link.symlink_to(victim)
+    monkeypatch.setattr(bridge_manager, "load_instances", lambda: {"alpha": {"data_dir": str(tmp_path)}})
+    bridge = bridge_manager.BridgeConfig(
+        bridge_type="telegram",
+        instance_name="alpha",
+        port=29317,
+        data_dir=str(tmp_path),
+    )
+
+    actions = {
+        "write": lambda: bridge_manager._write_private_file(link, "replacement"),
+        "protect": lambda: bridge_manager._protect_bridge_secret_files(bridge),
+        "register": lambda: bridge_manager._register_with_synapse(bridge, tmp_path / "registration.yaml"),
+    }
+    with pytest.raises((OSError, ValueError)):
+        actions[operation]()
+
+    after = victim.stat()
+    assert (after.st_uid, after.st_gid, after.st_mode) == (before.st_uid, before.st_gid, before.st_mode)
+    assert victim.read_text() == "server_name: unchanged\n"
+    assert link.is_symlink()
 
 
 def test_tuwunel_start_hint_parses_for_selected_instance(bridge_manager: ModuleType) -> None:
@@ -256,6 +295,34 @@ def test_start_strips_tokens_and_world_read_left_by_older_versions(
     }
 
 
+def test_owner_only_bridge_files_need_no_read_permission(
+    bridge_manager: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Already-private container files need no descriptor or spurious operator warning."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    for name in ("config.yaml", "registration.yaml"):
+        path = data_dir / name
+        path.write_text("private")
+        path.chmod(0o600)
+    bridge = bridge_manager.BridgeConfig(
+        bridge_type="telegram",
+        instance_name="alpha",
+        port=29317,
+        data_dir=str(tmp_path),
+    )
+
+    def denied_open(*_args: object, **_kwargs: object) -> int:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(bridge_manager.os, "open", denied_open)
+    bridge_manager._protect_bridge_secret_files(bridge)
+
+    assert bridge_manager.console.export_text() == ""
+
+
 def test_unrestrictable_bridge_file_prints_the_exact_fix(
     bridge_manager: ModuleType,
     tmp_path: Path,
@@ -279,7 +346,7 @@ def test_unrestrictable_bridge_file_prints_the_exact_fix(
     def _refuse_chmod(*_args: object) -> None:
         raise PermissionError(1, "Operation not permitted")
 
-    monkeypatch.setattr(bridge_manager.Path, "chmod", _refuse_chmod)
+    monkeypatch.setattr(bridge_manager.os, "fchmod", _refuse_chmod)
 
     bridge_manager._protect_bridge_secret_files(bridge)
 

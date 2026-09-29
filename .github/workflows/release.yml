@@ -148,6 +148,7 @@ jobs:
           GH_TOKEN: ${{ steps.release-bot.outputs.token }}
           TAG_NAME: ${{ inputs.release_ref }}
         run: |
+          set -o pipefail
           python3 .github/scripts/normalize_appcast.py macos/appcast.xml
 
           if git diff --quiet -- macos/appcast.xml; then
@@ -169,24 +170,21 @@ jobs:
           - Sparkle appcast entry and signature
           EOF
 
+          RELEASE_METADATA_BRANCH="release-metadata/mindroom"
           EXISTING_RELEASE_METADATA_PR=$(
             gh pr list \
               --repo "$GITHUB_REPOSITORY" \
               --base main \
               --state open \
-              --search '"Update MindRoom release metadata" in:title' \
+              --head "$RELEASE_METADATA_BRANCH" \
               --limit 100 \
-              --json number,title,headRefName,updatedAt \
-              --jq 'map(select(.title | startswith("Update MindRoom release metadata"))) | sort_by(.updatedAt) | reverse | first | if . == null then "" else "\(.number) \(.headRefName)" end'
+              --json number,headRefName,isCrossRepository |
+              jq -r --arg branch "$RELEASE_METADATA_BRANCH" 'map(select(.headRefName == $branch and .isCrossRepository == false)) | first | if . == null then "" else .number end'
           )
 
           if [[ -n "$EXISTING_RELEASE_METADATA_PR" ]]; then
-            EXISTING_RELEASE_METADATA_PR_NUMBER="${EXISTING_RELEASE_METADATA_PR%% *}"
-            RELEASE_METADATA_BRANCH="${EXISTING_RELEASE_METADATA_PR#* }"
-            echo "Updating existing release metadata PR #${EXISTING_RELEASE_METADATA_PR_NUMBER} on ${RELEASE_METADATA_BRANCH}."
+            echo "Updating existing release metadata PR #${EXISTING_RELEASE_METADATA_PR} on ${RELEASE_METADATA_BRANCH}."
           else
-            EXISTING_RELEASE_METADATA_PR_NUMBER=""
-            RELEASE_METADATA_BRANCH="release-metadata/mindroom"
             echo "Creating a new release metadata PR on ${RELEASE_METADATA_BRANCH}."
           fi
 
@@ -201,8 +199,8 @@ jobs:
             "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "HEAD:${RELEASE_METADATA_BRANCH}"
 
-          if [[ -n "$EXISTING_RELEASE_METADATA_PR_NUMBER" ]]; then
-            gh pr edit "$EXISTING_RELEASE_METADATA_PR_NUMBER" \
+          if [[ -n "$EXISTING_RELEASE_METADATA_PR" ]]; then
+            gh pr edit "$EXISTING_RELEASE_METADATA_PR" \
               --repo "$GITHUB_REPOSITORY" \
               --title "Update MindRoom release metadata to ${TAG_NAME}" \
               --body-file "$PR_BODY"

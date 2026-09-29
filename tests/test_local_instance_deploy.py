@@ -49,6 +49,37 @@ def _instance(
     )
 
 
+@pytest.mark.parametrize("operation", ["write", "give", "restrict", "directory"])
+def test_deploy_refuses_linked_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str) -> None:
+    """Container-planted links must not redirect host writes or permission changes."""
+    victim = tmp_path / "victim"
+    if operation == "directory":
+        victim.mkdir(mode=0o700)
+    else:
+        victim.write_text("unchanged")
+        victim.chmod(0o640)
+    before = victim.stat()
+    link = tmp_path / "planted"
+    link.symlink_to(victim)
+    if operation == "give":
+        monkeypatch.setattr(deploy, "CONTAINER_UID", os.getuid())
+
+    actions = {
+        "write": lambda: deploy._write_private_file(link, "replacement"),
+        "give": lambda: deploy._give_to_container_user(link),
+        "restrict": lambda: deploy._restrict_to_container_user(link),
+        "directory": lambda: deploy._create_directory_with_permissions(link),
+    }
+    with pytest.raises((OSError, ValueError)):
+        actions[operation]()
+
+    after = victim.stat()
+    assert (after.st_uid, after.st_gid, after.st_mode) == (before.st_uid, before.st_gid, before.st_mode)
+    assert link.is_symlink()
+    if operation != "directory":
+        assert victim.read_text() == "unchanged"
+
+
 def test_sync_matrix_host_overrides_writes_peer_domains(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Each Matrix instance should get a compose override for the other Matrix domains."""
     env_dir = tmp_path / "envs"
@@ -514,6 +545,7 @@ def test_telegram_bridge_compose_renders_configured_image(
 ) -> None:
     """Bridge metadata must be the single image source for generated Compose."""
     monkeypatch.setitem(sys.modules, "matty", ModuleType("matty"))
+    monkeypatch.syspath_prepend("local/instances/deploy")
     bridge_script = Path("local/instances/deploy/bridge.py")
     bridge_spec = importlib.util.spec_from_file_location("mindroom_bridge_manager", bridge_script)
     assert bridge_spec is not None
@@ -1517,7 +1549,7 @@ def test_launch_upgrades_older_synapse_env_without_changing_datastore_passwords(
     homeserver.parent.mkdir(parents=True)
     homeserver.write_text("database:\n  args:\n    password: synapse_password\n")
     homeserver.chmod(0o644)
-    monkeypatch.setattr(deploy.os, "chown", lambda *_args: None)
+    monkeypatch.setattr(deploy.os, "fchown", lambda *_args: None)
     env_file = _write_older_env_file(instance)
     older_env = env_file.read_text()
     env_at_launch: dict[str, str] = {}
@@ -1606,7 +1638,7 @@ def test_copied_credentials_are_owner_only(tmp_path: Path, monkeypatch: pytest.M
     target_dir.chmod(0o755)
     (target_dir / "openai.json").write_text('{"api_key": "secret"}')
     (target_dir / "openai.json").chmod(0o644)
-    monkeypatch.setattr(deploy.os, "chown", lambda *_args: None)
+    monkeypatch.setattr(deploy.os, "fchown", lambda *_args: None)
 
     deploy._create_instance_directories(instance)
 
@@ -1617,16 +1649,92 @@ def test_copied_credentials_are_owner_only(tmp_path: Path, monkeypatch: pytest.M
     }
 
 
+def test_copied_config_stays_readable_when_ownership_transfer_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-root operator's config must remain readable by the container after denied chown."""
+    source_dir = tmp_path / "repo"
+    source_dir.mkdir()
+    (source_dir / "config.yaml").write_text("agents: {}\n")
+    monkeypatch.setattr(deploy, "REPO_ROOT", source_dir)
+    monkeypatch.setattr(deploy, "CONTAINER_UID", os.getuid() + 1)
+    instance = _instance("alpha", matrix_type=None, data_root=tmp_path)
+    target_config = Path(instance.data_dir) / "config" / "config.yaml"
+    target_config.parent.mkdir(parents=True)
+
+    def denied_chown(*_args: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(deploy.os, "fchown", denied_chown)
+    deploy._copy_config_to_instance(instance)
+
+    assert _mode(target_config) == 0o644
+    assert target_config.read_text() == "agents: {}\n"
+
+
+def test_matrix_template_copy_refuses_linked_destination(tmp_path: Path) -> None:
+    """A planted log.config must not redirect a template copy or its mode change."""
+    template_dir = tmp_path / "templates"
+    template_dir.mkdir()
+    (template_dir / "log.config").write_text("template")
+    target_dir = tmp_path / "synapse"
+    target_dir.mkdir()
+    victim = tmp_path / "victim"
+    victim.write_text("unchanged")
+    victim.chmod(0o600)
+    (target_dir / "log.config").symlink_to(victim)
+    instance = _instance("alpha", matrix_type=deploy.MatrixType.SYNAPSE, data_root=tmp_path)
+
+    with pytest.raises(OSError, match="symbolic links"):
+        deploy._prepare_matrix_config(instance, deploy.MatrixType.SYNAPSE, "homeserver.yaml", template_dir, target_dir)
+
+    assert victim.read_text() == "unchanged"
+    assert _mode(victim) == 0o600
+
+
+def test_credential_copy_refuses_dangling_destination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dangling credential link must not create a file outside the instance."""
+    source_dir = tmp_path / "home" / ".mindroom" / "credentials"
+    source_dir.mkdir(parents=True)
+    (source_dir / "provider.json").write_text('{"api_key": "test-secret"}')
+    monkeypatch.setattr(deploy.Path, "home", lambda: tmp_path / "home")
+    instance = _instance("alpha", matrix_type=None, data_root=tmp_path)
+    target_dir = Path(instance.data_dir) / "mindroom_data" / "credentials"
+    target_dir.mkdir(parents=True)
+    victim = tmp_path / "missing-victim"
+    (target_dir / "provider.json").symlink_to(victim)
+
+    with pytest.raises(OSError, match="symbolic links"):
+        deploy._copy_credentials_to_instance(instance)
+
+    assert not victim.exists()
+
+
+def test_unreadable_existing_directory_remains_best_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An operator unable to open a container-owned directory may still continue deployment."""
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+
+    def denied_open(*_args: object, **_kwargs: object) -> int:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(deploy.os, "open", denied_open)
+    deploy._create_directory_with_permissions(directory)
+
+    assert _mode(directory) == 0o700
+
+
 def _operator_in_group_100(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, ...]]:
     """Fake chown for an operator whose primary group is 100, like NixOS users, so any group change fails."""
     calls: list[tuple[object, ...]] = []
 
-    def _chown(path: object, uid: int, gid: int) -> None:
-        calls.append((path, uid, gid))
+    def _chown(fd: int, uid: int, gid: int) -> None:
+        calls.append((os.fstat(fd).st_ino, uid, gid))
         if gid not in (-1, 100):
             raise PermissionError(1, "Operation not permitted")
 
-    monkeypatch.setattr(deploy.os, "chown", _chown)
+    monkeypatch.setattr(deploy.os, "fchown", _chown)
     return calls
 
 
@@ -1645,7 +1753,7 @@ def test_secret_file_goes_to_the_container_uid_without_changing_its_group(
 
     deploy._protect_synapse_config(homeserver)
 
-    assert calls == [(homeserver, os.getuid() + 1, -1)]
+    assert calls == [(homeserver.stat().st_ino, os.getuid() + 1, -1)]
     assert _mode(homeserver) == 0o600
     assert console.export_text() == ""
 
@@ -1683,9 +1791,28 @@ def test_unrestrictable_secret_file_prints_the_exact_fix(tmp_path: Path, monkeyp
     def _refuse_chown(*_args: object) -> None:
         raise PermissionError(1, "Operation not permitted")
 
-    monkeypatch.setattr(deploy.os, "chown", _refuse_chown)
+    monkeypatch.setattr(deploy.os, "fchown", _refuse_chown)
 
     deploy._protect_synapse_config(homeserver)
 
     assert f"sudo chown {os.getuid() + 1} {shlex.quote(str(homeserver))}" in console.export_text()
+    assert _mode(homeserver) == 0o600
+
+
+def test_unreadable_container_secret_keeps_permission_guidance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An operator denied a descriptor still gets repair guidance without aborting deployment."""
+    homeserver = tmp_path / "homeserver.yaml"
+    homeserver.write_text("unchanged")
+    homeserver.chmod(0o600)
+    console = Console(record=True, width=400)
+    monkeypatch.setattr(deploy, "console", console)
+
+    def denied_open(*_args: object, **_kwargs: object) -> int:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(deploy.os, "open", denied_open)
+    deploy._protect_synapse_config(homeserver)
+
+    assert f"sudo chmod 600 {shlex.quote(str(homeserver))}" in console.export_text()
+    assert homeserver.read_text() == "unchanged"
     assert _mode(homeserver) == 0o600

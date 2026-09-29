@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -42,14 +45,36 @@ def test_macos_app_publishes_after_matching_pypi_release(release_workflow: str) 
     assert "APP_VERSION: ${{ inputs.release_ref }}" in macos_job
 
 
-def test_release_metadata_pr_reuses_open_metadata_pr(release_workflow: str) -> None:
-    """Repeated release metadata updates should update an open metadata PR in place."""
+@pytest.mark.parametrize("include_matching_pr", [False, True])
+def test_release_metadata_pr_reuses_open_metadata_pr(release_workflow: str, include_matching_pr: bool) -> None:
+    """Only the fixed branch in this repository can be selected."""
     assert "gh pr list" in release_workflow
     assert "--state open" in release_workflow
-    assert """--search '"Update MindRoom release metadata" in:title'""" in release_workflow
-    assert 'startswith("Update MindRoom release metadata")' in release_workflow
-    assert 'RELEASE_METADATA_BRANCH="${EXISTING_RELEASE_METADATA_PR#* }"' in release_workflow
-    assert 'gh pr edit "$EXISTING_RELEASE_METADATA_PR_NUMBER"' in release_workflow
+    query_line = next(line for line in release_workflow.splitlines() if "jq -r --arg branch" in line)
+    query_command = shlex.split(query_line.replace("$RELEASE_METADATA_BRANCH", "release-metadata/mindroom"))
+    prs = [
+        {"number": 12, "headRefName": "unrelated", "isCrossRepository": False},
+        {
+            "number": 13,
+            "headRefName": "release-metadata/mindroom",
+            "isCrossRepository": True,
+        },
+    ]
+    if include_matching_pr:
+        prs.append(
+            {
+                "number": 11,
+                "headRefName": "release-metadata/mindroom",
+                "isCrossRepository": False,
+            },
+        )
+    result = subprocess.run(query_command, input=json.dumps(prs), text=True, capture_output=True, check=True)
+    assert result.stdout.strip() == ("11" if include_matching_pr else "")
+    assignments = [
+        line.strip() for line in release_workflow.splitlines() if line.strip().startswith("RELEASE_METADATA_BRANCH=")
+    ]
+    assert assignments == ['RELEASE_METADATA_BRANCH="release-metadata/mindroom"']
+    assert 'gh pr edit "$EXISTING_RELEASE_METADATA_PR"' in release_workflow
 
 
 def test_release_metadata_fallback_branch_is_not_tag_specific(release_workflow: str) -> None:
