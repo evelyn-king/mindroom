@@ -2321,6 +2321,7 @@ Room ownership and membership are verified before reusing an alias.
 The owner may invite other MindRoom agents into their personal room; an agent sees only messages sent after its invite.
 Anyone else invited into a personal room MindRoom created is removed, with one notice explaining why; imported rooms keep their attested roster and fail closed instead.
 Reconciliation then logs the warning `Personal-room imported roster has unattested members` naming the unexpected members, and retries that room after doubling delays up to hourly; a configuration reload retries it at once.
+When an onboarding-room join or command meets a personal room that fails these checks, including an alias another account already holds, MindRoom logs `Personal-room validation failed for an onboarding trigger` and the onboarding room keeps serving everyone else; reconciliation, which runs at startup and after a configuration reload, retries that room after doubling delays up to hourly.
 Personal rooms are retained across restarts and ordinary room cleanup, including after this feature is disabled.
 Disabling onboarding does not delete rooms or revoke their existing access.
 
@@ -20481,6 +20482,8 @@ When deriving context for an incoming event, MindRoom:
 2. Lets plain replies inherit thread membership transitively when their reply chain reaches a threaded ancestor or proven thread root.
 3. Lets edits, reactions, redactions, and other target-bound operations inherit the canonical thread membership of their target event.
 4. May start a new thread under a room-root event when agent thread mode requires it.
+
+A read that must come straight from the homeserver, such as the thread-summary pin check, restart auto-resume, and thread-root proofs for tools, walks room history back at most 100 pages of 100 events; a root older than that is reported as unproven, so those callers fail closed.
 
 ```
 ├── User: @assistant help with this code
