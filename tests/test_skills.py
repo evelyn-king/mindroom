@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 import os
 import platform
+import threading
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from structlog.testing import capture_logs
 
 import mindroom.tool_system.skills as skills_module
 import mindroom.tools  # noqa: F401
+from mindroom.background_tasks import wait_for_background_tasks
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
@@ -977,3 +979,69 @@ def test_workspace_skill_names_and_listings_cannot_bloat_the_prompt(tmp_path: Pa
 
     assert skills is None or len(skills.get_system_prompt_snippet()) < 1 << 20
     assert any(entry["log_level"] == "warning" for entry in logs)
+
+
+def test_workspace_skill_loads_record_usage_but_configured_skills_do_not(tmp_path: Path) -> None:
+    """Loading a workspace skill or one of its files feeds the learner's inactivity clock; configured skills do not."""
+    storage, workspace_skills = _workspace_skills(tmp_path)
+    skill_path = _write_skill(workspace_skills, "local", "Workspace skill")
+    (skill_path.parent / "references").mkdir()
+    (skill_path.parent / "references" / "notes.md").write_text("notes", encoding="utf-8")
+    _write_skill(tmp_path / "global", "shared", "Configured skill")
+    skills = build_agent_skills(
+        "code",
+        _base_config(["shared"]),
+        _runtime_paths(storage),
+        skill_roots=[tmp_path / "global"],
+        env_vars={},
+        credential_keys=set(),
+    )
+    assert skills is not None
+    get_instructions = next(tool for tool in skills.get_tools() if tool.name == "get_skill_instructions").entrypoint
+    assert get_instructions is not None
+    assert _get_skill_reference(skills, "local", "notes.md")["content"] == "notes"
+    read = json.loads((workspace_skills / ".usage.json").read_text(encoding="utf-8"))["local"]["last_used_at"]
+    get_instructions(skill_name="local")
+    get_instructions(skill_name="shared")
+
+    usage = json.loads((workspace_skills / ".usage.json").read_text(encoding="utf-8"))
+    assert usage["local"]["last_used_at"] > read
+    assert "shared" not in usage
+    assert not (tmp_path / "global" / ".usage.json").exists()
+
+
+def test_a_workspace_whose_skills_directory_is_one_skill_records_no_usage(tmp_path: Path) -> None:
+    """Usage records live beside skill directories, so loading a skills/ that is itself one skill writes none."""
+    storage, workspace_skills = _workspace_skills(tmp_path)
+    _write_skill(workspace_skills.parent, "skills", "Whole-directory skill")
+    skills = _load_workspace_only(tmp_path, storage)
+    assert skills is not None
+    get_instructions = next(tool for tool in skills.get_tools() if tool.name == "get_skill_instructions").entrypoint
+    assert get_instructions is not None
+    assert "Body" in get_instructions(skill_name="skills")
+    assert not (workspace_skills / ".usage.json").exists()
+    assert not (workspace_skills.parent / ".usage.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_workspace_skill_loads_on_the_event_loop_record_usage_in_a_thread(tmp_path: Path) -> None:
+    """Agno calls skill tools on the event loop, so the usage write, which syncs files, must not block it."""
+    storage, workspace_skills = _workspace_skills(tmp_path)
+    _write_skill(workspace_skills, "local", "Workspace skill")
+    skills = _load_workspace_only(tmp_path, storage)
+    assert skills is not None
+    get_instructions = next(tool for tool in skills.get_tools() if tool.name == "get_skill_instructions").entrypoint
+    assert get_instructions is not None
+    writers: list[threading.Thread] = []
+    record = skills_module.record_skill_use
+
+    def spy(skill_path: Path) -> None:
+        writers.append(threading.current_thread())
+        record(skill_path)
+
+    with patch.object(skills_module, "record_skill_use", spy):
+        get_instructions(skill_name="local")
+        assert await wait_for_background_tasks(5)
+    assert writers
+    assert threading.main_thread() not in writers
+    assert "last_used_at" in json.loads((workspace_skills / ".usage.json").read_text(encoding="utf-8"))["local"]

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager, suppress
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from itertools import count
 from types import SimpleNamespace
@@ -67,7 +67,13 @@ from mindroom.delivery_gateway import (
     SendTextRequest,
     StreamingDeliveryRequest,
 )
-from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND, ScheduledHistoryBudget
+from mindroom.dispatch_source import (
+    AUTO_RESUME_MESSAGE,
+    HOOK_SOURCE_KIND,
+    SCHEDULED_SOURCE_KIND,
+    SILENT_SCHEDULE_SOURCE_KIND,
+    ScheduledHistoryBudget,
+)
 from mindroom.entity_resolution import current_internal_sender_ids
 from mindroom.event_journal import (
     ApprovalCall,
@@ -146,6 +152,7 @@ from mindroom.turn_record import EditPreparation, canonicalize_turn_record
 from tests.conftest import (
     make_matrix_client_mock,
     make_visible_message,
+    message_origin,
     patch_response_runner_module,
     replace_response_runner_deps,
     request_envelope,
@@ -9726,3 +9733,132 @@ async def test_stop_while_progress_drains_lands_no_progress_edit_after_settlemen
     assert outcome.terminal_status == "cancelled"
     assert landed == [STREAM_STATUS_COMPLETED]
     assert _approval_reply_edits(client)[-1] == (STREAM_STATUS_COMPLETED, "**[Response cancelled by user]**")
+
+
+@dataclass
+class _RecordedSkillReviews:
+    """The orchestrator's skill-review runner as a response sees it, recording what the response asked of it."""
+
+    cancelled: list[dict[str, object]] = field(default_factory=list)
+    counted: list[dict[str, object]] = field(default_factory=list)
+    fail: bool = False
+
+    def cancel(self, _config: object, **scope: object) -> None:
+        self.cancelled.append(scope)
+
+    async def count(self, _config: object, **counted: object) -> None:
+        self.counted.append(counted)
+        if self.fail:
+            msg = "count failed"
+            raise OSError(msg)
+
+
+async def _respond_with_skill_learning(
+    tmp_path: Path,
+    request_update: Callable[[ResponseRequest], ResponseRequest] = lambda request: request,
+    *,
+    streaming: bool = False,
+    fail: bool = False,
+) -> tuple[_RecordedSkillReviews, SyntheticModel, AsyncMock]:
+    bot = _bot(tmp_path)
+    coordinator = unwrap_extracted_collaborator(bot._response_runner)
+    assert bot.client is not None
+    bot.client.room_send.return_value = nio.RoomSendResponse(event_id="$response", room_id="!room:localhost")
+    coordinator.deps.runtime.config.agents["general"].skill_learning.enabled = True
+    reviews = _RecordedSkillReviews(fail=fail)
+    coordinator.deps.runtime.orchestrator = MagicMock(knowledge_refresh_scheduler=None, skill_reviews=reviews)
+    model = SyntheticModel(
+        id="synthetic",
+        min_response_chars=30,
+        max_response_chars=30,
+        chars_per_second=0,
+        tool_call_probability=0,
+    )
+    with (
+        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch_response_runner_module(
+            typing_indicator=_noop_typing,
+            should_use_streaming=AsyncMock(return_value=streaming),
+        ),
+    ):
+        await coordinator.generate_response(request_update(_plain_request(_target())))
+        assert await wait_for_background_tasks(5, owner=coordinator.deps.runtime)
+    return reviews, model, bot.client.room_send
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_a_completed_response_hands_its_run_and_final_request_to_the_skill_reviews(
+    tmp_path: Path,
+    streaming: bool,
+) -> None:
+    """Both response drivers stop the conversation's review, then count the completed run with its final request."""
+    reviews, model, _send = await _respond_with_skill_learning(tmp_path, streaming=streaming)
+    (counted,) = reviews.counted
+    scope = {key: counted[key] for key in ("agent_name", "session_id", "identity")}
+    assert reviews.cancelled == [scope]
+    assert counted["agent_name"] == "general"
+    assert counted["identity"].requester_id == "@user:localhost"
+    captured = counted["captured"]
+    assert captured is not None
+    assert captured.model is model
+    assert captured.run_id == counted["run_id"]
+    final = captured.messages[-1]
+    assert (final.role, bool(final.content), final.tool_calls) == ("assistant", True, None)
+    assert "skill_manage" in {tool.name for tool in captured.tools if isinstance(tool, Function)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_by", ["a schedule", "a hook", "another agent", "a restart resume"])
+async def test_turns_no_person_asked_for_never_count_toward_skill_review(tmp_path: Path, requested_by: str) -> None:
+    """Like cron runs in Hermes, automation, agent requests, and restart resumes have no person to learn from."""
+
+    def update(request: ResponseRequest) -> ResponseRequest:
+        envelope = request.response_envelope
+        if requested_by in {"a schedule", "a hook"}:
+            source_kind = SCHEDULED_SOURCE_KIND if requested_by == "a schedule" else HOOK_SOURCE_KIND
+            return replace(
+                request,
+                response_envelope=request_envelope(
+                    target=envelope.target,
+                    prompt=request.prompt,
+                    user_id=request.user_id,
+                    source_kind=source_kind,
+                ),
+            )
+        if requested_by == "another agent":
+            origin = message_origin(
+                sender_id="@mindroom_helper:localhost",
+                sender_entity_name="helper",
+                requester_entity_name="helper",
+            )
+            return replace(request, response_envelope=replace(envelope, origin=origin))
+        return replace(request, response_envelope=replace(envelope, body=f"@General {AUTO_RESUME_MESSAGE}"))
+
+    reviews, _model, send = await _respond_with_skill_learning(tmp_path, update)
+    send.assert_awaited()
+    assert reviews.counted == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_skill_review_count_never_fails_the_reply(tmp_path: Path) -> None:
+    """Skill learning is background bookkeeping, so a failed count must not cost the user their answer."""
+    _reviews, _model, send = await _respond_with_skill_learning(tmp_path, fail=True)
+    send.assert_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("succeeded", [True, False])
+async def test_only_a_completed_response_counts_toward_its_skill_review(succeeded: bool) -> None:
+    """Post-response effects count a completed response's run, and nothing for a failed one."""
+    calls: list[str] = []
+
+    async def count(run_id: str) -> None:
+        calls.append(run_id)
+
+    await apply_post_response_effects(
+        FinalDeliveryOutcome(terminal_status="completed" if succeeded else "error", event_id=None),
+        ResponseOutcome(response_run_id="run-1", run_succeeded=succeeded),
+        PostResponseEffectsDeps(logger=MagicMock(), queue_skill_review=count),
+    )
+    assert calls == (["run-1"] if succeeded else [])

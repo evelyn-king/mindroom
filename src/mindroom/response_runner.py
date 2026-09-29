@@ -45,7 +45,7 @@ from mindroom.constants import (
     STREAM_STATUS_KEY,
     STREAM_STATUS_PENDING,
 )
-from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
+from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND, is_auto_resume_relay_body, is_automation_source_kind
 from mindroom.entity_resolution import current_internal_sender_ids, entity_identity_registry
 from mindroom.event_journal import (
     ApprovalContinuation,
@@ -110,6 +110,7 @@ from mindroom.runtime_shutdown import (
     RuntimeShutdownIntent,
 )
 from mindroom.scheduled_run_records import record_silent_schedule_started_if_needed
+from mindroom.skill_learning.capture import SkillReviewCapture
 from mindroom.streaming import (
     INTERRUPTED_RESPONSE_NOTE,
     PROGRESS_PLACEHOLDER,
@@ -145,6 +146,7 @@ from mindroom.tool_system.worker_routing import (
     serialize_tool_execution_identity,
     stream_with_tool_execution_identity,
 )
+from mindroom.turn_origin import SenderKind
 from mindroom.turn_record import EditPreparation, RevisionSnapshotChangedError
 from mindroom.user_turn_time import prefix_user_turn_time
 
@@ -217,6 +219,7 @@ if TYPE_CHECKING:
     from mindroom.tool_system.events import ToolTraceEntry
     from mindroom.tool_system.runtime_context import ToolRuntimeSupport
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
+    from mindroom.turn_origin import TurnOrigin
     from mindroom.turn_record import TurnRecord
 
     from .response_admission import ResponseAdmissionGate
@@ -851,6 +854,7 @@ class _PreparedResponseRuntime:
     show_tool_calls: bool
     tool_dispatch: ToolDispatchContext
     participation: ParticipationGate | None = None
+    skill_review_capture: SkillReviewCapture | None = None
 
 
 @dataclass
@@ -864,6 +868,19 @@ class _InboxResponseOwnership:
     room_id: str
     drain_intent: RuntimeShutdownIntent | None = None
     proof_task: asyncio.Task[bool] | None = None
+
+
+def _requested_by_a_person(origin: TurnOrigin, body: str) -> bool:
+    """Whether a turn counts toward skill learning.
+
+    Like Hermes skipping cron reviews, automated runs, restart resumes, and replies to other agents never count toward
+    a review; they have no human to learn from.
+    """
+    return (
+        origin.requester_kind == SenderKind.USER
+        and not is_automation_source_kind(origin.source_kind)
+        and not is_auto_resume_relay_body(body)
+    )
 
 
 @dataclass
@@ -1223,6 +1240,7 @@ class ResponseRunner:
         request: ResponseRequest,
         *,
         queue_memory_persistence: Callable[[], None] | None = None,
+        queue_skill_review: Callable[[str], Awaitable[None]] | None = None,
         persist_response_event_id: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> PostResponseEffectsDeps:
         """Build post-response effect deps bound to one request's room."""
@@ -1230,6 +1248,7 @@ class ResponseRunner:
             room_id=request.room_id,
             membership_turn_id=request.response_envelope.source_event_id,
             queue_memory_persistence=queue_memory_persistence,
+            queue_skill_review=queue_skill_review,
             persist_response_event_id=persist_response_event_id,
         )
 
@@ -2075,6 +2094,43 @@ class ResponseRunner:
             )
             for index, turn in enumerate(continuation.memory_thread_history)
         )
+
+    def _response_skill_review(
+        self,
+        request: ResponseRequest,
+        runtime: _PreparedResponseRuntime,
+        *,
+        session_id: str,
+        execution_identity: ToolExecutionIdentity | None,
+    ) -> tuple[Callable[[str], Coroutine[Any, Any, None]] | None, _PreparedResponseRuntime]:
+        """Stop the conversation's running review, and return a person's response's skill-review handoff.
+
+        Like Hermes, a response starting in a conversation stops its running review. The returned runtime records the
+        response's final request for the review to fork.
+        """
+        config = self.deps.runtime.config
+        orchestrator = self.deps.runtime.orchestrator
+        agent = config.agents.get(self.deps.agent_name)
+        if orchestrator is None or agent is None or not agent.skill_learning.enabled:
+            return None, runtime
+        reviews = orchestrator.skill_reviews
+        agent_name = self.deps.agent_name
+        reviews.cancel(config, agent_name=agent_name, session_id=session_id, identity=execution_identity)
+        if not _requested_by_a_person(request.response_envelope.origin, request.response_envelope.body):
+            return None, runtime
+        capture = SkillReviewCapture()
+
+        async def count(run_id: str) -> None:
+            await reviews.count(
+                config,
+                agent_name=agent_name,
+                session_id=session_id,
+                identity=execution_identity,
+                run_id=run_id,
+                captured=capture.latest,
+            )
+
+        return count, replace(runtime, skill_review_capture=capture)
 
     def _approval_memory_persistence(self, continuation: ApprovalContinuation) -> Callable[[], None] | None:
         """Return the normal agent-memory handoff for a completed continuation."""
@@ -3343,6 +3399,7 @@ class ResponseRunner:
             participation=runtime.participation,
             allow_no_report_response=_is_silent_schedule_response(request),
             scheduled_history_budget=request.scheduled_history_budget,
+            skill_review_capture=runtime.skill_review_capture,
         )
 
     def _notify_interrupted_response_recoverable(
@@ -5465,6 +5522,12 @@ class ResponseRunner:
             thread_history=memory_thread_history,
             user_id=request.user_id,
         )
+        queue_skill_review, runtime = self._response_skill_review(
+            request,
+            runtime,
+            session_id=session_id,
+            execution_identity=execution_identity,
+        )
 
         persist_response_event_id = self._build_persist_response_event_id_effect(
             session_id=session_id,
@@ -5555,6 +5618,7 @@ class ResponseRunner:
                 post_response_deps=lambda: self._post_response_deps(
                     request,
                     queue_memory_persistence=queue_memory_persistence,
+                    queue_skill_review=queue_skill_review,
                     persist_response_event_id=persist_response_event_id,
                 ),
                 approval_suspension_handler=lambda paused: self._suspend_for_approval(

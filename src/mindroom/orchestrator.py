@@ -99,6 +99,7 @@ from mindroom.runtime_state import (
     set_runtime_starting,
 )
 from mindroom.scheduling_executor import set_scheduling_hook_registry
+from mindroom.skill_learning.runner import SkillReviewRunner
 from mindroom.startup_errors import PermanentStartupError
 from mindroom.startup_maintenance import StartupMaintenanceController
 from mindroom.tool_approval import shutdown_approval_runtime
@@ -405,6 +406,7 @@ class _MultiAgentOrchestrator:
     _permanently_failed_entities: set[str] = field(default_factory=set, init=False)
     _memory_auto_flush_worker: MemoryAutoFlushWorker | None = field(default=None, init=False)
     _memory_auto_flush_task: asyncio.Task | None = field(default=None, init=False)
+    _skill_reviews: SkillReviewRunner = field(init=False, repr=False)
     _todo_poke_runtime: TodoPokeRuntimeCoordinator = field(init=False, repr=False)
     _thread_export_runner: WorkspaceThreadExportRunner = field(init=False, repr=False)
     config_reload: ConfigReloadLifecycle = field(init=False)
@@ -463,6 +465,7 @@ class _MultiAgentOrchestrator:
             api_enabled=self.api_enabled,
             agent_reply_memberships=self.agent_reply_memberships,
         )
+        self._skill_reviews = SkillReviewRunner(self.runtime_paths, lambda agent_name: self.agent_bots.get(agent_name))
         self._todo_poke_runtime = TodoPokeRuntimeCoordinator(
             runtime_paths=self.runtime_paths,
             config_provider=lambda: self.config,
@@ -550,6 +553,11 @@ class _MultiAgentOrchestrator:
     def knowledge_refresh_scheduler(self) -> KnowledgeRefreshScheduler:
         """Return the orchestrator-owned background knowledge refresh scheduler."""
         return self._knowledge_refresh_scheduler
+
+    @property
+    def skill_reviews(self) -> SkillReviewRunner:
+        """Return the orchestrator-owned runner of automatic skill reviews."""
+        return self._skill_reviews
 
     def entity_first_sync_complete(self, entity_name: str) -> bool | None:
         """Return first-sync readiness for the current entity generation."""
@@ -2500,6 +2508,7 @@ class _MultiAgentOrchestrator:
         await _run_shutdown_step("todo_poke", self._todo_poke_runtime.stop())
         await _run_shutdown_step("thread_exports", self._thread_export_runner.stop())
         await _run_shutdown_step("memory_auto_flush", self._stop_memory_auto_flush_worker())
+        await _run_shutdown_step("skill_reviews", self._skill_reviews.stop())
         await _run_shutdown_step("knowledge_source_watchers", self._knowledge_source_watcher.shutdown())
         await _run_shutdown_step("knowledge_refresh", self._knowledge_refresh_scheduler.shutdown())
         await _run_shutdown_step("bot_start_tasks", self._cancel_bot_start_tasks())

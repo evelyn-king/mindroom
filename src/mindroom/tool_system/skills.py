@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import platform
@@ -9,6 +10,7 @@ import re
 import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,11 +21,13 @@ from agno.skills.loaders import SkillLoader
 from agno.skills.skill import Skill
 
 from mindroom import yaml_io
+from mindroom.background_tasks import create_background_task
 from mindroom.constants import runtime_env_values
 from mindroom.credentials import get_runtime_credentials_manager
 from mindroom.logging_config import get_logger
 from mindroom.path_confinement import open_directory_within_root, read_regular_file_within_root
 from mindroom.tool_system.output_files import ToolOutputFilePolicy, wrap_function_for_output_files
+from mindroom.tool_system.skill_usage import record_skill_use
 from mindroom.tool_system.worker_routing import agent_workspace_root_path
 
 if TYPE_CHECKING:
@@ -34,14 +38,14 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-_SKILL_FILENAME = "SKILL.md"
+SKILL_FILENAME = "SKILL.md"
 _WORKSPACE_SKILLS_DIRNAME = "skills"
 _MAX_WORKSPACE_SKILLS = 256
-_MAX_WORKSPACE_SKILL_FILE_BYTES = 1 << 20
+MAX_WORKSPACE_SKILL_FILE_BYTES = 1 << 20
 _MAX_WORKSPACE_SKILLS_BYTES = 8 << 20
 # Names, descriptions, and file listings reach every system prompt, not only the skills a model opens.
-_MAX_WORKSPACE_SKILL_NAME_CHARS = 64
-_MAX_WORKSPACE_SKILL_DESCRIPTION_CHARS = 1024
+MAX_WORKSPACE_SKILL_NAME_CHARS = 64
+MAX_WORKSPACE_SKILL_DESCRIPTION_CHARS = 1024
 _MAX_WORKSPACE_SKILL_LISTING_ENTRIES = 256
 _FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 
@@ -160,6 +164,39 @@ class _MindroomSkills(Skills):
 
         logger.debug("Loaded skills", count=len(self._skills))
 
+    # AGNO_COMPAT: Skills offers no hook for when an agent loads a skill.
+    # Reason: Agno 3.0.9 Skills.get_tools binds the private _get_skill_instructions directly, so counting workspace
+    #   skill loads for the skill learner's inactivity clock requires overriding it.
+    # Upstream issue: Tracking gap; no issue for a skill-load callback has been identified.
+    # Upstream PR: None identified.
+    # Remove when: Skills calls a hook when a skill's instructions or files are loaded.
+    # Coverage: tests/test_skills.py::test_workspace_skill_loads_record_usage_but_configured_skills_do_not.
+    def _get_skill_instructions(self, skill_name: str) -> str:
+        self._record_use(skill_name)
+        return super()._get_skill_instructions(skill_name)
+
+    def _record_use(self, skill_name: str) -> None:
+        """Record one agent load of a workspace skill directory; configured skills are not recorded.
+
+        Usage records live beside skill directories, so a workspace whose ``skills/`` is itself one skill keeps none.
+        Agno calls the skill tools on the event loop, so there the usage write runs in a thread.
+        """
+        workspace_root = self._workspace_roots_by_skill.get(skill_name)
+        skill = self.get_skill(skill_name)
+        if (
+            workspace_root is None
+            or skill is None
+            or Path(skill.source_path).parent != workspace_root / _WORKSPACE_SKILLS_DIRNAME
+        ):
+            return
+        record = partial(record_skill_use, Path(skill.source_path))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            record()
+            return
+        create_background_task(asyncio.to_thread(record), name="record_skill_use")
+
     # AGNO_COMPAT: Skills reads skill references and scripts by path, following links.
     # Reason: Agno 3.0.9 Skills._get_skill_reference and _get_skill_script open files below a
     #   skill's source_path by path, so a workspace skill file swapped for a link or FIFO would
@@ -219,12 +256,14 @@ class _MindroomSkills(Skills):
             payload = read_regular_file_within_root(
                 workspace_root,
                 relative_path,
-                max_bytes=_MAX_WORKSPACE_SKILL_FILE_BYTES,
+                max_bytes=MAX_WORKSPACE_SKILL_FILE_BYTES,
             )
-            return {"content": payload.decode("utf-8")}
+            content = payload.decode("utf-8")
         except (OSError, ValueError) as exc:
             logger.warning("Refused a workspace skill file", path=str(workspace_root / relative_path), error=str(exc))
             return {"error": f"Error reading workspace skill file {filename}: {type(exc).__name__}"}
+        self._record_use(skill_name)
+        return {"content": content}
 
 
 def build_agent_skills(
@@ -342,6 +381,16 @@ def _get_default_skill_roots() -> list[Path]:
     return _unique_paths([_get_bundled_skills_dir(), *_PLUGIN_SKILL_ROOTS, get_user_skills_dir()])
 
 
+def agent_workspace_skills_root(runtime_paths: RuntimePaths, agent_name: str, *, workspace_root: Path | None) -> Path:
+    """Return the ``skills`` directory of a resolved workspace, or of the agent's canonical shared workspace."""
+    root = (
+        workspace_root
+        if workspace_root is not None
+        else agent_workspace_root_path(runtime_paths.storage_root, agent_name)
+    )
+    return root / _WORKSPACE_SKILLS_DIRNAME
+
+
 def _resolve_configured_skill_roots(skill_roots: Sequence[Path] | None = None) -> list[Path]:
     """Return configured global skill roots without the agent workspace root."""
     return _unique_paths(list(skill_roots) if skill_roots is not None else _get_default_skill_roots())
@@ -368,7 +417,7 @@ def list_skill_listings(roots: Sequence[Path] | None = None) -> list[_SkillListi
             listing = _SkillListing(
                 name=resolved_frontmatter.name,
                 description=resolved_frontmatter.description,
-                path=skill_dir / _SKILL_FILENAME,
+                path=skill_dir / SKILL_FILENAME,
                 origin=origin,
             )
             skills_by_name[listing.name] = listing
@@ -419,7 +468,7 @@ def _snapshot_skill_files(root: Path) -> list[tuple[str, int, int]]:
         return []
 
     entries: list[tuple[str, int, int]] = []
-    for skill_file in root.rglob(_SKILL_FILENAME):
+    for skill_file in root.rglob(SKILL_FILENAME):
         try:
             stat = skill_file.stat()
         except OSError:
@@ -433,34 +482,47 @@ def _iter_skill_dirs(root: Path) -> list[Path]:
     if not root.exists() or not root.is_dir():
         return []
 
-    if (root / _SKILL_FILENAME).exists():
+    if (root / SKILL_FILENAME).exists():
         return [root]
 
     skill_dirs = [
         path
         for path in root.iterdir()
-        if path.is_dir() and not path.name.startswith(".") and (path / _SKILL_FILENAME).exists()
+        if path.is_dir() and not path.name.startswith(".") and (path / SKILL_FILENAME).exists()
     ]
     return sorted(skill_dirs)
 
 
-def _parse_skill_frontmatter(content: str, *, path: str, allow_missing: bool) -> tuple[dict[str, Any], str] | None:
-    """Split one ``SKILL.md`` into its frontmatter mapping and instructions."""
+class SkillMarkdownError(ValueError):
+    """A ``SKILL.md`` whose frontmatter skill loading cannot read."""
+
+
+def parse_skill_markdown(content: str) -> tuple[dict[str, Any], str]:
+    """Split one ``SKILL.md`` into its frontmatter mapping and instructions, as skill loading reads them."""
     match = _FRONTMATTER_PATTERN.match(content)
     if not match:
-        if allow_missing:
-            return {}, content
-        logger.warning("Skill missing frontmatter", path=path)
-        return None
+        msg = "Skill missing frontmatter"
+        raise SkillMarkdownError(msg)
     try:
         frontmatter = yaml_io.safe_load(match.group(1)) or {}
     except Exception as exc:
-        logger.warning("Failed to parse skill frontmatter", path=path, error=str(exc))
-        return None
+        msg = f"Failed to parse skill frontmatter: {exc}"
+        raise SkillMarkdownError(msg) from exc
     if not isinstance(frontmatter, dict):
-        logger.warning("Skill frontmatter must be a mapping", path=path)
-        return None
+        msg = "Skill frontmatter must be a mapping"
+        raise SkillMarkdownError(msg)
     return cast("dict[str, Any]", frontmatter), match.group(2).strip()
+
+
+def _parse_skill_frontmatter(content: str, *, path: str, allow_missing: bool) -> tuple[dict[str, Any], str] | None:
+    """Split one ``SKILL.md`` into its frontmatter mapping and instructions, or warn and return None."""
+    if allow_missing and not _FRONTMATTER_PATTERN.match(content):
+        return {}, content
+    try:
+        return parse_skill_markdown(content)
+    except SkillMarkdownError as exc:
+        logger.warning("Refused skill frontmatter", path=path, error=str(exc))
+        return None
 
 
 def _read_skill_frontmatter(
@@ -499,7 +561,7 @@ def _resolve_skill_frontmatter(
     allow_missing_frontmatter: bool = False,
 ) -> _ResolvedSkillFrontmatter | None:
     frontmatter = _read_skill_frontmatter(
-        skill_dir / _SKILL_FILENAME,
+        skill_dir / SKILL_FILENAME,
         allow_missing=allow_missing_frontmatter,
     )
     if frontmatter is None:
@@ -544,7 +606,7 @@ def _load_root_skills(root: Path) -> list[Skill]:
     return skills
 
 
-def _workspace_skill_file_names(skill_fd: int, dirname: str) -> list[str]:
+def workspace_skill_file_names(skill_fd: int, dirname: str) -> list[str]:
     """Return the regular files one workspace skill lists in ``dirname``, never following links."""
     try:
         with open_directory_within_root(skill_fd, dirname) as listing_fd:
@@ -568,33 +630,33 @@ def _load_workspace_skill(skill_fd: int, source_path: Path) -> Skill | None:
     try:
         content = read_regular_file_within_root(
             skill_fd,
-            _SKILL_FILENAME,
-            max_bytes=_MAX_WORKSPACE_SKILL_FILE_BYTES,
+            SKILL_FILENAME,
+            max_bytes=MAX_WORKSPACE_SKILL_FILE_BYTES,
         ).decode("utf-8")
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as exc:
-        logger.warning("Refused a workspace skill file", path=str(source_path / _SKILL_FILENAME), error=str(exc))
+        logger.warning("Refused a workspace skill file", path=str(source_path / SKILL_FILENAME), error=str(exc))
         return None
     parsed = _parse_skill_frontmatter(content, path=str(source_path), allow_missing=True)
     if parsed is None:
         return None
     frontmatter, instructions = parsed
     name = frontmatter.get("name", source_path.name)
-    if isinstance(name, str) and len(name) > _MAX_WORKSPACE_SKILL_NAME_CHARS:
-        logger.warning("Refused a workspace skill whose name is too long", path=str(source_path / _SKILL_FILENAME))
+    if isinstance(name, str) and len(name) > MAX_WORKSPACE_SKILL_NAME_CHARS:
+        logger.warning("Refused a workspace skill whose name is too long", path=str(source_path / SKILL_FILENAME))
         return None
     description = frontmatter.get("description", "")
-    if isinstance(description, str) and len(description) > _MAX_WORKSPACE_SKILL_DESCRIPTION_CHARS:
-        logger.warning("Truncated a workspace skill description", path=str(source_path / _SKILL_FILENAME))
-        description = description[:_MAX_WORKSPACE_SKILL_DESCRIPTION_CHARS]
+    if isinstance(description, str) and len(description) > MAX_WORKSPACE_SKILL_DESCRIPTION_CHARS:
+        logger.warning("Truncated a workspace skill description", path=str(source_path / SKILL_FILENAME))
+        description = description[:MAX_WORKSPACE_SKILL_DESCRIPTION_CHARS]
     return Skill(
         name=name,
         description=description,
         instructions=instructions,
         source_path=str(source_path),
-        scripts=_workspace_skill_file_names(skill_fd, "scripts"),
-        references=_workspace_skill_file_names(skill_fd, "references"),
+        scripts=workspace_skill_file_names(skill_fd, "scripts"),
+        references=workspace_skill_file_names(skill_fd, "references"),
         metadata=frontmatter.get("metadata"),
         license=frontmatter.get("license"),
         compatibility=frontmatter.get("compatibility"),
@@ -608,7 +670,7 @@ def _load_workspace_skills(workspace_root: Path) -> list[Skill]:
     try:
         with open_directory_within_root(workspace_root, _WORKSPACE_SKILLS_DIRNAME) as skills_fd:
             try:
-                os.stat(_SKILL_FILENAME, dir_fd=skills_fd, follow_symlinks=False)
+                os.stat(SKILL_FILENAME, dir_fd=skills_fd, follow_symlinks=False)
             except FileNotFoundError:
                 pass
             else:
@@ -667,14 +729,15 @@ def _normalize_skill(skill: Skill) -> Skill | None:
 
     skill.name, skill.description = normalized
 
-    metadata = _parse_metadata(skill.metadata, path=skill.source_path)
+    metadata = parse_skill_metadata(skill.metadata, path=skill.source_path)
     if metadata is None:
         return None
     skill.metadata = metadata
     return skill
 
 
-def _parse_metadata(raw: object, *, path: str) -> dict[str, Any] | None:
+def parse_skill_metadata(raw: object, *, path: str) -> dict[str, Any] | None:
+    """Return skill metadata as a mapping, accepting OpenClaw JSON5 strings, or warn and return None."""
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return {}
     if isinstance(raw, dict):
