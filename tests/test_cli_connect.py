@@ -312,7 +312,130 @@ def test_run_device_pairing_flags_malformed_owner_user_id() -> None:
     )
 
     assert result.owner_user_id is None
-    assert result.owner_user_id_invalid is True
+    assert result.rejected_owner_user_id == "alice"
+
+
+def _pair_once(responses: list[httpx.Response]) -> cli_connect.PairCompleteResult | None:
+    return cli_connect.run_device_pairing(
+        provisioning_url="https://provisioning.example",
+        client_name="devbox",
+        client_fingerprint="sha256:test",
+        matrix_ssl_verify=True,
+        announce=lambda _session: None,
+        post_request=_fake_transport(responses, []),
+        sleep=lambda _seconds: None,
+        renew_expired=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "owner_user_id",
+    [
+        '@alice:mindroom.chat","@mallory:evil.example',
+        '@al"ice:mindroom.chat',
+        "@alice\\:mindroom.chat",
+        "@alice:mindroom.chat\\",
+        "@alice:mindroom.chat#",
+        "@Alice:mindroom.chat",
+    ],
+)
+def test_owner_user_id_outside_the_matrix_grammar_never_reaches_config(tmp_path: Path, owner_user_id: str) -> None:
+    """A service-supplied owner that is not a Matrix user ID is flagged and never spliced into YAML."""
+    result = _pair_once(
+        [httpx.Response(200, json=_START), httpx.Response(200, json={**_CONNECTED, "owner_user_id": owner_user_id})],
+    )
+    assert result is not None
+    assert result.owner_user_id is None
+    assert result.rejected_owner_user_id == owner_user_id
+
+    config_path = tmp_path / "config.yaml"
+    original = f"authorization:\n  global_users:\n    - {OWNER_MATRIX_USER_ID_PLACEHOLDER}\n"
+    config_path.write_text(original, encoding="utf-8")
+    assert (
+        cli_connect.replace_owner_placeholders_in_config(config_path=config_path, owner_user_id=owner_user_id) is False
+    )
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("client_id", "client-123\nMINDROOM_STORAGE_PATH=/tmp/attacker"),
+        ("client_secret", 'secret\nMINDROOM_STORAGE_PATH="/tmp/x\nExecStartPre=/bin/sh -c id\n#"'),
+        ("client_secret", "secret\rMATRIX_HOMESERVER=https://attacker.example"),
+        ("client_secret", "secret\u2028MATRIX_HOMESERVER=https://attacker.example"),
+        ("client_secret", "secret $HOME"),
+        ("client_secret", "secret#comment"),
+        ("client_secret", "s" * 513),
+    ],
+)
+def test_pairing_credentials_outside_the_token_grammar_are_refused(field: str, value: str) -> None:
+    """Issued credentials land in .env and service units, so anything but a plain token fails the pairing."""
+    with pytest.raises(ValueError, match=f"Provisioning response has invalid {field}"):
+        _pair_once([httpx.Response(200, json=_START), httpx.Response(200, json={**_CONNECTED, field: value})])
+
+
+def test_pairing_accepts_token_shaped_credentials() -> None:
+    """URL-safe and standard base64 tokens, as provisioning services issue them, still pair."""
+    result = _pair_once(
+        [
+            httpx.Response(200, json=_START),
+            httpx.Response(200, json={**_CONNECTED, "client_id": "Ab3_-.~x", "client_secret": "q+/Z9w=="}),
+        ],
+    )
+
+    assert result is not None
+    assert (result.client_id, result.client_secret) == ("Ab3_-.~x", "q+/Z9w==")
+
+
+@pytest.mark.parametrize(
+    "approve_url",
+    [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "smb://attacker.example/share",
+        "x-mindroom-helper://run",
+        "https:///connect",
+        "http://evil.example\\@127.0.0.1/connect",
+        "https://user@chat.example/connect",
+        "https://:secret@chat.example/connect",
+        "https://chat.example/connect?code=ABCD EFGH",
+        "https://chat.example/connect\n?code=ABCD-EFGH",
+    ],
+)
+def test_pairing_refuses_approve_urls_a_browser_should_not_open(approve_url: str) -> None:
+    """The service's approval link may be opened automatically, so it must be a plain http(s) URL."""
+    with pytest.raises(ValueError, match="Pairing response has invalid approve_url"):
+        _pair_once([httpx.Response(200, json={**_START, "approve_url": approve_url})])
+
+
+@pytest.mark.parametrize(
+    "approve_url",
+    [
+        "https://chat.example/connect?code=ABCD-EFGH",
+        "http://localhost:8080/connect?code=ABCD-EFGH",
+        "http://[::1]:8080/connect?code=ABCD-EFGH",
+        "http://10.0.0.5:8776/connect?code=ABCD-EFGH",
+        "http://provisioning.tailnet.example/connect?code=ABCD-EFGH",
+    ],
+)
+def test_pairing_accepts_http_and_https_approve_urls(approve_url: str) -> None:
+    """Hosted approval pages and self-hosted provisioning services on a LAN, tailnet, or loopback keep working."""
+    announced: list[cli_connect.DevicePairSession] = []
+    cli_connect.run_device_pairing(
+        provisioning_url="https://provisioning.example",
+        client_name="devbox",
+        client_fingerprint="sha256:test",
+        matrix_ssl_verify=True,
+        announce=announced.append,
+        post_request=_fake_transport(
+            [httpx.Response(200, json={**_START, "approve_url": approve_url}), httpx.Response(200, json=_CONNECTED)],
+            [],
+        ),
+        sleep=lambda _seconds: None,
+    )
+
+    assert [session.approve_url for session in announced] == [approve_url]
 
 
 def test_render_qr_draws_the_link_with_block_characters() -> None:
@@ -1030,6 +1153,55 @@ def test_pair_local_install_discards_credentials_when_the_approver_is_not_this_u
     assert "Approved by @alice:mindroom.chat." in out.getvalue()
     assert "secret-123" not in out.getvalue()
     assert not (tmp_path / ".env").exists()
+    assert OWNER_MATRIX_USER_ID_PLACEHOLDER in config_path.read_text()
+
+
+@pytest.mark.parametrize(
+    ("owner_user_id", "shown"),
+    [("@Alice:selfhosted.example", "'@Alice:selfhosted.example'"), (42, "'42'")],
+)
+def test_pair_local_install_still_asks_about_an_approver_it_cannot_save(
+    tmp_path: Path,
+    owner_user_id: object,
+    shown: str,
+) -> None:
+    """A named approver outside the Matrix grammar is shown and confirmed like any other, never treated as unnamed."""
+    runtime_paths, config_path = _approval_install(tmp_path)
+    out = io.StringIO()
+    connected = {**_CONNECTED, "owner_user_id": owner_user_id}
+    asked: list[bool] = []
+
+    def _decline() -> bool:
+        asked.append(True)
+        return False
+
+    with pytest.raises(ValueError, match=rf"approved by {shown} is unusable"):
+        cli_connect.pair_local_install(
+            runtime_paths,
+            console=Console(file=out, width=200),
+            provisioning_url="https://provisioning.example",
+            post_request=_fake_transport([httpx.Response(200, json=_START), httpx.Response(200, json=connected)], []),
+            sleep=lambda _seconds: None,
+            confirm_approver=_decline,
+        )
+
+    assert asked == [True]
+    assert f"Approved by {shown}, which is not a valid Matrix user ID." in out.getvalue()
+    assert not (tmp_path / ".env").exists()
+
+    result = cli_connect.pair_local_install(
+        runtime_paths,
+        console=Console(file=io.StringIO(), width=200),
+        provisioning_url="https://provisioning.example",
+        post_request=_fake_transport([httpx.Response(200, json=_START), httpx.Response(200, json=connected)], []),
+        sleep=lambda _seconds: None,
+        confirm_approver=lambda: True,
+    )
+
+    assert result is not None
+    env_content = (tmp_path / ".env").read_text()
+    assert "MINDROOM_LOCAL_CLIENT_SECRET=secret-123" in env_content
+    assert OWNER_MATRIX_USER_ID_ENV not in env_content
     assert OWNER_MATRIX_USER_ID_PLACEHOLDER in config_path.read_text()
 
 

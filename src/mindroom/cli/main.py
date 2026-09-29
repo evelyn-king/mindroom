@@ -191,7 +191,8 @@ def run(
                     confirm_approver=_approver_confirmation(),
                 )
     except (OSError, TypeError, ValueError) as exc:
-        console.print(f"[red]Error:[/red] {exc}")
+        # Pairing errors can carry text the provisioning service chose, such as an approver or error detail.
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
         raise typer.Exit(1) from None
 
     asyncio.run(
@@ -701,7 +702,7 @@ def connect(
                 # Preserve the result through shutdown; Python resets callable handlers during finalization.
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
     except (TypeError, ValueError) as exc:
-        console.print(f"[red]Error:[/red] {exc}")
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
         raise typer.Exit(1) from None
 
 

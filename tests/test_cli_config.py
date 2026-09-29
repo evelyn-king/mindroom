@@ -770,6 +770,65 @@ class TestConfigInit:
         assert config["room_defaults"]["invite_users"] == ["@alice:mindroom.chat"]
         assert config["room_defaults"]["admins"] == ["@alice:mindroom.chat"]
 
+    def test_init_mindroom_chat_warns_about_a_saved_owner_it_cannot_use(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A saved owner outside the current Matrix grammar is reported, not silently dropped."""
+        target = tmp_path / "config.yaml"
+        (tmp_path / ".env").write_text(f"{OWNER_MATRIX_USER_ID_ENV}=@Alice:selfhosted.example\n", encoding="utf-8")
+
+        result = runner.invoke(
+            app,
+            [
+                "config",
+                "init",
+                "--path",
+                str(target),
+                "--matrix-server",
+                "mindroom.chat",
+                "--provider",
+                "vertexai_claude",
+            ],
+            input="n\n",
+        )
+
+        assert result.exit_code == 0
+        # Rich folds long paths mid-token, so compare without any whitespace.
+        output = "".join(result.output.split())
+        expected = f"{OWNER_MATRIX_USER_ID_ENV} in {tmp_path / '.env'} is not a valid Matrix user ID ('@Alice:selfhosted.example')"
+        assert "".join(expected.split()) in output
+        assert OWNER_MATRIX_USER_ID_PLACEHOLDER in target.read_text(encoding="utf-8")
+
+    def test_init_names_the_environment_as_the_source_of_an_unusable_owner(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An owner that came from the process environment is not blamed on `.env`."""
+        target = tmp_path / "config.yaml"
+        monkeypatch.setenv(OWNER_MATRIX_USER_ID_ENV, "@Alice:selfhosted.example")
+
+        result = runner.invoke(
+            app,
+            [
+                "config",
+                "init",
+                "--path",
+                str(target),
+                "--matrix-server",
+                "mindroom.chat",
+                "--provider",
+                "vertexai_claude",
+            ],
+            input="n\n",
+        )
+
+        assert result.exit_code == 0
+        output = normalize_console_output(result.output)
+        assert f"{OWNER_MATRIX_USER_ID_ENV} in the environment is not a valid Matrix user ID" in output
+        assert ".env is not a valid" not in output
+
     def test_init_mindroom_chat_codex_writes_hosted_codex_defaults(self, tmp_path: Path) -> None:
         """Hosted Codex config should use Codex defaults and hosted Matrix settings."""
         target = tmp_path / "config.yaml"
@@ -4331,7 +4390,8 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
         """Printed exports must remain one literal shell value."""
         cfg = tmp_path / "config.yaml"
         cfg.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n")
-        client_secret = f"[red]{'x' * 120};$(id)[/red]"
+        provisioning_url = "https://x.test/[red]a b;$(id)[/red]"
+        client_secret = "x" * 120
         responses = [
             httpx.Response(
                 200,
@@ -4347,7 +4407,7 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
                 200,
                 json={
                     "status": "connected",
-                    "client_id": "client value",
+                    "client_id": "client-123",
                     "client_secret": client_secret,
                     "namespace": "a1b2c3d4",
                     "owner_user_id": "@alice:mindroom.chat",
@@ -4361,16 +4421,16 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
             [
                 "connect",
                 "--provisioning-url",
-                "https://x.test/a b",
+                provisioning_url,
                 "--no-persist-env",
             ],
             cfg,
         )
 
         assert result.exit_code == 0
-        assert "export MINDROOM_PROVISIONING_URL='https://x.test/a b'" in result.output
-        assert "export MINDROOM_LOCAL_CLIENT_ID='client value'" in result.output
-        assert f"  export MINDROOM_LOCAL_CLIENT_SECRET='{client_secret}'" in result.output.splitlines()
+        assert f"  export MINDROOM_PROVISIONING_URL='{provisioning_url}'" in result.output.splitlines()
+        assert "export MINDROOM_LOCAL_CLIENT_ID=client-123" in result.output
+        assert f"  export MINDROOM_LOCAL_CLIENT_SECRET={client_secret}" in result.output.splitlines()
         assert "export MINDROOM_NAMESPACE=a1b2c3d4" in result.output
 
     def test_connect_uses_runtime_env_default_provisioning_url(

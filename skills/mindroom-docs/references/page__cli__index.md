@@ -1424,6 +1424,7 @@ mindroom connect
 The command prints an approval link, a pair code, and (in a terminal) a QR code of the link.
 Open the link or scan the QR code while signed in to MindRoom Chat and approve the machine, or enter the code in MindRoom Chat → Settings → Local MindRoom.
 Add `--open-browser` to open the approval link in your default browser.
+The link must be a plain `http` or `https` URL without credentials, backslashes, or whitespace; any other link from the provisioning service fails the pairing.
 Approve only when the code on the page matches your terminal (`Approve only if the page shows code ABCD-EFGH`); the page also shows the address the request came from.
 
 `connect` makes one attempt: if nobody approves within 10 minutes, it exits with `Approval timed out. Run the command again to get a new link.`
@@ -1466,7 +1467,12 @@ On success (default `--persist-env`), this writes to `.env` next to `config.yaml
 - `MINDROOM_LOCAL_CLIENT_SECRET`
 - `MINDROOM_NAMESPACE`
 
+The client ID and secret must be plain tokens of letters, digits, and `._~+/-` of at most 512 characters, optionally followed by `=` padding; any other value fails the pairing before anything is saved.
+
 If your config still contains the owner placeholder token `__MINDROOM_OWNER_USER_ID_FROM_PAIRING__`, `connect` will auto-replace it in membership access and managed-room policy settings when pairing returns a valid `owner_user_id`.
+A valid `owner_user_id` is a Matrix user ID with a current-grammar localpart (lowercase letters, digits, and `._=/+-`) and a valid server name; any other value is reported as malformed and never written to `.env` or `config.yaml`.
+Such an account still counts as named: it is printed as `Approved by '<value>', which is not a valid Matrix user ID.` and, in a terminal, confirmed like any other approver.
+`mindroom config init` likewise warns when `MINDROOM_OWNER_USER_ID`, from the environment or `.env`, is outside that grammar, names where it came from, and leaves the owner placeholders for you to replace.
 
 Use `--no-persist-env` if you want to export variables only for the current shell session.
 
