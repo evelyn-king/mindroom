@@ -12824,10 +12824,14 @@ revoke_public_report("pub_...")
 `config_manager` exposes `get_info()`, `manage_config()`, `manage_agent()`, and `manage_team()`.
 `get_info(info_type, name=None)` supports `mindroom_docs`, `config_schema`, `available_models`, `agents`, `teams`, `available_tools`, `tool_details`, `agent_config`, and `agent_template`.
 `tool_details` requires `name` and reads from live `TOOL_METADATA`, so it includes real config fields and statuses from the current worktree.
-`agent_config` returns the authored YAML for a specific agent.
+`agent_config` returns the redacted authored YAML for a specific agent.
 `agent_template` generates starter YAML for one of the built-in template types: `researcher`, `developer`, `social`, `communicator`, `analyst`, or `productivity`.
 `manage_config(operation, path, changes, dry_run)` addresses the authored document written to `config.yaml` with RFC 6901 JSON Pointer paths.
 `manage_config(operation="inspect", path=...)` returns one authored subtree as YAML with secret-bearing values redacted at every pointer depth.
+Redaction masks every value inside a field the config schema marks secret, such as MCP server `env` and `headers`, plugin `settings`, and model `extra_kwargs`, whatever its key names, except `${NAME}` environment references, which are shown as written.
+Other typed fields keep their values, entries in free-form maps such as tool overrides are also masked when their key names look like credentials, and credential patterns in any text, such as URL passwords and bearer tokens, are masked.
+Inspection, `agent_config`, and every write require a requester listed in `administrators`; other requesters, and calls without a requester, receive an authorization error instead of configuration content.
+A patch whose value contains the `***redacted***` marker is refused, so copying inspected output back never replaces a hidden real value.
 `manage_config(operation="patch", changes=[...])` applies an atomic batch of RFC 6902 `add`, `replace`, and `remove` entries across the full `Config` schema, validates the result against the active runtime, and persists only when validation passes.
 `dry_run=True` validates a patch and returns its receipt without writing.
 Patch receipts report the config path, changed paths, and validation and persistence status without echoing changed values.
@@ -12897,7 +12901,8 @@ manage_team(
 ### What It Does
 
 `self_config` exposes `get_own_config()` and `update_own_config()`.
-`get_own_config()` returns the current agent's authored YAML block.
+`get_own_config()` returns the current agent's authored YAML block, redacted like `config_manager` inspection.
+Reads and writes both require a requester listed in `administrators`.
 `update_own_config()` only changes fields that you pass explicitly.
 On this branch, `update_own_config()` can modify `display_name`, `role`, `instructions`, `tools`, `model`, `rooms`, `markdown`, `learning`, `learning_mode`, `knowledge_bases`, `skills`, `include_default_tools`, `show_tool_calls`, `thread_mode`, `num_history_runs`, `num_history_messages`, `compress_tool_results`, `max_tool_calls_from_history`, and `context_files`.
 `update_own_config()` requires a requester listed in `administrators`, like [`config_manager`], and every call raises an approval card even when `tool_approval.default` is `auto_approve`.
@@ -14142,6 +14147,8 @@ Use `stdio` for local subprocess servers.
 
 `env` and `headers` values support `${ENV_VAR}` interpolation.
 MindRoom resolves those placeholders from the current runtime environment when it opens the MCP transport.
+Pass `stdio` credentials through `env`, preferably as `${ENV_VAR}` placeholders, never through `args`.
+Configuration displays such as `config_manager` inspection and `!config show` mask every `env` and `headers` value except whole `${ENV_VAR}` placeholders, but show `args` as written, and `args` support no placeholders.
 Static `headers` are process-global and shared by every requester.
 Use the OAuth `auth` block plus `worker_scope: user` or `worker_scope: user_agent` for remote MCP servers that need different bearer tokens by requester.
 Use `worker_scope: shared` when one connected account belongs to the agent and every authorized caller should use it.
@@ -14158,7 +14165,7 @@ Use `worker_scope: shared` when one connected account belongs to the agent and e
 | `required` | bool | `false` | Block dependent agent startup while this server is unavailable instead of degrading |
 | `transport` | string | *required* | One of `stdio`, `sse`, or `streamable-http` |
 | `command` | string | `null` | Required for `stdio` |
-| `args` | list[string] | `[]` | Optional `stdio` arguments |
+| `args` | list[string] | `[]` | Optional `stdio` arguments; shown unmasked, so never put credentials here |
 | `cwd` | string | `null` | Optional `stdio` working directory |
 | `env` | map[string,string] | `{}` | Optional `stdio` environment variables; supports `${ENV_VAR}` placeholders |
 | `url` | string | `null` | Required for `sse` and `streamable-http` |
@@ -18686,6 +18693,10 @@ Changes are validated against the Pydantic config schema before applying.
 !config get agents.analyst.display_name
 ```
 
+Shown values, including the current and new values in a `!config set` preview, are redacted like `config_manager` inspection.
+Every value inside a field the config schema marks secret is masked, such as MCP server `env` and `headers`, plugin `settings`, model `extra_kwargs`, API keys, and Git repository URLs, except `${NAME}` environment references, which name where a secret lives and are shown as written.
+Other typed fields keep their values; entries in free-form maps, such as tool overrides, are also masked when their key names look like credentials, and credential patterns in any text, such as URL passwords and bearer tokens, are masked.
+
 **Modify configuration:**
 
 ```
@@ -18712,6 +18723,10 @@ When you use `!config set`, MindRoom:
 
 Only the user who requested the change can confirm or cancel it.
 Pending changes are persisted in Matrix room state and survive restarts.
+Room state is readable by every room member and is not end-to-end encrypted, so the pending change stores the requester, room, thread, creation time, configuration path, and decision progress, but never the current value.
+It stores the new value only when redaction leaves that value unchanged.
+`!config set` refuses a value containing the `***redacted***` marker, which only appears in redacted output, so copying shown values back never replaces a hidden real value; set that field to its real value instead.
+A new value that redaction masks is kept only in the running MindRoom process; if MindRoom restarts before you confirm, the confirmation replies that the pending change was lost and asks you to run `!config set` again.
 Unconfirmed changes expire after 24 hours.
 
 Changes are saved to `config.yaml` immediately on confirmation and take effect for new agent interactions.
@@ -20061,8 +20076,9 @@ Session IDs are derived from request headers:
 Agent memory and conversation history persist across requests with the same session ID.
 For persistent MindRoom tool sessions (for example a long-running coding session), prefer `X-Session-Id`.
 
-Session IDs are namespaced internally with a hash of the API key to prevent cross-key session collision.
-Two different API keys using the same `X-Session-Id` value will not share a session.
+Session IDs are namespaced internally with the full SHA-256 digest of the validated API key to prevent cross-key session collision.
+Two different API keys using the same `X-Session-Id` value will not share a session, and differently spaced `Authorization` headers carrying the same key share that key's sessions.
+Without configured API keys, the `Authorization` header authenticates nothing, so every caller shares one unauthenticated namespace.
 
 ### Claude Agent tool sessions
 
@@ -20090,6 +20106,7 @@ The API accepts but ignores these OpenAI parameters (the agent's own config cont
 - `n`, `stop`, `frequency_penalty`, `presence_penalty`, `seed`
 - `response_format`, `logprobs`, `logit_bias`
 - `stream_options` (usage stats are always zeros)
+- `user` (agent and team runs belong to the key's mapped requester, or to no user for unmapped keys, so the field never selects another user's memory, learning, or usage attribution)
 
 Client `system` / `developer` messages are prepended to the prompt. They augment the agent's built-in instructions, not replace them.
 
