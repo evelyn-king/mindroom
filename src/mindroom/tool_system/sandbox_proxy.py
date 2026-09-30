@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 import httpx
 
 from mindroom.config.worker_projection import worker_config_data
-from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, build_execution_tool_env
+from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, PROVIDER_ENV_KEYS, build_execution_tool_env
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.tool_system.declarations import SupportsPrimaryCallPlacement, declare_tool_schema_source
 from mindroom.tool_system.registry_state import TOOL_METADATA
@@ -912,6 +912,29 @@ def sandbox_proxy_enabled_for_tool(
     )
 
 
+def primary_owns_tool_settings(
+    tool_name: str,
+    *,
+    runtime_paths: RuntimePaths,
+    worker_tools_override: list[str] | None = None,
+) -> bool:
+    """Return whether routing runs this registered tool in the primary, so its settings must stay in primary stores.
+
+    Model provider services double as provider keys that workers read, so they keep their existing placement.
+    """
+    if (
+        tool_name not in TOOL_METADATA
+        or tool_name in PROVIDER_ENV_KEYS
+        or sandbox_proxy_config(runtime_paths).runner_mode
+    ):
+        return False
+    return not sandbox_proxy_enabled_for_tool(
+        tool_name,
+        runtime_paths=runtime_paths,
+        worker_tools_override=worker_tools_override,
+    )
+
+
 def _call_proxy_sync(
     *,
     runtime_paths: RuntimePaths,
@@ -927,6 +950,7 @@ def _call_proxy_sync(
     execution_env: dict[str, str] | None = None,
     extra_env_passthrough: str | None = None,
     worker_target: ResolvedWorkerTarget | None = None,
+    authored_worker_tools: list[str] | None = None,
 ) -> object:
     from mindroom.tool_system.worker_arguments import prepare_worker_call_arguments  # noqa: PLC0415
 
@@ -998,6 +1022,12 @@ def _call_proxy_sync(
             worker_handle=worker_handle,
             worker_manager=worker_manager,
             client_factory=httpx.Client,
+            # Leased settings of other tools the primary builds live where the dashboard saves them.
+            primary_built_service=functools.partial(
+                primary_owns_tool_settings,
+                runtime_paths=runtime_paths,
+                worker_tools_override=authored_worker_tools,
+            ),
         )
         from mindroom.tool_system.media_attachments import finalize_tool_media  # noqa: PLC0415
         from mindroom.tool_system.media_transport import (  # noqa: PLC0415
@@ -1031,6 +1061,7 @@ def _wrap_sync_function(
     extra_env_passthrough: str | None = None,
     worker_target: ResolvedWorkerTarget | None = None,
     primary_placement: SupportsPrimaryCallPlacement | None = None,
+    authored_worker_tools: list[str] | None = None,
 ) -> Function:
     wrapped = function.model_copy(deep=False)
     entrypoint = function.entrypoint
@@ -1057,6 +1088,7 @@ def _wrap_sync_function(
             execution_env=execution_env,
             extra_env_passthrough=extra_env_passthrough,
             worker_target=worker_target,
+            authored_worker_tools=authored_worker_tools,
         )
 
     declare_tool_schema_source(proxy_entrypoint, entrypoint)
@@ -1078,6 +1110,7 @@ def _wrap_async_function(
     extra_env_passthrough: str | None = None,
     worker_target: ResolvedWorkerTarget | None = None,
     primary_placement: SupportsPrimaryCallPlacement | None = None,
+    authored_worker_tools: list[str] | None = None,
 ) -> Function:
     wrapped = function.model_copy(deep=False)
     entrypoint = function.entrypoint
@@ -1105,6 +1138,7 @@ def _wrap_async_function(
             execution_env=execution_env,
             extra_env_passthrough=extra_env_passthrough,
             worker_target=worker_target,
+            authored_worker_tools=authored_worker_tools,
         )
         return await _run_in_worker_proxy_executor(call)
 
@@ -1125,11 +1159,13 @@ def maybe_wrap_toolkit_for_sandbox_proxy(
     extra_env_passthrough: str | None = None,
     worker_tools_override: list[str] | None = None,
     worker_target: ResolvedWorkerTarget | None = None,
+    authored_worker_tools: list[str] | None = None,
 ) -> Toolkit:
     """Wrap toolkit functions so calls execute through the sandbox runner API.
 
     Note: mutates ``toolkit.functions`` and ``toolkit.async_functions`` in place.
     Callers must pass a freshly-created toolkit (``get_tool_by_name`` does this).
+    ``authored_worker_tools`` is the agent's configured routing, which decides where leased services are stored.
     """
     if not sandbox_proxy_enabled_for_tool(
         tool_name,
@@ -1160,6 +1196,7 @@ def maybe_wrap_toolkit_for_sandbox_proxy(
             extra_env_passthrough=extra_env_passthrough,
             worker_target=worker_target,
             primary_placement=primary_placement,
+            authored_worker_tools=authored_worker_tools,
         )
         for function_name, function in original_functions.items()
     }
@@ -1177,6 +1214,7 @@ def maybe_wrap_toolkit_for_sandbox_proxy(
             extra_env_passthrough=extra_env_passthrough,
             worker_target=worker_target,
             primary_placement=primary_placement,
+            authored_worker_tools=authored_worker_tools,
         )
         for function_name, function in original_async_functions.items()
     }

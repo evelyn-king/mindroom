@@ -88,6 +88,7 @@ async def test_manual_oauth_fallback_status_is_requester_scoped_and_secret_free(
         {"access_token": manual_secret, "base_url": "https://api.github.com"},
         credentials_manager=manager,
         worker_target=alice_target,
+        primary_built_tool=True,
     )
     alice_tool = _github_tool()
     bob_tool = _github_tool()
@@ -112,6 +113,7 @@ async def test_blank_manual_oauth_fallback_does_not_mark_tool_available(tmp_path
         {"access_token": "   ", "base_url": "https://api.github.com"},
         credentials_manager=manager,
         worker_target=target,
+        primary_built_tool=True,
     )
     tool = _github_tool()
 
@@ -139,3 +141,46 @@ async def test_environment_oauth_fallback_status_is_available_and_secret_free(tm
     assert tool["manual_auth_configured"] is False
     assert tool["environment_auth_configured"] is True
     assert environment_secret not in repr(tool)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("worker_tools", "expected_status"),
+    [([], "available"), (["google_bigquery"], "requires_config")],
+)
+async def test_tool_status_reads_settings_from_where_the_tool_runs(
+    tmp_path: Path,
+    worker_tools: list[str],
+    expected_status: str,
+) -> None:
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "mindroom_data",
+        process_env={"MINDROOM_SANDBOX_PROXY_URL": "http://sandbox:8765", "MINDROOM_SANDBOX_PROXY_TOKEN": "token"},
+    )
+    manager = get_runtime_credentials_manager(runtime_paths)
+    target = resolve_worker_target("shared", "code", execution_identity=None, tenant_id="test-tenant")
+    assert target.worker_key is not None
+    manager.for_primary_runtime_agent_scope("code").save_credentials("google_bigquery", {"project": "primary"})
+    manager.for_worker(target.worker_key).save_credentials("google_bigquery", {"dataset": "worker-only"})
+    tool = {
+        "name": "google_bigquery",
+        "status": "requires_config",
+        "config_fields": [{"name": "project", "required": True}],
+    }
+    context = tools_api._ResolvedToolAvailabilityContext(
+        execution_scope="shared",
+        dashboard_configuration_supported=True,
+        status_authoritative=True,
+        credentials_manager=manager,
+        worker_target=target,
+        allowed_shared_services=None,
+        auth_provider_credential_services={},
+        oauth_providers={},
+        runtime_paths=runtime_paths,
+        worker_tools=worker_tools,
+    )
+
+    await tools_api._update_tools_statuses([tool], context)
+
+    assert tool["status"] == expected_status

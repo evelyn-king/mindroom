@@ -47,7 +47,7 @@ from mindroom.constants import (
     shell_extra_env_values,
     subprocess_path_with_prepends,
 )
-from mindroom.credentials import get_runtime_credentials_manager, save_scoped_credentials
+from mindroom.credentials import CredentialsManager, get_runtime_credentials_manager, save_scoped_credentials
 from mindroom.hooks import HookRegistry
 from mindroom.message_target import MessageTarget
 from mindroom.runtime_env_policy import VENDOR_TELEMETRY_ENV_VALUES
@@ -1285,6 +1285,67 @@ def test_proxy_requests_credential_lease_when_policy_matches(monkeypatch: pytest
 
 
 @pytest.mark.parametrize(
+    ("leased_service", "authored_worker_tools", "expected_token"),
+    [
+        ("github", None, "primary"),
+        ("google_bigquery", None, "worker"),
+        ("google_bigquery", ["calculator"], "primary"),
+    ],
+)
+def test_proxy_leases_service_settings_from_the_store_the_dashboard_uses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    leased_service: str,
+    authored_worker_tools: list[str] | None,
+    expected_token: str,
+) -> None:
+    """A leased service follows its own routing: primary-built tools from primary stores, routed ones from the worker."""
+    captured_calls: list[tuple[str, dict[str, Any]]] = []
+    runtime_paths = _configure_proxy_runtime(
+        monkeypatch,
+        proxy_url="http://sandbox-runner:8765",
+        execution_mode="all",
+        credential_policy={"calculator.add": (leased_service,)},
+    )
+    manager = CredentialsManager(tmp_path / "credentials")
+    target = resolve_worker_target("shared", "alpha", None, tenant_id="test-tenant")
+    assert target.worker_key is not None
+    manager.for_primary_runtime_agent_scope("alpha").save_credentials(leased_service, {"access_token": "primary"})
+    manager.for_worker(target.worker_key).save_credentials(leased_service, {"access_token": "worker"})
+    monkeypatch.setattr(
+        "mindroom.tool_system.sandbox_proxy.httpx.Client",
+        _recording_client_class(
+            captured_calls=captured_calls,
+            responder=lambda url, _json: (
+                {"lease_id": "lease-123", "expires_at": 123.0, "max_uses": 1}
+                if url.endswith("/leases")
+                else {"ok": True, "result": "proxied"}
+            ),
+        ),
+    )
+
+    # Construction passes the agent's resolved worker tools; leases must still route by the authored setting.
+    tool = get_tool_by_name(
+        "calculator",
+        runtime_paths,
+        credentials_manager=manager,
+        runtime_config=Config(
+            agents={"alpha": AgentConfig(display_name="Alpha", worker_tools=authored_worker_tools)},
+            models={},
+        ),
+        worker_tools_override=["calculator"],
+        worker_target=target,
+    )
+    entrypoint = tool.functions["add"].entrypoint
+    assert entrypoint is not None
+    assert entrypoint(1, 2) == "proxied"
+
+    lease_url, lease_payload = captured_calls[0]
+    assert lease_url.endswith("/leases")
+    assert lease_payload["credential_overrides"] == {"access_token": expected_token}
+
+
+@pytest.mark.parametrize(
     ("credential_policy", "expected_overrides"),
     [
         (None, {"api_key": "saved-key", "region": "eu"}),
@@ -1726,6 +1787,7 @@ def _sandbox_proxy_test_metadata(
     default_execution_target: ToolExecutionTarget = ToolExecutionTarget.PRIMARY,
     consumes_workspace_paths: bool = False,
     requires_primary_runtime: bool = False,
+    requires_room_context: bool = False,
 ) -> ToolMetadata:
     return ToolMetadata(
         name=name,
@@ -1736,6 +1798,7 @@ def _sandbox_proxy_test_metadata(
         default_execution_target=default_execution_target,
         consumes_workspace_paths=consumes_workspace_paths,
         requires_primary_runtime=requires_primary_runtime,
+        requires_room_context=requires_room_context,
     )
 
 
@@ -1784,6 +1847,62 @@ def test_declared_primary_runtime_requirement_cannot_be_overridden(monkeypatch: 
             worker_tools_override=[tool_name],
         )
         is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("requires_primary_runtime", "requires_room_context", "worker_tools", "flags", "expected"),
+    [
+        pytest.param(True, False, ["routing_test"], {}, True, id="primary-runtime"),
+        pytest.param(False, True, ["routing_test"], {}, True, id="room-context"),
+        pytest.param(False, False, [], {}, True, id="not-routed"),
+        pytest.param(False, False, ["routing_test"], {}, False, id="routed"),
+        pytest.param(False, False, [], {"runner_mode": True}, False, id="inside-worker"),
+    ],
+)
+def test_primary_owns_tool_settings_follows_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    requires_primary_runtime: bool,
+    requires_room_context: bool,
+    worker_tools: list[str],
+    flags: dict[str, bool],
+    expected: bool,
+) -> None:
+    """Only the primary process building a tool itself marks its settings as primary-built."""
+    monkeypatch.setitem(
+        TOOL_METADATA,
+        "routing_test",
+        _sandbox_proxy_test_metadata(
+            "routing_test",
+            requires_primary_runtime=requires_primary_runtime,
+            requires_room_context=requires_room_context,
+        ),
+    )
+    runtime_paths = _configure_proxy_runtime(
+        monkeypatch,
+        proxy_url="http://sandbox:8765",
+        runner_mode=flags.get("runner_mode", False),
+    )
+
+    assert (
+        sandbox_proxy_module.primary_owns_tool_settings(
+            "routing_test",
+            runtime_paths=runtime_paths,
+            worker_tools_override=worker_tools,
+        )
+        is expected
+    )
+
+
+def test_model_provider_services_keep_their_settings_placement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider services double as worker-read provider keys, so an unrouted same-named tool does not move them."""
+    runtime_paths = _configure_proxy_runtime(monkeypatch, proxy_url="http://sandbox:8765")
+
+    assert "openai" in TOOL_METADATA
+    assert not sandbox_proxy_module.primary_owns_tool_settings(
+        "openai",
+        runtime_paths=runtime_paths,
+        worker_tools_override=[],
     )
 
 
@@ -2041,6 +2160,44 @@ def test_get_tool_by_name_builds_google_bigquery_from_scoped_credentials(
     assert tool.location == "us-central1"
     assert captured["project"] == "demo-project"
     assert captured["credentials"] is None
+
+
+def test_primary_built_tool_ignores_worker_written_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A tool the primary builds for an agent reads that agent's primary settings, never its worker store."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={"MINDROOM_SANDBOX_PROXY_URL": "http://sandbox:8765", "MINDROOM_SANDBOX_PROXY_TOKEN": "token"},
+    )
+    credentials_manager = get_runtime_credentials_manager(runtime_paths)
+    target = resolve_worker_target("shared", "alpha", None, tenant_id="test-tenant")
+    assert target.worker_key is not None
+    settings = {"dataset": "demo_dataset", "location": "us-central1"}
+    credentials_manager.for_primary_runtime_agent_scope("alpha").save_credentials(
+        "google_bigquery",
+        {**settings, "project": "primary-project"},
+    )
+    credentials_manager.for_worker(target.worker_key).save_credentials(
+        "google_bigquery",
+        {**settings, "project": "worker-project"},
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeGoogleBigQueryTools:
+        def __init__(self, *, project: str, **_: object) -> None:
+            captured["project"] = project
+
+    monkeypatch.setitem(TOOL_REGISTRY, "google_bigquery", lambda: _FakeGoogleBigQueryTools)
+
+    get_tool_by_name(
+        "google_bigquery",
+        runtime_paths,
+        credentials_manager=credentials_manager,
+        worker_tools_override=[],
+        worker_target=target,
+    )
+
+    assert captured["project"] == "primary-project"
 
 
 def test_get_tool_by_name_requires_explicit_clickup_config(tmp_path: Path) -> None:

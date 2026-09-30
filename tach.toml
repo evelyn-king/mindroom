@@ -1763,6 +1763,8 @@ depends_on = [
     "mindroom.api.dashboard_credential_scope",
     "mindroom.credential_policy",
     "mindroom.credentials",
+    "mindroom.tool_system.catalog",
+    "mindroom.tool_system.sandbox_proxy",
     "mindroom.tool_system.worker_routing",
 ]
 
@@ -1787,6 +1789,7 @@ depends_on = [
     "mindroom.credentials",
     "mindroom.oauth.credential_lifecycle",
     "mindroom.tool_system.catalog",
+    "mindroom.tool_system.sandbox_proxy",
     "mindroom.tool_system.worker_routing",
 ]
 
@@ -6482,6 +6485,7 @@ expose = [
     "sandbox_proxy_config",
     "sandbox_proxy_enabled_for_tool",
     "save_attachment_to_worker",
+    "primary_owns_tool_settings",
     "view_file_from_worker",
     "to_json_compatible",
 ]

@@ -39,7 +39,7 @@ from mindroom.tool_system.registry_state import (
     scoped_plugin_registration_owner,
     scoped_plugin_registration_store,
 )
-from mindroom.tool_system.sandbox_proxy import maybe_wrap_toolkit_for_sandbox_proxy
+from mindroom.tool_system.sandbox_proxy import maybe_wrap_toolkit_for_sandbox_proxy, primary_owns_tool_settings
 from mindroom.tool_system.worker_routing import (
     ResolvedWorkerTarget,
     supports_tool_name_for_worker_scope,
@@ -738,6 +738,11 @@ def _build_tool_instance(
             credentials_manager=resolved_credentials_manager,
             worker_target=worker_target,
             allowed_shared_services=allowed_shared_services,
+            primary_built_tool=primary_owns_tool_settings(
+                tool_name,
+                runtime_paths=runtime_paths,
+                worker_tools_override=worker_tools_override,
+            ),
         )
         if resolved_credentials_manager is not None
         else {}
@@ -802,6 +807,11 @@ def _build_tool_instance(
         worker_tools_override=worker_tools_override,
         shared_storage_root_path=shared_storage_root_path,
         worker_target=worker_target,
+        authored_worker_tools=(
+            runtime_config.get_agent_worker_tools(routing_agent_name)
+            if runtime_config is not None and routing_agent_name in runtime_config.agents
+            else None
+        ),
     )
 
 

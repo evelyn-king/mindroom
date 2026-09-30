@@ -31,7 +31,12 @@ from mindroom.oauth.credential_lifecycle import (
 )
 from mindroom.oauth.registry import load_oauth_providers
 from mindroom.oauth.service import oauth_provider_service_account_configured
-from mindroom.tool_system.catalog import export_tools_metadata, resolved_tool_metadata_for_runtime
+from mindroom.tool_system.catalog import (
+    ensure_tool_registry_loaded,
+    export_tools_metadata,
+    resolved_tool_metadata_for_runtime,
+)
+from mindroom.tool_system.sandbox_proxy import primary_owns_tool_settings
 from mindroom.tool_system.worker_routing import (
     WorkerScope,
     build_worker_target_from_runtime_env,
@@ -68,6 +73,7 @@ class _ResolvedToolAvailabilityContext:
     oauth_providers: dict[str, OAuthProvider]
     runtime_paths: RuntimePaths
     oauth_config: Config | None = None
+    worker_tools: list[str] | None = None
 
 
 def _effective_allowed_shared_services(
@@ -284,6 +290,7 @@ def _resolve_tool_availability_context(
         else None
     )
     oauth_providers = load_oauth_providers(config, runtime_paths)
+    ensure_tool_registry_loaded(runtime_paths)
     return _ResolvedToolAvailabilityContext(
         execution_scope=execution_scope,
         dashboard_configuration_supported=status_authoritative,
@@ -297,6 +304,9 @@ def _resolve_tool_availability_context(
         oauth_providers=oauth_providers,
         runtime_paths=runtime_paths,
         oauth_config=config,
+        worker_tools=(
+            config.get_agent_worker_tools(scope_request.agent_name) if scope_request.agent_name is not None else None
+        ),
     )
 
 
@@ -356,6 +366,13 @@ async def _update_tools_statuses(
                     credentials_manager=context.credentials_manager,
                     worker_target=worker_target,
                     allowed_shared_services=allowed_shared_services,
+                    primary_built_tool=worker_target is not None
+                    and worker_target.routing_agent_name is not None
+                    and primary_owns_tool_settings(
+                        service,
+                        runtime_paths=context.runtime_paths,
+                        worker_tools_override=context.worker_tools,
+                    ),
                 )
             else:
                 credentials_cache[cache_key] = _load_shared_preview_credentials(

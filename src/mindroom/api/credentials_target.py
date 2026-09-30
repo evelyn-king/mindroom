@@ -27,6 +27,8 @@ from mindroom.credentials import (
     load_scoped_credentials,
     save_scoped_credentials,
 )
+from mindroom.tool_system.catalog import ensure_tool_registry_loaded
+from mindroom.tool_system.sandbox_proxy import primary_owns_tool_settings
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
     WorkerScope,
@@ -53,6 +55,7 @@ class RequestCredentialsTarget:
     agent_name: str | None
     execution_identity: ToolExecutionIdentity | None
     allowed_shared_services: frozenset[str] | None = None
+    worker_tools: list[str] | None = None
 
 
 def loaded_runtime_config_for_credentials_request(
@@ -223,6 +226,7 @@ def resolve_request_credentials_target(
         agent_name=scope_request.agent_name,
         execution_identity=execution_identity,
         allowed_shared_services=config.get_worker_grantable_credentials(),
+        worker_tools=config.get_agent_worker_tools(scope_request.agent_name),
     )
 
 
@@ -288,11 +292,24 @@ def load_credentials_for_target(service: str, target: RequestCredentialsTarget) 
         allowed_shared_services=target.allowed_shared_services,
         worker_credentials_manager=target.target_manager,
         allow_shared_mirror=False,
+        primary_built_tool=target_primary_owns_tool_settings(service, target),
     )
 
 
 def _service_uses_primary_runtime_global_store(service: str, target: RequestCredentialsTarget) -> bool:
     return credential_service_policy(service, target.worker_scope).uses_primary_runtime_global_credentials
+
+
+def target_primary_owns_tool_settings(service: str, target: RequestCredentialsTarget) -> bool:
+    """Return whether the target agent's primary process builds the tool that this service configures."""
+    if target.worker_scope is None or target.agent_name is None:
+        return False
+    ensure_tool_registry_loaded(target.runtime_paths)
+    return primary_owns_tool_settings(
+        service,
+        runtime_paths=target.runtime_paths,
+        worker_tools_override=target.worker_tools,
+    )
 
 
 def worker_target_for_credentials_target(target: RequestCredentialsTarget) -> ResolvedWorkerTarget | None:
@@ -320,6 +337,7 @@ def save_credentials_for_target(service: str, credentials: dict[str, Any], targe
         credentials_manager=target.base_manager,
         worker_target=worker_target_for_credentials_target(target),
         worker_credentials_manager=target.target_manager,
+        primary_built_tool=target_primary_owns_tool_settings(service, target),
     )
 
 
@@ -336,6 +354,7 @@ def delete_credentials_for_target(service: str, target: RequestCredentialsTarget
         credentials_manager=target.base_manager,
         worker_target=worker_target_for_credentials_target(target),
         worker_credentials_manager=target.target_manager,
+        primary_built_tool=target_primary_owns_tool_settings(service, target),
     )
 
 
@@ -348,7 +367,11 @@ def primary_runtime_scoped_services_for_target(target: RequestCredentialsTarget)
         return {
             service
             for service in agent_scoped_manager.list_services()
-            if credential_service_policy(service, target.worker_scope).uses_primary_runtime_agent_scoped_credentials
+            if credential_service_policy(
+                service,
+                target.worker_scope,
+                primary_built_tool=target_primary_owns_tool_settings(service, target),
+            ).uses_primary_runtime_agent_scoped_credentials
         }
     if target.worker_scope not in {"user", "user_agent"}:
         return set()
@@ -362,5 +385,9 @@ def primary_runtime_scoped_services_for_target(target: RequestCredentialsTarget)
     return {
         service
         for service in scoped_manager.list_services()
-        if credential_service_policy(service, target.worker_scope).uses_primary_runtime_scoped_credentials
+        if credential_service_policy(
+            service,
+            target.worker_scope,
+            primary_built_tool=target_primary_owns_tool_settings(service, target),
+        ).uses_primary_runtime_scoped_credentials
     }
