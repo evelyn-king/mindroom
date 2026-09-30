@@ -396,7 +396,9 @@ def _replay_safe_tool_search_result(
             changed = True
             continue
         available_references.append(reference)
-    if not available_references:
+    # A search that matched nothing references no stale tool and stays; dropping
+    # its pair would change a signed turn whose blocks surround it.
+    if tool_references and not available_references:
         return None, True
     if len(available_references) == len(tool_references):
         return prepared_block, changed
@@ -460,8 +462,9 @@ def _request_kwargs_with_replay_safe_tool_search_results(request_kwargs: dict[st
     together. Replaying that orphan produces another 400. Search results can
     likewise reference tools that are absent from a later request after its
     dynamic tool surface changes. Drop unavailable references and remove a
-    search pair when none remain. Valid pairs and other server-tool types
-    remain intact. The input structure is never mutated.
+    search pair when filtering removes every reference; a search that matched
+    nothing stays. Valid pairs and other server-tool types remain intact. The
+    input structure is never mutated.
     """
     messages = request_kwargs.get("messages")
     if not isinstance(messages, list):
