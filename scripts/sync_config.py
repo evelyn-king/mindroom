@@ -59,6 +59,8 @@ def saas_config() -> dict:
     config["defaults"]["tools"].remove("update_awareness")
     for agent in config["agents"].values():
         agent["tools"].remove("update_awareness")
+        # Hosted agents learn workspace skills from their conversations.
+        agent["skill_learning"] = {"enabled": True}
     return config
 
 
