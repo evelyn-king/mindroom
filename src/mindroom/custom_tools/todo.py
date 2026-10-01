@@ -14,8 +14,8 @@ import yaml
 from agno.agent import Agent
 from agno.team.team import Team  # noqa: TC002 - Agno resolves tool annotations at runtime.
 from agno.tools import Toolkit
-from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
-from jinja2.sandbox import SandboxedEnvironment, SecurityError
+from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError, nodes
+from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from mindroom import yaml_io
@@ -51,6 +51,9 @@ _PRIORITY_EMOJI: dict[str, str] = {
     "low": "green",
 }
 _TEMPLATE_RECURSION_LIMIT = 3
+# Workspace templates are worker-written, so one apply_template call must stay small however they nest.
+_MAX_TEMPLATE_SIZE = 64 * 1024
+_MAX_TEMPLATE_TODOS = 100
 _WORKSPACE_TEMPLATE_RELATIVE_DIR = Path("todo/templates")
 _JINJA_ENV = SandboxedEnvironment(autoescape=False, undefined=StrictUndefined)
 
@@ -95,7 +98,8 @@ class TemplateTodo(BaseModel):
     sub_template: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     priority: Literal["low", "medium", "high", "critical"] = "medium"
-    depends_on: list[int] = Field(default_factory=list)
+    # A set, so a repeated index cannot multiply the edges a sub-template's terminals add.
+    depends_on: set[int] = Field(default_factory=set)
     assigned_agent: str | None = None
 
     @model_validator(mode="after")
@@ -154,7 +158,26 @@ class _TemplateRoot:
             return path.read_text(encoding="utf-8")
         # Template paths are canonical; open them below the workspace as spelled so a replaced workspace is refused.
         relative = path.relative_to(self.workspace_root.resolve())
-        return read_regular_file_within_root(self.workspace_root, relative).decode("utf-8")
+        payload = read_regular_file_within_root(self.workspace_root, relative, max_bytes=_MAX_TEMPLATE_SIZE)
+        return payload.decode("utf-8")
+
+
+@dataclass(slots=True)
+class _TemplateBudget:
+    """Template text one `apply_template` call may still read and render, shared by every sub-template it expands."""
+
+    remaining_read_bytes: int = _MAX_TEMPLATE_SIZE
+    remaining_rendered_chars: int = _MAX_TEMPLATE_SIZE
+
+    def charge_read(self, path: Path, text: str) -> None:
+        self.remaining_read_bytes -= len(text.encode("utf-8"))
+        if self.remaining_read_bytes < 0:
+            raise _template_value_error(path, f"templates read by one call exceed {_MAX_TEMPLATE_SIZE} bytes")
+
+    def charge_rendered(self, path: Path, chunk: str) -> None:
+        self.remaining_rendered_chars -= len(chunk)
+        if self.remaining_rendered_chars < 0:
+            raise _template_value_error(path, f"templates rendered by one call exceed {_MAX_TEMPLATE_SIZE} characters")
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,15 +332,28 @@ def _template_value_error(path: Path, message: str) -> ValueError:
     return ValueError(f"Invalid template '{path.name}': {message}")
 
 
-def _render_jinja_template(template_text: str, params: Mapping[str, Any], *, path: Path) -> str:
+def _render_jinja_template(
+    template_text: str,
+    params: Mapping[str, Any],
+    *,
+    path: Path,
+    budget: _TemplateBudget,
+) -> str:
+    # Only plain substitution is bounded: any expression, filter, or loop can allocate or spin in the primary.
+    rendered: list[str] = []
     try:
-        return _JINJA_ENV.from_string(template_text).render(**params)
-    except SecurityError as exc:
-        raise _template_value_error(path, f"unsafe template expression: {exc}") from exc
+        parsed = _JINJA_ENV.parse(template_text)
+        substitution = (nodes.Output, nodes.TemplateData, nodes.Name)
+        if not all(isinstance(node, substitution) for node in parsed.find_all(nodes.Node)):
+            raise _template_value_error(path, "templates may only substitute parameters as `{{ NAME }}`")
+        for chunk in _JINJA_ENV.from_string(parsed).generate(**params):
+            budget.charge_rendered(path, chunk)
+            rendered.append(chunk)
     except UndefinedError as exc:
         raise _template_value_error(path, f"undefined variable: {exc}") from exc
     except TemplateSyntaxError as exc:
         raise _template_value_error(path, f"syntax error: {exc}") from exc
+    return "".join(rendered)
 
 
 def _format_validation_error(exc: ValidationError) -> str:
@@ -330,7 +366,7 @@ def _format_validation_error(exc: ValidationError) -> str:
 
 def _load_template_document(path: Path, text: str) -> dict[str, Any]:
     try:
-        document = yaml_io.safe_load(text)
+        document = yaml_io.safe_load_without_aliases(text)
     except yaml.YAMLError as exc:
         raise _template_value_error(path, str(exc)) from exc
     if not isinstance(document, dict):
@@ -420,7 +456,9 @@ def _render_template_definition(
     params: dict[str, Any],
     *,
     template_roots: Sequence[_TemplateRoot],
+    budget: _TemplateBudget,
     depth: int = 1,
+    max_todos: int = _MAX_TEMPLATE_TODOS,
 ) -> dict[str, Any]:
     if depth > _TEMPLATE_RECURSION_LIMIT:
         msg = f"Template recursion depth exceeded while expanding '{name}'"
@@ -428,6 +466,7 @@ def _render_template_definition(
 
     path, template_root = _resolve_template_path(name, template_roots)
     raw_text = template_root.read_text(path)
+    budget.charge_read(path, raw_text)
     raw_template = _load_template_document(path, raw_text)
     _validate_template_document(raw_template, path)
     schema = _PARAMS_SCHEMAS.get(name) if template_root.source == "builtin" else None
@@ -439,12 +478,18 @@ def _render_template_definition(
         except ValidationError as exc:
             raise _template_value_error(path, f"params validation failed: {_format_validation_error(exc)}") from exc
 
-    rendered_text = _render_jinja_template(raw_text, resolved_params, path=path)
+    rendered_text = _render_jinja_template(raw_text, resolved_params, path=path, budget=budget)
     rendered_template = _load_template_document(path, rendered_text)
     rendered_document = _validate_template_document(rendered_template, path)
     rendered_todos = rendered_document.model_dump(mode="python", exclude_none=True)["todos"]
     _validate_depends_on_indexes(rendered_todos, path=path)
-    expanded_todos = _expand_template_todos(rendered_todos, template_roots=template_roots, depth=depth)
+    expanded_todos = _expand_template_todos(
+        rendered_todos,
+        template_roots=template_roots,
+        budget=budget,
+        depth=depth,
+        max_todos=max_todos,
+    )
     _validate_dependency_cycle(rendered_document.name, expanded_todos)
 
     return {
@@ -460,12 +505,18 @@ def _expand_template_todos(
     todos: list[dict[str, Any]],
     *,
     template_roots: Sequence[_TemplateRoot],
+    budget: _TemplateBudget,
     depth: int,
+    max_todos: int,
 ) -> list[dict[str, Any]]:
     expanded: list[dict[str, Any]] = []
     index_map: dict[int, _ExpandedTemplateIndex] = {}
 
     for original_index, entry in enumerate(todos, start=1):
+        # Every entry adds at least one todo, so this budget also bounds sub-template renders.
+        if len(expanded) >= max_todos:
+            msg = f"Templates may expand to at most {_MAX_TEMPLATE_TODOS} todos"
+            raise ValueError(msg)
         if entry.get("title") is not None:
             expanded.append(
                 {
@@ -484,7 +535,9 @@ def _expand_template_todos(
             entry["sub_template"],
             entry.get("params", {}),
             template_roots=template_roots,
+            budget=budget,
             depth=depth + 1,
+            max_todos=max_todos - len(expanded),
         )
         offset = len(expanded)
         expanded.extend(
@@ -936,7 +989,12 @@ class TodoTools(Toolkit):
     ) -> str:
         """Apply a named todo template to the current thread's work plan."""
         template_roots = _visible_template_roots(agent)
-        rendered_template = _render_template_definition(name, params, template_roots=template_roots)
+        rendered_template = _render_template_definition(
+            name,
+            params,
+            template_roots=template_roots,
+            budget=_TemplateBudget(),
+        )
         if dry_run:
             return _format_template_preview(
                 rendered_template["name"],
