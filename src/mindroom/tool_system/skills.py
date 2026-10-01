@@ -500,9 +500,14 @@ class SkillMarkdownError(ValueError):
     """A ``SKILL.md`` whose frontmatter skill loading cannot read."""
 
 
+def _match_skill_frontmatter(content: str) -> re.Match[str] | None:
+    # With no closing fence the pattern backtracks quadratically before failing, so skip it when it cannot match.
+    return _FRONTMATTER_PATTERN.match(content) if "\n---" in content else None
+
+
 def parse_skill_markdown(content: str) -> tuple[dict[str, Any], str]:
     """Split one ``SKILL.md`` into its frontmatter mapping and instructions, as skill loading reads them."""
-    match = _FRONTMATTER_PATTERN.match(content)
+    match = _match_skill_frontmatter(content)
     if not match:
         msg = "Skill missing frontmatter"
         raise SkillMarkdownError(msg)
@@ -519,7 +524,7 @@ def parse_skill_markdown(content: str) -> tuple[dict[str, Any], str]:
 
 def _parse_skill_frontmatter(content: str, *, path: str, allow_missing: bool) -> tuple[dict[str, Any], str] | None:
     """Split one ``SKILL.md`` into its frontmatter mapping and instructions, or warn and return None."""
-    if allow_missing and not _FRONTMATTER_PATTERN.match(content):
+    if allow_missing and not _match_skill_frontmatter(content):
         return {}, content
     try:
         return parse_skill_markdown(content)
