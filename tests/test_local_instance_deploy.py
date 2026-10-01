@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -1704,6 +1703,77 @@ def test_launch_tightens_an_existing_world_readable_env_file(tmp_path: Path) -> 
     assert _mode(env_file) == 0o600
 
 
+def _replace_example_password_hash(users_file: Path) -> None:
+    """Give the example account its own hash so launches pass the public-hash check."""
+    database = yaml.safe_load(users_file.read_text(encoding="utf-8"))
+    parts = database["users"]["admin"]["password"].split("$")
+    parts[4] = "MDEyMzQ1Njc4OWFiY2RlZg"
+    database["users"]["admin"]["password"] = "$".join(parts)
+    users_file.write_text(yaml.safe_dump(database), encoding="utf-8")
+
+
+@pytest.mark.usefixtures("world_readable_umask")
+@pytest.mark.parametrize("command", ["create", "start", "restart", "restart_all"])
+def test_authelia_directory_is_owner_only(
+    authelia_launch: tuple[deploy.Instance, Path, list[str], Console],
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """Authelia's generated secrets and user password hashes stay unreadable to other local accounts, including older copies."""
+    instance, users_file, _commands, _console = authelia_launch
+    authelia_dir = users_file.parent
+    monkeypatch.setattr(deploy.os, "fchown", lambda *_args: None)
+    if command == "create":
+        shutil.rmtree(authelia_dir)
+        deploy._setup_authelia_config(instance)
+        assert "jwt_secret" in (authelia_dir / "configuration.yml").read_text()
+    else:
+        authelia_dir.chmod(0o755)
+        _replace_example_password_hash(users_file)
+        _launch_authelia(command)
+
+    assert _mode(authelia_dir) == 0o700
+
+
+@pytest.mark.usefixtures("world_readable_umask")
+@pytest.mark.parametrize("command", ["start", "restart", "restart_all"])
+def test_launch_tightens_the_authelia_directory_compose_mounts(
+    authelia_launch: tuple[deploy.Instance, Path, list[str], Console],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """A DATA_DIR edited away from the registry's data directory still gets its mounted Authelia directory tightened."""
+    _instance, registry_users, _commands, _console = authelia_launch
+    mounted_users = tmp_path / "moved data" / "authelia" / "users_database.yml"
+    mounted_users.parent.mkdir(parents=True, mode=0o755)
+    shutil.copyfile(registry_users, mounted_users)
+    _replace_example_password_hash(mounted_users)
+    monkeypatch.setattr(deploy, "_resolve_authelia_users_file", lambda _instance: mounted_users)
+    monkeypatch.setattr(deploy.os, "fchown", lambda *_args: None)
+
+    _launch_authelia(command)
+
+    assert _mode(mounted_users.parent) == 0o700
+
+
+def test_launch_refuses_an_authelia_directory_it_cannot_make_private(
+    authelia_launch: tuple[deploy.Instance, Path, list[str], Console],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory another account owns stays readable after the attempt, so launch stops instead of claiming it is private."""
+    _instance, registry_users, commands, _console = authelia_launch
+    _replace_example_password_hash(registry_users)
+    registry_users.parent.chmod(0o755)
+    monkeypatch.setattr(deploy, "_set_directory_permissions", lambda *_args: None)
+
+    with pytest.raises(deploy.typer.Exit):
+        _launch_authelia("start")
+
+    assert _mode(registry_users.parent) == 0o755
+    assert not any(" up " in command for command in commands)
+
+
 @pytest.mark.usefixtures("world_readable_umask")
 def test_copied_credentials_are_owner_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Credential copies and their directory stay private, including copies left world-readable by older versions."""
@@ -1860,8 +1930,11 @@ def test_secret_file_already_owned_by_the_container_uid_is_not_chowned(
     assert console.export_text() == ""
 
 
-def test_unrestrictable_secret_file_prints_the_exact_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """When deploy.py cannot hand a secret file to the container user, it still makes it owner-only and says how."""
+def test_unrestrictable_secret_file_asks_for_a_root_rerun(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When deploy.py cannot hand a secret file to the container user, it still makes it owner-only and says how.
+
+    It never prints a sudo command naming the path, because the container could swap that path for a link first.
+    """
     homeserver = tmp_path / "synapse dir" / "homeserver.yaml"
     homeserver.parent.mkdir()
     homeserver.write_text("macaroon_secret_key: secret\n")
@@ -1877,7 +1950,9 @@ def test_unrestrictable_secret_file_prints_the_exact_fix(tmp_path: Path, monkeyp
 
     deploy._protect_synapse_config(homeserver)
 
-    assert f"sudo chown {os.getuid() + 1} {shlex.quote(str(homeserver))}" in console.export_text()
+    output = normalize_console_output(console.export_text())
+    assert "Rerun this deploy.py command as root" in output
+    assert "sudo" not in output
     assert _mode(homeserver) == 0o600
 
 
@@ -1895,6 +1970,8 @@ def test_unreadable_container_secret_keeps_permission_guidance(tmp_path: Path, m
     monkeypatch.setattr(deploy.os, "open", denied_open)
     deploy._protect_synapse_config(homeserver)
 
-    assert f"sudo chmod 600 {shlex.quote(str(homeserver))}" in console.export_text()
+    output = normalize_console_output(console.export_text())
+    assert "Rerun this deploy.py command as root" in output
+    assert "sudo" not in output
     assert homeserver.read_text() == "unchanged"
     assert _mode(homeserver) == 0o600

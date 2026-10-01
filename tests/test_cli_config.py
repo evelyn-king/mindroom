@@ -4547,20 +4547,19 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
         assert result.exit_code == 0
         assert "malformed namespace" in normalize_console_output(result.output)
 
-    def test_connect_passes_matrix_ssl_verify_to_httpx(
+    def test_connect_verifies_provisioning_tls_when_matrix_ssl_verify_is_false(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Connect should pass MATRIX_SSL_VERIFY through to httpx.post."""
+        """MATRIX_SSL_VERIFY covers only the homeserver, so pairing still verifies the service that names the owner."""
         cfg = tmp_path / "config.yaml"
         cfg.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n")
 
-        called: dict[str, object] = {}
+        calls: list[dict[str, object]] = []
 
         def _fake_post(url: str, **kwargs: object) -> httpx.Response:
-            called["url"] = url
-            called["kwargs"] = kwargs
+            calls.append(kwargs)
             if "start" in url:
                 return httpx.Response(
                     200,
@@ -4583,7 +4582,7 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
                 },
             )
 
-        monkeypatch.setattr("mindroom.cli.connect._httpx_post", _fake_post)
+        monkeypatch.setattr(httpx, "post", _fake_post)
         monkeypatch.setattr("mindroom.cli.connect.time.sleep", lambda _seconds: None)
 
         result = _invoke_with_runtime(
@@ -4597,10 +4596,9 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
             env={"MATRIX_SSL_VERIFY": "false"},
         )
 
-        assert result.exit_code == 0
-        kwargs = called["kwargs"]
-        assert isinstance(kwargs, dict)
-        assert kwargs["verify"] is False
+        assert result.exit_code == 0, result.output
+        # httpx verifies certificates unless told otherwise.
+        assert [kwargs.get("verify", True) for kwargs in calls] == [True, True]
 
     def test_connect_pair_code_option_removed(self, tmp_path: Path) -> None:
         """--pair-code should exit with code 2 (option removed)."""
@@ -4715,7 +4713,7 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
             ["connect", "--provisioning-url", "https://provisioning.example", "--force"],
             cfg,
             # A terminal still confirms the approving account after pairing.
-            input="\n",
+            input="y\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -4762,7 +4760,7 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
         assert result.exit_code == 1
         assert "Error: bad runtime" in result.output
 
-    @pytest.mark.parametrize(("answer", "saved"), [("n\n", False), ("\n", True)])
+    @pytest.mark.parametrize(("answer", "saved"), [("n\n", False), ("\n", False), ("y\n", True)])
     def test_connect_asks_whether_the_approving_account_is_yours(
         self,
         tmp_path: Path,
@@ -4770,7 +4768,7 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
         answer: str,
         saved: bool,
     ) -> None:
-        """A terminal confirms the approving account (default yes); declining saves nothing and fails."""
+        """A terminal saves the approving account only on an explicit yes; a bare Enter or no saves nothing and fails."""
         cfg = tmp_path / "config.yaml"
         cfg.write_text(
             "agents: {}\nmodels: {}\nrouter:\n  model: default\n"
@@ -4789,7 +4787,7 @@ app(["connect", "--path", sys.argv[1], "--force", "--graceful-cancel",
 
         output = normalize_console_output(result.output)
         assert "Approved by @alice:mindroom.chat." in output
-        assert "Is this your account? [Y/n]" in output
+        assert "Is this your account? [y/N]" in output
         assert (tmp_path / ".env").exists() is saved
         assert (OWNER_MATRIX_USER_ID_PLACEHOLDER in cfg.read_text()) is not saved
         if saved:
@@ -4949,7 +4947,8 @@ class TestLocalStackSetup:
         assert env_path.exists()
         env_content = env_path.read_text()
         assert "MATRIX_HOMESERVER=http://localhost:8008" in env_content
-        assert "MATRIX_SSL_VERIFY=false" in env_content
+        # A plain-HTTP homeserver needs no TLS override, which would also apply to a hosted homeserver set later.
+        assert "MATRIX_SSL_VERIFY" not in env_content
         assert "MATRIX_SERVER_NAME=localhost" in env_content
         assert "Local stack is ready." in result.output
 
@@ -4980,11 +4979,9 @@ class TestLocalStackSetup:
         assert ["docker", "compose", "up", "-d"] not in commands
         assert any(cmd[:3] == ["docker", "run", "-d"] for cmd in commands)
 
-    def test_no_persist_env_prints_inline_command(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """--no-persist-env should not write .env and should print inline env usage."""
-        cfg = tmp_path / "config.yaml"
-        cfg.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n")
-        storage_path = tmp_path / "mindroom_data"
+    @staticmethod
+    def _stub_local_stack(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Stand in for Docker and a healthy homeserver."""
         monkeypatch.setattr("mindroom.cli.local_stack.sys.platform", "linux")
         monkeypatch.setattr("mindroom.cli.local_stack.shutil.which", lambda _name: "/usr/bin/docker")
         monkeypatch.setattr(
@@ -4997,17 +4994,56 @@ class TestLocalStackSetup:
             lambda cmd, **_kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         )
 
+    @pytest.mark.parametrize(
+        ("homeserver_url", "env_prefix"),
+        [
+            ("http://localhost:8008", "MATRIX_HOMESERVER=http://localhost:8008 uv run"),
+            ("https://localhost:8448", "MATRIX_HOMESERVER=https://localhost:8448 MATRIX_SSL_VERIFY=false uv run"),
+        ],
+    )
+    def test_no_persist_env_prints_inline_command(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        homeserver_url: str,
+        env_prefix: str,
+    ) -> None:
+        """--no-persist-env writes no .env and prints the same settings it would persist."""
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n")
+        self._stub_local_stack(monkeypatch)
+
         result = _invoke_with_runtime(
-            ["local-stack-setup", "--skip-synapse", "--no-persist-env"],
+            ["local-stack-setup", "--skip-synapse", "--no-persist-env", "--homeserver-url", homeserver_url],
             cfg,
-            storage_path=storage_path,
+            storage_path=tmp_path / "mindroom_data",
         )
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert not (tmp_path / ".env").exists()
-        assert "MATRIX_HOMESERVER=http://localhost:8008 MATRIX_SSL_VERIFY=false" in result.output
-        assert "uv run" in result.output
-        assert "mindroom run" in result.output
+        output = normalize_console_output(result.output)
+        assert f"{env_prefix} mindroom run" in output
+
+    def test_https_homeserver_persists_ssl_verify_override(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An https:// local homeserver still gets MATRIX_SSL_VERIFY=false for its local certificate."""
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n")
+        self._stub_local_stack(monkeypatch)
+
+        result = _invoke_with_runtime(
+            ["local-stack-setup", "--skip-synapse", "--homeserver-url", "https://localhost:8448"],
+            cfg,
+            storage_path=tmp_path / "mindroom_data",
+        )
+
+        assert result.exit_code == 0, result.output
+        env_content = (tmp_path / ".env").read_text()
+        assert "MATRIX_HOMESERVER=https://localhost:8448" in env_content
+        assert "MATRIX_SSL_VERIFY=false" in env_content
 
     def test_rejects_unsupported_platform(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Command fails on unsupported operating systems."""
