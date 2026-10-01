@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -14,8 +15,6 @@ import yaml
 from agno.agent import Agent
 from agno.team.team import Team  # noqa: TC002 - Agno resolves tool annotations at runtime.
 from agno.tools import Toolkit
-from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError, nodes
-from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from mindroom import yaml_io
@@ -32,6 +31,7 @@ from mindroom.custom_tools.todo_state import (
     state_root,
     todos_path,
 )
+from mindroom.custom_tools.todo_template_render import render_trusted_template, render_workspace_template
 from mindroom.path_confinement import read_regular_file_within_root, resolve_path_within_root
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, get_tool_runtime_context
@@ -54,8 +54,8 @@ _TEMPLATE_RECURSION_LIMIT = 3
 # Workspace templates are worker-written, so one apply_template call must stay small however they nest.
 _MAX_TEMPLATE_SIZE = 64 * 1024
 _MAX_TEMPLATE_TODOS = 100
+_MAX_TEMPLATE_RENDER_SECONDS = 5.0
 _WORKSPACE_TEMPLATE_RELATIVE_DIR = Path("todo/templates")
-_JINJA_ENV = SandboxedEnvironment(autoescape=False, undefined=StrictUndefined)
 
 
 class MindroomDevParams(BaseModel):
@@ -168,6 +168,7 @@ class _TemplateBudget:
 
     remaining_read_bytes: int = _MAX_TEMPLATE_SIZE
     remaining_rendered_chars: int = _MAX_TEMPLATE_SIZE
+    render_deadline: float = field(default_factory=lambda: time.monotonic() + _MAX_TEMPLATE_RENDER_SECONDS)
 
     def charge_read(self, path: Path, text: str) -> None:
         self.remaining_read_bytes -= len(text.encode("utf-8"))
@@ -178,6 +179,15 @@ class _TemplateBudget:
         self.remaining_rendered_chars -= len(chunk)
         if self.remaining_rendered_chars < 0:
             raise _template_value_error(path, f"templates rendered by one call exceed {_MAX_TEMPLATE_SIZE} characters")
+
+    def remaining_render_seconds(self, path: Path) -> float:
+        remaining = self.render_deadline - time.monotonic()
+        if remaining <= 0:
+            raise _template_value_error(
+                path,
+                f"templates rendered by one call exceed {_MAX_TEMPLATE_RENDER_SECONDS:g} seconds",
+            )
+        return remaining
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,23 +347,26 @@ def _render_jinja_template(
     params: Mapping[str, Any],
     *,
     path: Path,
+    template_root: _TemplateRoot,
     budget: _TemplateBudget,
 ) -> str:
-    # Only plain substitution is bounded: any expression, filter, or loop can allocate or spin in the primary.
-    rendered: list[str] = []
+    workspace = template_root.source == "workspace"
+    timeout_seconds = budget.remaining_render_seconds(path) if workspace else 0.0
     try:
-        parsed = _JINJA_ENV.parse(template_text)
-        substitution = (nodes.Output, nodes.TemplateData, nodes.Name)
-        if not all(isinstance(node, substitution) for node in parsed.find_all(nodes.Node)):
-            raise _template_value_error(path, "templates may only substitute parameters as `{{ NAME }}`")
-        for chunk in _JINJA_ENV.from_string(parsed).generate(**params):
-            budget.charge_rendered(path, chunk)
-            rendered.append(chunk)
-    except UndefinedError as exc:
-        raise _template_value_error(path, f"undefined variable: {exc}") from exc
-    except TemplateSyntaxError as exc:
-        raise _template_value_error(path, f"syntax error: {exc}") from exc
-    return "".join(rendered)
+        if workspace:
+            rendered_text = render_workspace_template(
+                template_text,
+                params,
+                max_chars=budget.remaining_rendered_chars,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            # Built-in templates ship with MindRoom, so they render in this process.
+            rendered_text = render_trusted_template(template_text, params, max_chars=budget.remaining_rendered_chars)
+    except ValueError as exc:
+        raise _template_value_error(path, str(exc)) from exc
+    budget.charge_rendered(path, rendered_text)
+    return rendered_text
 
 
 def _format_validation_error(exc: ValidationError) -> str:
@@ -478,7 +491,13 @@ def _render_template_definition(
         except ValidationError as exc:
             raise _template_value_error(path, f"params validation failed: {_format_validation_error(exc)}") from exc
 
-    rendered_text = _render_jinja_template(raw_text, resolved_params, path=path, budget=budget)
+    rendered_text = _render_jinja_template(
+        raw_text,
+        resolved_params,
+        path=path,
+        template_root=template_root,
+        budget=budget,
+    )
     rendered_template = _load_template_document(path, rendered_text)
     rendered_document = _validate_template_document(rendered_template, path)
     rendered_todos = rendered_document.model_dump(mode="python", exclude_none=True)["todos"]

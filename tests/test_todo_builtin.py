@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,6 +12,7 @@ from agno.agent import Agent as AgnoAgent
 from agno.team.team import Team as AgnoTeam
 
 import mindroom.custom_tools.todo as todo_module
+import mindroom.custom_tools.todo_template_render as todo_template_render_module
 import mindroom.tools  # noqa: F401
 from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig
@@ -538,6 +540,10 @@ todos:
     assert "`broken`" not in listing
 
 
+# Only Linux enforces the render child's address-space cap; elsewhere workspace templates only substitute.
+_NEEDS_MEMORY_CAP = pytest.mark.skipif(sys.platform != "linux", reason="needs RLIMIT_AS")
+
+
 def _template_text(name: str, todos: str, *, description: str = "Workspace template.") -> str:
     return f'name: {name}\nversion: "1"\ndescription: "{description}"\ntodos:\n{todos}'
 
@@ -546,21 +552,18 @@ def _template_text(name: str, todos: str, *, description: str = "Workspace templ
     ("templates", "params", "error"),
     [
         pytest.param(
-            {"hostile": _template_text("hostile", "  - title: One\n", description="{{ 'a' * 10**7 }}")},
+            {"hostile": _template_text("hostile", "  - title: One\n", description="{{ 'a' * 10**10 }}")},
             {},
-            "only substitute parameters",
-            id="expression",
+            "memory limit",
+            id="memory",
+            marks=_NEEDS_MEMORY_CAP,
         ),
         pytest.param(
-            {
-                "hostile": _template_text(
-                    "hostile",
-                    "  - title: '{% for i in range(1000) %}{% for j in range(1000) %}{% endfor %}{% endfor %}One'\n",
-                ),
-            },
+            {"hostile": _template_text("hostile", "  - title: One\n", description="{{ ''.__class__.__mro__ }}")},
             {},
-            "only substitute parameters",
-            id="loops",
+            "unsafe template expression",
+            id="sandbox-escape",
+            marks=_NEEDS_MEMORY_CAP,
         ),
         pytest.param(
             {"hostile": _template_text("hostile", "  - title: One\n", description="{{ X }}" * 100)},
@@ -623,7 +626,7 @@ def test_workspace_templates_cannot_make_the_primary_render_unbounded_work(
     params: dict[str, str],
     error: str,
 ) -> None:
-    """Worker-written templates render in the primary, so expressions, loops, aliases, and fan-out are refused."""
+    """Worker-written templates render under memory, sandbox, alias, size, and fan-out limits."""
     config = _config(tmp_path)
     tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
     for name, text in templates.items():
@@ -631,6 +634,59 @@ def test_workspace_templates_cannot_make_the_primary_render_unbounded_work(
 
     with tool_runtime_context(_tool_context(config)), pytest.raises(ValueError, match=error):
         tool.apply_template(agent=_agent(), name="hostile", params=params, dry_run=True)
+
+
+@_NEEDS_MEMORY_CAP
+def test_workspace_templates_render_jinja_conditionals_and_filters(tmp_path: Path) -> None:
+    """Workspace templates keep full inline Jinja, rendered outside the primary."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "deploy",
+        _template_text(
+            "deploy",
+            "  - title: \"{% if REPO == 'cinny' %}Deploy Cinny{% else %}No deploy for {{ REPO }}{% endif %}\"\n"
+            "  - title: \"Push {{ BRANCH | default('main') | upper }}\"\n"
+            "    depends_on: [1]\n",
+        ),
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        cinny = tool.apply_template(agent=_agent(), name="deploy", params={"REPO": "cinny"}, dry_run=True)
+        other = tool.apply_template(agent=_agent(), name="deploy", params={"REPO": "x"}, dry_run=True)
+
+    assert "- 1. [medium] Deploy Cinny" in cinny
+    assert "- 2. [medium] Push MAIN (depends on 1)" in cinny
+    assert "- 1. [medium] No deploy for x" in other
+
+
+def test_template_renderer_only_substitutes_where_memory_cannot_be_capped() -> None:
+    """Where the address-space limit cannot be installed, expressions are refused before any of them runs."""
+    request = {"template": "{% if true %}x{% endif %}", "params": {}, "max_chars": 100}
+    substitution = {"template": "Fix {{ ISSUE }}", "params": {"ISSUE": "X-1"}, "max_chars": 100}
+
+    refused = todo_template_render_module._render(request, memory_limited=False)
+    rendered = todo_template_render_module._render(substitution, memory_limited=False)
+
+    assert "only substitute" in refused["error"]
+    assert rendered == {"rendered": "Fix X-1"}
+
+
+@_NEEDS_MEMORY_CAP
+def test_workspace_template_that_spins_is_stopped_at_the_call_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A template that loops without end is killed when the call's render time runs out."""
+    monkeypatch.setattr(todo_module, "_MAX_TEMPLATE_RENDER_SECONDS", 1.0)
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    loops = "{% for i in range(100000) %}{% for j in range(100000) %}{% endfor %}{% endfor %}"
+    _write_workspace_template(config, "hostile", _template_text("hostile", f"  - title: '{loops}One'\n"))
+
+    with tool_runtime_context(_tool_context(config)), pytest.raises(ValueError, match="time"):
+        tool.apply_template(agent=_agent(), name="hostile", params={}, dry_run=True)
 
 
 def test_workspace_template_file_above_size_cap_is_refused_and_unlisted(tmp_path: Path) -> None:
