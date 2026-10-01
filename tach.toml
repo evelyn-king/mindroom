@@ -7196,7 +7196,7 @@ depends_on = []
 [[modules]]
 path = "mindroom.worker_computer.browser_proxy"
 depends_on = []
-visibility = ["mindroom.custom_tools.browser", "mindroom.custom_tools.browser_mcp", "mindroom.tools.crawl4ai", "mindroom.worker_computer.mcp_provider"]
+visibility = ["mindroom.custom_tools.agno_compat_agentql", "mindroom.custom_tools.browser", "mindroom.custom_tools.browser_mcp", "mindroom.tools.crawl4ai", "mindroom.worker_computer.mcp_provider"]
 
 [[modules]]
 path = "mindroom.worker_computer.mcp_provider"
@@ -7230,6 +7230,32 @@ visibility = ["mindroom.tools.trafilatura"]
 
 [[interfaces]]
 from = ["mindroom.tools.agno_compat_trafilatura"]
+expose = ["install_server_fetch_guard"]
+
+[[modules]]
+path = "mindroom.tools.file_generation"
+depends_on = ["mindroom.tool_system.declarations", "mindroom.tool_system.registration", "mindroom.tools.agno_compat_file_generation"]
+
+[[modules]]
+path = "mindroom.tools.agno_compat_file_generation"
+depends_on = ["mindroom.atomic_file", "mindroom.path_confinement"]
+visibility = ["mindroom.tools.file_generation"]
+
+[[interfaces]]
+from = ["mindroom.tools.agno_compat_file_generation"]
+expose = ["WorkspaceFileGenerationTools"]
+
+[[modules]]
+path = "mindroom.tools.newspaper4k"
+depends_on = ["mindroom.tool_system.declarations", "mindroom.tool_system.registration", "mindroom.tools.agno_compat_newspaper4k"]
+
+[[modules]]
+path = "mindroom.tools.agno_compat_newspaper4k"
+depends_on = ["mindroom.bounded_bytes", "mindroom.server_fetch_url"]
+visibility = ["mindroom.tools.newspaper4k"]
+
+[[interfaces]]
+from = ["mindroom.tools.agno_compat_newspaper4k"]
 expose = ["install_server_fetch_guard"]
 
 [[modules]]
@@ -7388,7 +7414,7 @@ depends_on = ["mindroom.tool_system.declarations", "mindroom.tool_system.registr
 
 [[modules]]
 path = "mindroom.custom_tools.agno_compat_agentql"
-depends_on = ["mindroom.logging_config"]
+depends_on = ["mindroom.logging_config", "mindroom.runtime_env_policy", "mindroom.server_fetch_url", "mindroom.worker_computer.browser_proxy"]
 visibility = ["mindroom.tools.agentql"]
 
 [[interfaces]]
