@@ -16,13 +16,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from agno.agent import Agent
+from agno.agent._init import set_learning_machine
 from agno.db.in_memory import InMemoryDb
 from agno.knowledge.knowledge import Knowledge
 from agno.learn import LearningMachine, LearningMode, UserMemoryConfig, UserProfileConfig
 from agno.run import RunContext
 from agno.run.agent import RunOutput
 from agno.session import AgentSession
-from agno.tools.function import Function
+from agno.tools.function import Function, FunctionCall
 from agno.tools.toolkit import Toolkit
 from pydantic import ValidationError
 from structlog.testing import capture_logs
@@ -49,14 +50,17 @@ from mindroom.config.agent import (
     AgentPrivateKnowledgeConfig,
     TeamConfig,
 )
+from mindroom.config.approval import ApprovalRuleConfig, ToolApprovalConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig, ModelConfig
+from mindroom.config.plugin import PluginEntryConfig
 from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths, resolve_runtime_paths
 from mindroom.credentials import CredentialsManager, get_runtime_credentials_manager, load_scoped_credentials
 from mindroom.entity_resolution import managed_entity_power_user_ids_for_room
 from mindroom.entity_rooms import get_rooms_for_entity
 from mindroom.history.session_context import close_team_runtime_state_dbs
+from mindroom.hooks import EVENT_TOOL_BEFORE_CALL, HookRegistry, ToolBeforeCallContext, hook
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.utils import resolve_agent_knowledge_access
 from mindroom.matrix.state import MatrixState
@@ -4139,6 +4143,89 @@ async def test_create_agent_tool_filter_applies_to_agno_generated_knowledge_func
 
     assert "search_knowledge_base" in seen
     assert all(not isinstance(tool, Function) or tool.name != "search_knowledge_base" for tool in tools)
+
+
+def _config_with_workspace_skill(tmp_path: Path) -> Config:
+    config = _test_config()
+    config.agents["general"].knowledge_bases = ["docs"]
+    config.knowledge_bases = {
+        "docs": KnowledgeBaseConfig(description="Reference docs.", path="./knowledge_docs/docs"),
+    }
+    runtime_paths = _runtime_paths(tmp_path)
+    config = _bind_runtime_paths(config, runtime_paths)
+    skill_dir = agent_workspace_root_path(runtime_paths.storage_root, "general") / "skills" / "scripted"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: scripted\ndescription: Scripted skill\n---\n\nSKILL BODY\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+async def _generated_functions(agent: Agent, user_id: str | None = None) -> dict[str, Function]:
+    tools = await agent.aget_tools(
+        RunOutput(run_id="run", agent_id="general", agent_name="GeneralAgent", session_id="session"),
+        RunContext(run_id="run", session_id="session"),
+        AgentSession(session_id="session", agent_id="general", created_at=1, updated_at=1),
+        user_id=user_id,
+    )
+    return {tool.name: tool for tool in tools if isinstance(tool, Function)}
+
+
+@pytest.mark.asyncio
+async def test_create_agent_hides_agno_generated_functions_an_approval_rule_may_gate(tmp_path: Path) -> None:
+    """Generated functions have no toolkit origin to pause and resume, so gated ones are never exposed."""
+    config = _config_with_workspace_skill(tmp_path)
+    config.tool_approval = ToolApprovalConfig(
+        rules=[
+            ApprovalRuleConfig(match="get_skill_script", action="require_approval"),
+            ApprovalRuleConfig(match="search_knowledge_base", action="require_approval"),
+        ],
+    )
+
+    functions = await _generated_functions(_create_agent_for_test("general", config, knowledge=Knowledge(name="docs")))
+
+    assert "get_skill_instructions" in functions
+    assert "get_skill_script" not in functions
+    assert "search_knowledge_base" not in functions
+
+
+@pytest.mark.asyncio
+async def test_create_agent_runs_plugin_tool_hooks_for_agno_generated_functions(tmp_path: Path) -> None:
+    """A plugin before-call gate can decline a function Agno adds after agent construction."""
+
+    @hook(EVENT_TOOL_BEFORE_CALL)
+    async def decline(ctx: ToolBeforeCallContext) -> None:
+        ctx.decline("blocked by plugin")
+
+    plugin = SimpleNamespace(
+        name="gate",
+        entry_config=PluginEntryConfig(path="gate"),
+        plugin_order=0,
+        discovered_hooks=(decline,),
+    )
+    config = _config_with_workspace_skill(tmp_path)
+    config.agents["general"].learning_mode = "agentic"
+    agent = _create_agent_for_test("general", config, hook_registry=HookRegistry.from_plugins([plugin]))
+    set_learning_machine(agent)
+
+    functions = await _generated_functions(agent, user_id="@alice:localhost")
+    skill_call = FunctionCall(
+        function=functions["get_skill_instructions"],
+        arguments={"skill_name": "scripted"},
+        call_id="call-1",
+    )
+    memory_call = FunctionCall(
+        function=functions["update_user_memory"],
+        arguments={"task": "Remember the user prefers tea."},
+        call_id="call-2",
+    )
+    skill_result = await skill_call.aexecute()
+    memory_result = await memory_call.aexecute()
+
+    assert "[TOOL CALL DECLINED]" in str(skill_result.result)
+    assert "SKILL BODY" not in str(skill_result.result)
+    assert "[TOOL CALL DECLINED]" in str(memory_result.result)
 
 
 @patch("mindroom.agent_storage._ConversationSqliteDb")
