@@ -32,6 +32,7 @@ from mindroom.tool_system.worker_routing import parse_tool_execution_identity_pa
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping, Sequence
 
+    from mindroom.agent_modes import AgentMode
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
@@ -324,11 +325,15 @@ def prepare_child_turn(
     runtime_paths: RuntimePaths,
     depth: int,
     model: str | None = None,
+    agent_mode: AgentMode = "standard",
     previous: DelegationChild | None = None,
     parent_tool_call_id: str = "",
     parent_requirement_id: str = "",
 ) -> DelegationChild:
-    """Prepare the same scoped fresh/follow-up turn for direct and native callers."""
+    """Prepare the same scoped fresh/follow-up turn for direct and native callers.
+
+    A follow-up keeps the model of the child it continues; callers pass its mode.
+    """
     delegation_id = uuid4().hex
     session_id = previous.session_id if previous is not None else f"delegate:{caller_name}:{agent_name}:{delegation_id}"
     identity = (
@@ -366,4 +371,5 @@ def prepare_child_turn(
         previous_delegation_id=previous.delegation_id if previous is not None else None,
         parent_requirement_id=parent_requirement_id,
         storage_bindings=freeze_delegation_storage(config, (caller_name, agent_name)),
+        agent_mode=agent_mode,
     )
