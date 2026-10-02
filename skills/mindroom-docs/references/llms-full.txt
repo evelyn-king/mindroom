@@ -6150,6 +6150,7 @@ MindRoom exposes `google_drive_list_files()`, `google_drive_search_files()`, `go
 `google_drive_search_files()` searches Drive metadata.
 `google_drive_read_file()` reads Google Workspace files and non-Google files up to the configured `max_read_size`.
 `google_drive_download_file()` downloads a Drive file, exporting Google Workspace files to their best native format, for example a complete Google Sheets workbook as `.xlsx`.
+Downloads and exports larger than `max_download_size` are refused before they are saved, and a stream that grows past the limit is discarded without leaving a file.
 `google_drive_upload_file()` uploads a local file, resolves relative paths from the agent workspace, and follows the agent's [`file_access`](https://docs.mindroom.chat/architecture/security-posture/#file-access) setting for which local files it may read.
 `google_drive_update_file(file_id, local_path, mime_type=None)` replaces an existing binary file's contents from a local file under the same `file_access` rule.
 Native Google Workspace files require their respective Workspace APIs for content updates.
@@ -6169,6 +6170,7 @@ When no usable MindRoom OAuth credentials exist, the wrapper raises `OAuthConnec
 | `download_file` | `boolean` | `no` | `false` | Enable file downloads and Workspace exports into the agent workspace. |
 | `write` | `boolean` | `no` | `true` | Enable uploads, binary content replacement, folder creation, file moves or renames, and trashing. |
 | `max_read_size` | `number` | `no` | `10485760` | Maximum non-Google-Workspace file size to read in bytes. |
+| `max_download_size` | `number` | `no` | `104857600` | Maximum file or export size to download into the agent workspace in bytes. |
 
 ### Example
 
@@ -18806,7 +18808,8 @@ If that budget is exhausted, the error is surfaced without a new media-free retr
 Errors requesting a guided retry, incomplete Responses streams, and provider safeguard refusals do not trigger the media-free fallback.
 Non-streaming calls have separate eligibility rules: an eligible transient failure may receive the one media-free retry.
 
-When the retry succeeds after exactly one previously unknown media kind was present, the model route learns that kind is unsupported, and later requests omit it up front instead of paying a failed API call.
+When the retry succeeds after exactly one previously unknown media kind was present, and the provider error says the model does not support that kind of input (for example `does not support image input` or `is not a multimodal model`), the model route learns that kind is unsupported, and later requests omit it up front instead of paying a failed API call.
+Any other rejection, such as an image the provider could not decode or a file in a format it does not accept, removes the media from that one request only, so one participant's attachment cannot hide media from other requests on the same model.
 Eligible failures involving multiple previously unknown media kinds still retry once, but do not teach the capability cache because one stripped attempt cannot identify which kind caused the failure.
 This learned capability state is process-local and resets on restart.
 Payload-size and context-overflow rejections never teach the capability state, since dropping media can shrink an oversized request for reasons unrelated to media support.
@@ -20118,6 +20121,7 @@ Opening a thread is atomic per key.
 While one delivery is posting the first root, a concurrent delivery with the same key receives `409 External trigger thread is being opened by another delivery`; retry it with a fresh signed request and the same `event_id`, and it will join the thread.
 A reservation whose first delivery fails is released immediately; a crashed delivery releases it after 5 minutes.
 Reservations are fenced: a delivery that outlives its reservation can neither bind its root over a newer reservation nor release it, so a slow first delivery cannot orphan the thread that replaced it.
+If the trigger's `thread_key` records reach their limit while such a slow delivery is posting, its message is still recorded as delivered but its key is not kept, so a later delivery with that key opens a new thread once there is room.
 
 A follow-up that fails to send keeps the key bound to its thread, so a transient error never splits one conversation across two threads.
 
@@ -20133,9 +20137,9 @@ If delivery succeeds, a later signed request with the same `event_id` is treated
 
 Delivered `event_id` records are retained for 24 hours in the current JSON replay store.
 
-Because the replay store retains them, `event_id`, `thread_key`, and the signature nonce are each limited to 256 characters.
+Because the replay store retains them, `event_id`, `thread_key`, and the signature nonce are each limited to 256 bytes as the JSON replay store writes them: printable ASCII characters other than `"` and `\` take one byte each, and every other character takes the 2 to 12 bytes of its JSON escape.
 
-Each trigger may hold at most 10,000 unexpired nonces and 10,000 unexpired `event_id` records, and a request that would add one more is answered with `429` until older records expire.
+Each trigger may hold at most 10,000 unexpired nonces, 10,000 unexpired `event_id` records, and 10,000 unexpired `thread_key` records, and a request that would add one more is answered with `429` until older records expire.
 
 Retries must create a fresh signed request with the same `--event-id`.
 
