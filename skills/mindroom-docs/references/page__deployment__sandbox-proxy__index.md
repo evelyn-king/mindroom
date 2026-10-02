@@ -192,7 +192,9 @@ Each worker pod runs the sandbox-runner app and is addressed through an internal
 Each dedicated worker needs access to its agent's storage directory.
 Worker-local files (caches, virtualenvs, metadata) are kept separate per worker.
 When a worker is idle, its Deployment scales to zero, but agent data and worker caches are preserved.
-The runtime chart stores derived worker tokens and optional credential-encryption keys as per-worker entries in one chart-created worker-auth Secret when workers run in the release namespace.
+The runtime chart stores derived worker tokens as per-worker entries in one chart-created worker-auth Secret when workers run in the release namespace.
+Dedicated workers never receive the credential encryption key, matching dedicated Docker workers.
+With encrypted credential storage enabled, the worker credential stores and the `.shared_credentials` mirror the primary writes are encrypted with that key, so worker code cannot read them and tool settings reach the worker only through [credential leases](#credential-leases).
 If `workers.kubernetes.namespace` is set to a separate worker namespace, the runtime chart can instead manage per-worker auth Secrets in that namespace.
 The hosted instance chart refuses this mode, because its tenants share the `mindroom-instances` namespace and a worker manager's Role there would reach every tenant's Deployments and Services.
 
@@ -628,8 +630,9 @@ Selected services follow the call's scoped credential policy and, where applicab
 Only fields declared by the receiving toolkit are applied as constructor configuration; unrelated credential fields are ignored.
 The lease holds its values in memory until consumed or expired, and the proxy requests one use with the configured TTL.
 With the `static_runner` backend, the primary also leases the called tool's own saved settings on every call because a containerized shared runner has no access to the credential store.
-Scoped calls to dedicated Docker and Kubernetes workers lease the called tool's saved settings the same way, except for model-provider tools, because the primary owns scoped tool settings; values in the worker's own credential store apply only where the lease sets nothing.
-Unscoped dedicated workers keep reading tool settings from their own worker credential stores.
+Calls to dedicated Docker and Kubernetes workers lease the called tool's saved settings the same way, because the primary owns tool settings; values in the worker's own credential store apply only where the lease sets nothing.
+Scoped calls lease the settings saved for their scope, and unscoped calls lease the settings saved in the primary credential store, so neither needs the credential encryption key in the worker.
+The `defaults.worker_grantable_credentials` allowlist controls which shared credentials are mirrored into dedicated workers and which shared settings scoped calls may lease, but it does not limit unscoped calls: as with the `static_runner` backend, unscoped calls still lease the called tool's saved settings from the primary credential store, including the `openai` and `groq` provider keys, because those tools share their service names with the model providers.
 Settings saved in a worker credential store before the primary owned them stay there and still apply where a lease sets nothing, so clear worker credential stores after upgrading if those values should stop applying.
 Services selected by the policy override those values.
 

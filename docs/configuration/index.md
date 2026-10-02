@@ -454,7 +454,7 @@ Container `env_file`/`--env-file` injection supplies process variables and can t
 |----------|-------------|---------|
 | `MATRIX_HOMESERVER` | Matrix homeserver URL | `http://localhost:8008` |
 | `MATRIX_SERVER_NAME` | Server name for federation | _(derived from homeserver)_ |
-| `MATRIX_SSL_VERIFY` | Verify the homeserver's TLS certificate; provisioning service requests are always verified | `true` |
+| `MATRIX_SSL_VERIFY` | Verify the TLS certificate of `MATRIX_HOMESERVER`; provisioning service requests and other homeservers are always verified | `true` |
 | `MINDROOM_DESKTOP_MATRIX_HOMESERVER` | Public Matrix URL printed by `!desktop setup` when it differs from the runtime's internal homeserver URL | `MATRIX_HOMESERVER` |
 | `MINDROOM_DESKTOP_CLOUDFLARE_ACCESS` | Include `--cloudflare-access` in the Desktop login and pairing commands printed by `!desktop setup` | `false` |
 
@@ -1051,6 +1051,7 @@ OAuth credentials are read only from their authoritative SQLite stores and use t
 Legacy OAuth JSON files and sidecars are ignored and left unchanged, and changing the encryption setting never imports them.
 An OAuth connection that exists only in JSON must be reconnected with the intended encryption setting.
 Current encrypted SQLite credentials become readable again when their correct key is restored.
+Dedicated Docker and Kubernetes workers never receive the key, so with encryption enabled they cannot read the worker credential stores and `.shared_credentials` mirrors the primary encrypts, and saved tool settings reach them only through [credential leases](../deployment/sandbox-proxy.md#credential-leases).
 
 ## Debug Logging
 
