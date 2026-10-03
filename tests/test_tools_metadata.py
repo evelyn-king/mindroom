@@ -1955,7 +1955,6 @@ _UNCONFINED_LOCAL_FILE_TOOLS = (
     "redshift",
     "slack",
     "sql",
-    "visualization",
 )
 
 
