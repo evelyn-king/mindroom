@@ -1773,6 +1773,8 @@ Agent-authored, system-authored, and configured bridge-bot-authored tool calls a
 An agent that acts for the human whose request another agent's reply relayed to it asks that human for approval, as if the human had asked it directly.
 OpenAI-compatible `/v1/chat/completions` has no approval transport, so any tool function that matches a required-approval rule, including script-based rules, is hidden from the `/v1` tool schema instead of being exposed and blocked later.
 Skill, knowledge-search, and learning functions such as `get_skill_script`, `search_knowledge_base`, and `update_user_memory` cannot pause for approval, so on every channel they are hidden when a required-approval rule or `default: require_approval` applies to them; add an `auto_approve` rule for one to keep it available.
+When this hides `search_knowledge_base`, or all of `get_skill_instructions`, `get_skill_reference`, and `get_skill_script`, the agent's prompt also stops describing knowledge search or, for a standard agent, its skill functions, so the model is not told to call functions it cannot see.
+Minimal mode still includes skill contents as context documents.
 
 This partial example gates Slack message sending and file uploads, plus shell calls selected by the review script.
 It does not gate every Slack operation, and the same function names in other toolkits also match.
@@ -9595,6 +9597,7 @@ With `after-toolcall`, MindRoom rebuilds the current agent or team with the sele
 With `next-turn`, the current response continues with the model it started with and the selected model begins on the next user turn.
 The override applies to the agents, teams, and router in the thread that the requester may address, and persists across restarts.
 Every other entity keeps its own thread override or room-level model.
+During a configured team's turn, the team's thread override also applies to its member agents, because the team's `access` reaches them.
 `get_thread_model` returns an `overrides` map from each entity with an active thread override to its model, plus the available model names.
 When a stored override names a model that has been removed from `config.models`, runtime resolution ignores it, and `get_thread_model` reports that entity under `stale_overrides` instead of `overrides`.
 `reset_thread_model` removes the thread override of the entities the requester may address so room-level model selection applies to them: an active runtime `!room_model` override, then configured `room_models`, then each entity's configured model.
@@ -13320,7 +13323,7 @@ revoke_public_report("pub_...")
 Redaction masks every value inside a field the config schema marks secret, such as MCP server `env` and `headers`, plugin `settings`, and model `extra_kwargs`, whatever its key names, except `${NAME}` environment references, which are shown as written.
 Other typed fields keep their values, entries in free-form maps such as tool overrides are also masked when their key names look like credentials, and credential patterns in any text, such as URL passwords and bearer tokens, are masked.
 Inspection, `agent_config`, and every write require a requester listed in `administrators`; other requesters, and calls without a requester, receive an authorization error instead of configuration content.
-A patch whose value contains the `***redacted***` marker is refused, so copying inspected output back never replaces a hidden real value.
+A patch value, or a `display_name`, `role`, or `instructions` value given to `manage_agent()`, that contains the `***redacted***` marker or a URL password masked as `user:***@host` is refused, so copying redacted output back never replaces a hidden real value.
 `manage_config(operation="patch", changes=[...])` applies an atomic batch of RFC 6902 `add`, `replace`, and `remove` entries across the full `Config` schema, validates the result against the active runtime, and persists only when validation passes.
 `dry_run=True` validates a patch and returns its receipt without writing.
 Patch receipts report the config path, changed paths, and validation and persistence status without echoing changed values.
@@ -13391,6 +13394,7 @@ manage_team(
 
 `self_config` exposes `get_own_config()` and `update_own_config()`.
 `get_own_config()` returns the current agent's authored YAML block, redacted like `config_manager` inspection.
+`update_own_config()` refuses a `display_name`, `role`, or `instructions` value that contains the `***redacted***` marker or a URL password masked as `user:***@host`, so copying that redacted output back never replaces a hidden real value.
 Reads and writes both require a requester listed in `administrators`.
 `update_own_config()` only changes fields that you pass explicitly.
 On this branch, `update_own_config()` can modify `display_name`, `role`, `instructions`, `tools`, `model`, `rooms`, `markdown`, `learning`, `learning_mode`, `knowledge_bases`, `skills`, `include_default_tools`, `show_tool_calls`, `thread_mode`, `num_history_runs`, `num_history_messages`, `compress_tool_results`, `max_tool_calls_from_history`, and `context_files`.
@@ -19251,6 +19255,7 @@ Show or switch the model that the agents, teams, and router you may address use 
 ```
 
 The override applies only to the entities whose `access` admits the user who set it in this room; every other entity keeps its own thread override or room-level model.
+During a configured team's turn, the team's thread override also applies to its member agents, because the team's `access` reaches them.
 `!model reset` likewise removes the override only for the entities you may address.
 
 `!model` and `!model list` show each thread override with the entities it applies to, and the available model names.
@@ -19372,7 +19377,7 @@ Only the user who requested the change can confirm or cancel it.
 Pending changes are persisted in Matrix room state and survive restarts.
 Room state is readable by every room member and is not end-to-end encrypted, so the pending change stores the requester, room, thread, creation time, configuration path, and decision progress, but never the current value.
 It stores the new value only when redaction leaves that value unchanged.
-`!config set` refuses a value containing the `***redacted***` marker, which only appears in redacted output, so copying shown values back never replaces a hidden real value; set that field to its real value instead.
+`!config set` refuses a value containing the `***redacted***` marker or a URL password masked as `user:***@host`, which only appear in redacted output, so copying shown values back never replaces a hidden real value; set that field to its real value instead.
 A new value that redaction masks is kept only in the running MindRoom process; if MindRoom restarts before you confirm, the confirmation replies that the pending change was lost and asks you to run `!config set` again.
 Unconfirmed changes expire after 24 hours.
 
@@ -19715,6 +19720,7 @@ Schedule agents or teams to perform tasks at specific times or intervals using n
 
 By default, tasks run in the same scope where they were created: the room timeline for room-level schedules, or the current thread for threaded schedules.
 The `schedule()` tool accepts `new_thread=True` to start a fresh thread per fire: each fire posts a room-level root and the responding agent answers in a new thread under it with a fresh session.
+A fire's text never runs as a chat command, even when it starts with `!`; it reaches the agents as an ordinary scheduled message.
 
 Schedules with a recorded creator are automatically canceled once live membership checks confirm that neither the creator nor any permitted human alias is joined to the room.
 Configured bot accounts and managed identities do not count as human aliases.
@@ -20458,6 +20464,7 @@ An agent's or team's reply, including a raw `m.room.message` an agent sends with
 A mentioned agent or team then acts for that human: it applies its own `access` to the human and does not respond when that excludes them, and it runs with the human as requester for credentials, requester-private instances, memory, learning, and approvals.
 The `!help`, `!model`, `!mode`, and schedule commands in such a reply likewise run with that human as requester, so they reach only the entities the human may address.
 MindRoom refuses every other command in such a reply, including `!desktop`, `!config`, `!encrypt`, `!room_model`, and `!thread_mode`, so the human must send those personally.
+A scheduled task's text never runs as a chat command when it fires, so an agent cannot send one for the human by scheduling it either.
 The replying entity stays the message's author in conversation history and prompts, and its unaddressed replies remain agent chatter that other entities ignore.
 A team's `access` authorizes requests to the team as a whole: a requester the team admits reaches every member agent through that team, even members whose own `access` would not admit them directly.
 The authoritative membership index fails closed while a referenced room is missing, stale, unresolved, or unavailable.
