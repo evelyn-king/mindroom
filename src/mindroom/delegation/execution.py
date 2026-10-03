@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -841,7 +842,8 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
         if call is None or not call.binds_arguments(tool.tool_args):
             msg = "Saved delegation approval no longer matches its pending arguments; retry the request"
             raise RuntimeError(msg)
-    if requirement.id not in state.hooks:
+    # Hook records live in storage worker code can write, so only a started child may reuse its stored gate.
+    if retained is None or requirement.id not in state.hooks:
         state.hooks[requirement.id] = await before_delegation(
             execution_identity=caller_identity,
             arguments=args,
@@ -1101,14 +1103,21 @@ async def drive_delegations(  # noqa: C901, PLR0912
             )
         continued = None
         error_event: RunErrorEvent | TeamRunErrorEvent | None = None
-        async with closing_async_stream(continuation_stream):
-            async for event in continuation_stream:
-                if isinstance(event, (RunErrorEvent, TeamRunErrorEvent)):
-                    error_event = event
-                if isinstance(event, (RunOutput, TeamRunOutput)):
-                    continued = event
-                elif not isinstance(event, (RunPausedEvent, TeamRunPausedEvent)) and on_event is not None:
-                    on_event(event)
+        # Agno re-reads this run from storage worker code can write, and without decisions no stored call is approved.
+        unapproved_refusal = (
+            approved_executions_context(cast("Agent", entity), {})
+            if decisions is None and isinstance(response, RunOutput)
+            else nullcontext()
+        )
+        with unapproved_refusal:
+            async with closing_async_stream(continuation_stream):
+                async for event in continuation_stream:
+                    if isinstance(event, (RunErrorEvent, TeamRunErrorEvent)):
+                        error_event = event
+                    if isinstance(event, (RunOutput, TeamRunOutput)):
+                        continued = event
+                    elif not isinstance(event, (RunPausedEvent, TeamRunPausedEvent)) and on_event is not None:
+                        on_event(event)
         entity_label = "Team" if isinstance(response, TeamRunOutput) else "Agent"
         if continued is None:
             if error_event is not None:
