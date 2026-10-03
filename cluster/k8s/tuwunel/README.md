@@ -157,6 +157,30 @@ When the apex is not routed to Tuwunel, the operator must serve the delegation d
 
 The chart defaults `tuwunel.wellKnown.client` to the effective `clientBaseUrl` and `tuwunel.wellKnown.server` to `<serverName>:443`; override them when the public routing differs.
 
+## Upgrades and Database Migrations
+
+The first start after a Tuwunel upgrade can run a one-time database migration, and the listener does not open until it finishes.
+Tuwunel stops a migration only at its next safe point, and a kill before then leaves the database half migrated with no repair path.
+The chart therefore sets `terminationGracePeriodSeconds: 1800`, following [Tuwunel's Kubernetes guidance](https://github.com/mindroom-ai/mindroom-tuwunel/blob/main/docs/deploying/kubernetes.md), instead of the Kubernetes default of 30 seconds.
+GKE Autopilot limits the grace period to 600 seconds (25 seconds for Spot Pods) and lowers larger values with a warning, so set `terminationGracePeriodSeconds: 600` there.
+Lower it on other platforms that cap the grace period, or set it to `null` to use the Kubernetes default.
+
+For large databases, raise `probes.startup.failureThreshold` so the startup probe budget covers the longest expected migration, because a failing startup probe restarts the container.
+The `Recreate` strategy starts the replacement pod only after the old pod stops, and the old pod can take up to `terminationGracePeriodSeconds` to stop.
+Kubernetes' default progress deadline of 600 seconds is shorter than the 1800-second grace period, so a slow shutdown alone can make Kubernetes report the rollout as stalled.
+Set `progressDeadlineSeconds` above the old pod's shutdown time plus the startup probe budget so Kubernetes does not report the rollout as stalled while the old pod stops and the migration runs.
+The chart rejects invalid values and values above Kubernetes' int32 limit of `2147483647` seconds, and leaving it unset or `null` preserves the Kubernetes default.
+This controls when Kubernetes reports a stalled rollout; it does not change probe settings or Helm's wait timeout.
+
+```yaml
+probes:
+  startup:
+    periodSeconds: 10
+    failureThreshold: 180 # 30 minutes
+progressDeadlineSeconds: 4200 # 30-minute shutdown + 30-minute startup + margin
+terminationGracePeriodSeconds: 1800
+```
+
 ## Notes
 
 - The Deployment is pinned to one replica with a `Recreate` strategy because Tuwunel does not support horizontal scaling against one database.
