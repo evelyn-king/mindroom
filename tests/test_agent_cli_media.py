@@ -21,7 +21,8 @@ from mindroom.agent_cli.bash import MinimalBashTools
 from mindroom.agent_cli.events import stream_cli_events
 from mindroom.agent_cli.json_io import MAX_ENVELOPE_BYTES, canonical_json
 from mindroom.agent_cli.lifetime import response_cli_lifetime
-from mindroom.agent_cli.protocol import ContextReadOperation, ToolCallOperation, ToolDescribeOperation
+from mindroom.agent_cli.projection import project_cli_result
+from mindroom.agent_cli.protocol import ContextReadOperation, ToolCallOperation, ToolCallReceipt, ToolDescribeOperation
 from mindroom.agent_cli.session import CliTurnOwner
 from mindroom.agent_cli.shell_contract import AgentCliShellEnv
 from mindroom.agent_cli.turn import LiveTurnTools
@@ -362,3 +363,32 @@ async def test_admission_uses_current_window_context_after_rebuild(tmp_path) -> 
         assert tag.get() == "unbound"
     finally:
         await owner.close()
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        # Quotes double when JSON-escaped, so this alone would overflow the 64 KiB receipt envelope.
+        '"' * 40_000,
+        # Halving stops just under the budget, so the notice must count toward it too.
+        "x" * 32_700,
+    ],
+    ids=["escaped", "notice-at-budget"],
+)
+def test_large_result_without_workspace_is_shortened_to_fit_its_receipt(result: str) -> None:
+    """With nowhere to save the full output, an oversized result still reaches the caller, shortened."""
+    projected = project_cli_result(result, None, "run_shell_command")
+
+    assert isinstance(projected, str)
+    assert projected.startswith(result[:1000])
+    assert projected.endswith("Call the tool directly for all of it.]")
+    assert len(json.dumps(projected, ensure_ascii=False).encode()) <= 16 * 1024
+    receipt = ToolCallReceipt(
+        call_id=uuid4(),
+        toolkit="shell",
+        function="run_shell_command",
+        status="completed",
+        outcome=projected,
+    )
+    assert len(canonical_json(receipt.model_dump(mode="json")).encode()) <= MAX_ENVELOPE_BYTES
+    assert project_cli_result("small", None, "run_shell_command") == "small"

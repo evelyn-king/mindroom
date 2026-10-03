@@ -37,6 +37,19 @@ A minimal subagent cannot pause for approval, so approval-gated tools are hidden
 Minimal subagents run only inside Matrix conversations.
 A minimal child runs Bash where its own shell runs.
 
+## Standard mode
+
+Standard-mode agents with the `shell` tool can also use `mindroom-agent` inside their shell commands, so one script can combine many tool calls, loop over results, or filter them before anything returns to the model.
+It is available automatically when the agent answers a Matrix conversation itself and its shell meets the [deployment requirements](#deployment-requirements); the agent's instructions then mention it.
+Team members, call agents, workflow participants, and OpenAI-compatible requests do not get it.
+The agent keeps all of its tools as ordinary tools as well.
+Tools that may require approval, ask the requester a question, delegate to another agent, or end the turn are not offered through the CLI in standard mode; the agent calls them directly instead.
+The CLI is not offered when the agent's shell commands themselves require approval, and after a response pauses for any approval, the rest of that response continues without it.
+Calls are admitted only while one of the response's shell commands is running; shell commands still run in parallel, and when they overlap, a call is attributed to the most recently started one.
+Media returned by those calls reaches the model with the shell command's result.
+Calls through the CLI count against their own `max_tool_calls_per_turn` budget, separate from the agent's ordinary tool calls.
+Streamed responses show calls made through the CLI as their own tool-trace entries.
+
 ## Instructions and context
 
 Minimal mode replaces the automatically assembled long prompt with discovery guidance and optional `minimal_instructions`:
@@ -114,7 +127,7 @@ mindroom-agent context read NAME --offset 0 --limit 8000
 Use names returned by context discovery.
 Context reads do not accept arbitrary filesystem paths.
 Large schemas provide a context name for paged readback.
-Large tool results provide a bounded preview and a workspace artifact path containing the full output.
+Large tool results provide a bounded preview and a workspace artifact path containing the full output; for an agent without a workspace, they are shortened instead.
 Images, audio, and files remain available through the normal response attachment handling.
 
 ## Exit codes

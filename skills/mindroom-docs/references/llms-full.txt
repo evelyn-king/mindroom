@@ -4947,6 +4947,19 @@ A minimal subagent cannot pause for approval, so approval-gated tools are hidden
 Minimal subagents run only inside Matrix conversations.
 A minimal child runs Bash where its own shell runs.
 
+## Standard mode
+
+Standard-mode agents with the `shell` tool can also use `mindroom-agent` inside their shell commands, so one script can combine many tool calls, loop over results, or filter them before anything returns to the model.
+It is available automatically when the agent answers a Matrix conversation itself and its shell meets the [deployment requirements](#deployment-requirements); the agent's instructions then mention it.
+Team members, call agents, workflow participants, and OpenAI-compatible requests do not get it.
+The agent keeps all of its tools as ordinary tools as well.
+Tools that may require approval, ask the requester a question, delegate to another agent, or end the turn are not offered through the CLI in standard mode; the agent calls them directly instead.
+The CLI is not offered when the agent's shell commands themselves require approval, and after a response pauses for any approval, the rest of that response continues without it.
+Calls are admitted only while one of the response's shell commands is running; shell commands still run in parallel, and when they overlap, a call is attributed to the most recently started one.
+Media returned by those calls reaches the model with the shell command's result.
+Calls through the CLI count against their own `max_tool_calls_per_turn` budget, separate from the agent's ordinary tool calls.
+Streamed responses show calls made through the CLI as their own tool-trace entries.
+
 ## Instructions and context
 
 Minimal mode replaces the automatically assembled long prompt with discovery guidance and optional `minimal_instructions`:
@@ -5024,7 +5037,7 @@ mindroom-agent context read NAME --offset 0 --limit 8000
 Use names returned by context discovery.
 Context reads do not accept arbitrary filesystem paths.
 Large schemas provide a context name for paged readback.
-Large tool results provide a bounded preview and a workspace artifact path containing the full output.
+Large tool results provide a bounded preview and a workspace artifact path containing the full output; for an agent without a workspace, they are shortened instead.
 Images, audio, and files remain available through the normal response attachment handling.
 
 ## Exit codes
@@ -20897,6 +20910,7 @@ MindRoom's architecture consists of several key components working together.
 | `agent_descriptions.py` | Shared agent description rendering for routing and delegation |
 | `agent_policy.py` | Derives canonical execution policies from authored agent config |
 | `minimal_agent.py` | Same live Agent with one provider-facing Bash tool and hidden canonical tool preparation |
+| `cli_shell_agent.py` | Standard agents whose native shell commands call their other tools through `mindroom-agent` |
 | `agent_cli/` | Response-owned CLI grants, call admission, shell access, discovery, and result projection |
 | `agent_modes.py` | Conversation-scoped standard/minimal selection persistence |
 | `minimal_mode_preflight.py` | Minimal-mode eligibility for `!mode` and minimal subagents, reported as one actionable checklist |
@@ -22551,7 +22565,7 @@ Do not report or "fix" these; they are deliberate.
   Every learner read and write goes through no-follow descriptors, and the primary takes no lock inside the workspace, so worker code cannot stall it through learned skills.
 - `skill_manage`, which agents that list it or learn skills use in chat and the review writes with, runs in the primary process and writes only below the agent's workspace `skills/` directory through the same no-follow descriptors, regardless of `file_access`, like MindRoom-owned output.
 - A team's `access` authorizes its exact member agents for team requests, in Matrix and the OpenAI-compatible API, even members whose own `access` would not admit the requester directly; adding an agent to a team is a deliberate grant.
-- A minimal-mode response's CLI grant is in the environment of its shell commands, so other code in the same worker can use that requester's tools through it until the response ends; code that shares a worker already shares its trust.
+- A response's CLI grant, in minimal mode or for a standard-mode agent whose shell can reach MindRoom, is in the environment of its shell commands, so other code in the same worker can use that requester's tools through it until the response ends; code that shares a worker already shares its trust.
 - A non-private agent's workspace is shared by every requester's runtime for that agent, including `user` and `user_agent` workers, so files one requester leaves there (such as `.mindroom/worker-env.sh`, `.pth` files, or Git config) can run in another requester's runtime; use `private` agents when requesters need isolation from each other.
 - Likewise, a non-private agent's primary-process `browser` profiles and default artifacts live in that agent's state root and are shared by all of its requesters, so one requester can use web sessions another signed in and upload screenshots another took; they never cross agents or the requesters of a private agent.
 - A browser egress proxy in a sandbox runner receives destination hostnames, because an approved-egress proxy decides by name, so rebinding between the relay's check and that proxy's own lookup is the proxy's responsibility; in the primary the relay tunnels to the address it validated.
