@@ -4657,6 +4657,8 @@ The rules are:
 4. **Threads with two or more humans** — explicit targeting is required by default; eligible individual agents can use the opt-in participation exception above.
 5. **Mentioning another joined room participant** — if a message tags only joined users who are neither managed entities nor configured bot accounts, agents and teams stay silent.
 
+A thread whose history does not fit in one read, 2,000 messages or 16 MiB of stored content, whichever comes first, is not continued from an untagged message when the room has more than one possible responder, unless an agent is still answering there; mention the agent or team to continue it.
+
 Mentions of unmanaged user IDs that are absent from the room or merely invited do not suppress normal routing or automatic responses.
 Mentioning a configured agent that is not joined to the room still counts as an explicit mention for the other agents.
 
@@ -9534,9 +9536,9 @@ The tool normalizes the target to the canonical thread root before sending a new
 Manual summaries are marked with `model_name="manual"` and pin the thread by default, which stops automatic summaries from overwriting the title.
 Pass `pin=False` to write a summary that later automatic summaries may replace; that also releases a thread pinned by an earlier call.
 A per-thread async lock prevents concurrent duplicate manual summaries from racing each other.
-Manual tool writes require complete projected thread history within the 2,000-message read window.
+Manual tool writes require complete projected thread history within one read, 2,000 messages or 16 MiB of stored content, whichever comes first.
 If history is incomplete or unavailable, the tool returns an error before publishing the summary.
-A history read can be incomplete below that window limit.
+A history read can be incomplete below those limits.
 
 Manual edits from MindRoom Chat also pin the summary immediately using a version 1 `m.notice` with `model="manual"` and `pinned=true` in `io.mindroom.thread_summary` metadata.
 The sender must have responder access to the updating agent or another eligible responder in the room, so a shared thread title stays pinned across agents.
@@ -9769,9 +9771,9 @@ The next scheduled refresh uses one structured model call to update the summary 
 The background task reads fresh authoritative history for counting and includes the delivered response.
 The model prompt excludes trusted summary notices and messages with empty bodies.
 If more than 50 messages remain, it includes only the first three and last three plus an omission notice; at 50 or fewer, it includes all remaining messages.
-Automatic refreshes require complete projected thread history within the 2,000-message read window, just like manual tool writes.
-Incomplete or unavailable history skips an automatic refresh, and incompleteness can occur below the window limit.
-The read window counts projected messages, while prompt sampling counts body-bearing non-summary messages; neither is a raw Matrix event count.
+Automatic refreshes require complete projected thread history within one read, 2,000 messages or 16 MiB of stored content, whichever comes first, just like manual tool writes.
+Incomplete or unavailable history skips an automatic refresh, and incompleteness can occur below those limits.
+The read's message limit counts projected messages, while prompt sampling counts body-bearing non-summary messages; neither is a raw Matrix event count.
 Existing tags win, including tags observed after the model call finishes.
 MindRoom serializes automatic and tool-driven tag mutations per thread within one running process, and persisted removal tombstones prevent a later automatic batch from repopulating a deliberately untagged thread.
 The initial tags use the same summary model, room override, temperature, prompt, lock, and background lifecycle as the refreshed summary.
@@ -19008,7 +19010,7 @@ Downloaded Matrix media is stored once per content and file type, so events that
   This is a post-download check, so use a smaller file when it is rejected.
   Homeservers and model providers may impose lower limits; `get_attachment(view=True)` has a separate 20 MiB per-attachment limit.
 - **Earlier media that fails** -- a file, image, or video earlier in the conversation that cannot be downloaded, decrypted, or stored is not tried again for an hour, so later turns do not fetch it each time.
-- **Earlier media per turn** -- one turn downloads at most 10 earlier files, images, or videos that are not stored yet, oldest first, and leaves the rest for later turns.
+- **Earlier media per turn** -- one turn downloads at most 10 earlier files, images, or videos that are not stored yet, newest first, and leaves the rest for later turns.
   The thread's opening message is not counted toward this limit or held back after a failure: each turn downloads it until it is stored.
 - **Routing with multiple eligible responders** -- without an `@mention`, the router uses the file caption to select among candidates only when room configuration and reply permissions leave multiple eligible agents or teams.
 - **Model support** -- the configured model must support file or video inputs for direct analysis. Models that do not can still use the `attachments` tool to inspect and process files via tool calls.
@@ -21163,7 +21165,8 @@ When deriving context for an incoming event, MindRoom:
 3. Lets edits, reactions, redactions, and other target-bound operations inherit the canonical thread membership of their target event.
 4. May start a new thread under a room-root event when agent thread mode requires it.
 
-A read that must come straight from the homeserver, such as the thread-summary pin check, restart auto-resume, and thread-root proofs for tools, walks room history back at most 100 pages of 100 events; a root older than that is reported as unproven, so those callers fail closed.
+A read that must come straight from the homeserver, such as the thread-summary pin check, restart auto-resume, and thread-root proofs for tools, walks room history back at most 1,000 pages of 100 events and keeps at most 10,000 events from that walk, counting each non-edit message and one edit per original and sender; a root older than either bound is reported as unproven, so those callers fail closed.
+Every message event in the room counts toward the page bound, including each streaming edit of every other reply on a homeserver that keeps them.
 
 ```
 ├── User: @assistant help with this code
