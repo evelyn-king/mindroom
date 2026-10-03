@@ -119,7 +119,10 @@ def upgrade_approval_toolkit_origins(transaction: Transaction, columns: frozense
 # canonical arguments.
 # Handling: Add the nullable column and keep historical rows; an approved call without a digest never executes,
 # because continuation refuses calls whose persisted arguments do not match their digest and fails normally.
-# Coverage: tests/test_journal_upgrade_boundary.py::test_approval_argument_digest_upgrade_keeps_calls_unexecutable.
+# The exception is CLI recovery of a generated `agent` function, which runs the arguments saved in the journal's
+# own CLI payload, where worker code cannot write, whether or not a digest was recorded.
+# Coverage: tests/test_journal_upgrade_boundary.py::test_approval_argument_digest_upgrade_keeps_calls_unexecutable;
+# tests/test_cli_approval_recovery.py::test_generated_cli_approval_rebuilds_and_authorizes_exact_function.
 def upgrade_approval_argument_digests(transaction: Transaction, columns: frozenset[str]) -> None:
     """Add the argument digest column inside the schema transaction."""
     if "arguments_digest" not in columns:
