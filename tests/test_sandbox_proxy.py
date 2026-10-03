@@ -7123,6 +7123,7 @@ class TestWorkerToolsOverride:
             "reasoning",
             "script",
             "slack",
+            "spotify",
             "sql",
             "todo",
             "usage_stats",
