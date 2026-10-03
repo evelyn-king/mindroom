@@ -182,6 +182,7 @@ Enable them locally with **Allow shell command requests** in the macOS app's **A
 
 Every `run_shell` request waits for a decision from the person at the computer, either on the approval card in the macOS app or at the prompt in the terminal running `mindroom desktop run`, unless an earlier choice already auto-approved it.
 The approver sees the exact command, working directory, requester, agent, and expiry, with control, text-direction, invisible, and non-ASCII space characters shown escaped, and the command's length in characters and lines.
+When any of them contains a non-ASCII character, both surfaces warn that it can look like ASCII and repeat the command with every non-ASCII character escaped, so a look-alike host such as one spelled with Cyrillic letters stands out.
 The macOS card lays out every line of the command and working folder left to right, so right-to-left text cannot reverse how a line reads, and copying the text yields exactly what is shown.
 The choices are reject, approve once, or approve and also auto-approve later commands for 5, 15, or 60 minutes or until shell access is revoked or the bridge stops.
 There is no remote approval operation, so a chat message, the agent, or cloud configuration cannot approve a command, extend auto-approval, or grant it.
@@ -281,10 +282,12 @@ macOS supports native semantic state through AXUIElement and requires Accessibil
 macOS screenshots require macOS 14 or newer and Screen Recording permission.
 When `mindroom desktop run` starts from a terminal, macOS attributes both permissions to that terminal app and applies a new grant only after the app is quit and reopened, even if it already appears enabled; inside tmux, also restart the tmux server with `tmux kill-server`.
 ScreenCaptureKit captures the exact selected window, with its process and bounds checked before capture.
+On macOS, right before each coordinate pointer event from `click`, `double_click`, `drag`, `hover`, or `scroll`, including every drag step and the release, the topmost visible window at that point must belong to the allowed app; if another app's window covers it, such as a notification banner, floating panel, or Picture in Picture, input stops, any held button is released, and the outcome is reported as unknown.
 Linux currently exposes screenshot-only observation and state through the explicit `primary-screen` app ID, while coordinate input through PyAutoGUI is available during a control lease.
 On Windows, the terminal commands `mindroom desktop login`, `pair`, `setup`, `access`, and `run` target screenshot-only observation through the explicit `primary-screen` app ID, which has not yet been verified on a real Windows computer.
 Coordinate input during a control lease uses the same PyAutoGUI path and is also unverified on Windows.
 Linux pixel operation currently targets an active X11 desktop because PyAutoGUI does not provide native Wayland control.
+On Linux and Windows, coordinate input is best-effort: it is not bound to the app's window, so a window covering the point receives it.
 A headless or locked graphical session is not a supported target.
 Read-only folders and shell commands need no application selection and no Accessibility or Screen Recording permission.
 They require macOS or Linux.
