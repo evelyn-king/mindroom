@@ -112,7 +112,7 @@ The MCP manager callback schedules an orchestrator-owned background task so the 
 6. A runtime being replaced wakes its pre-admission waiters with `ResponseAdmissionRefusedError`.
    The refusal leaves the admitted source pending in the event journal so the replacement runtime can replay it.
    The refusal path performs no Matrix I/O, so replacement shutdown cannot stall on an untimed send.
-   Auto-resume messages received by replacement bots during the apply wait for the gate to reopen instead of being dropped.
+   Replies the forced apply cancels are left pending the same way, so the replacement runtime replays them and continues each in its existing message.
 7. If responses never drain, either replacement flow stops deferring after 600 seconds and closes the gate over still-running responses.
    This bounded forced apply prevents a busy install from starving config or MCP replacement forever.
 8. For config reloads, `ConfigReloadLifecycle._update_config()` loads and validates the new config while admission remains open, then `build_config_update_plan()` computes targeted restarts and in-place reconciliations after the gate closes.

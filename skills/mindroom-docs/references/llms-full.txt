@@ -1737,7 +1737,6 @@ These settings are global-only:
 | `coalescing.debounce_ms` | `1000` | Milliseconds (>= 0) to wait after media for more attachments or a trailing caption before replying; text replies immediately |
 | `show_stop_button` | `true` | Add a 🛑 reaction while an agent responds; see [Stop Button](https://docs.mindroom.chat/chat-commands/#stop-button) |
 | `max_consecutive_agent_replies` | `50` | Consecutive agent or team messages (>= 1) before agents stop waking each other; see [Agents mentioning other agents](https://docs.mindroom.chat/authorization/#agents-mentioning-other-agents) |
-| `auto_resume_after_restart` | `true` | Resume interrupted threads after a restart; see [Automatic Restart Resumption](https://docs.mindroom.chat/configuration/threads/#automatic-restart-resumption) |
 | `max_preload_chars` | `50000` | Cap (>= 1) on preloaded context files; see [File-Based Context Loading](#file-based-context-loading) |
 | `tool_output_auto_save_threshold_bytes` | `51200` | Larger tool outputs are saved to the workspace; see [Workspace and tool output files](https://docs.mindroom.chat/tools/execution-and-coding/#workspace-and-tool-output-files) |
 | `worker_grantable_credentials` | `null` | Shared credential services available inside isolated workers (`null` grants none); Google OAuth client and token services and `google_vertex_adc` cannot be granted. See [Credential leases](https://docs.mindroom.chat/deployment/sandbox-proxy/#credential-leases) |
@@ -2726,12 +2725,6 @@ With `defer_reaction` set, each message that can wait gets the reaction once; wr
 When a user edits a message that already received an agent response, the agent regenerates its reply for the updated content and edits its previous reply in place.
 Edits by agents never trigger regeneration.
 When another agent's reply finishes with a mention of this agent, it reaches this agent as a new message.
-
-## Automatic Restart Resumption
-
-`defaults.auto_resume_after_restart` (boolean, default `true`) makes the router post resume prompts after a restart in threads whose responses were interrupted.
-Set it to `false` to suppress those prompts and resume the work manually.
-Work that was superseded by later messages, or whose requester or room membership no longer applies, is not resumed.
 
 # History & Compaction
 
@@ -4211,6 +4204,7 @@ Raise `update_interval` to reduce load on the homeserver, or lower it for smooth
 Even when streaming is enabled, MindRoom streams a response only when the user who sent the message is `online` or `unavailable`; for an `offline` requester, the placeholder is replaced with the complete response.
 Everyone in the room sees the same edits.
 If the presence check fails, for example because the homeserver has presence disabled, MindRoom does not stream.
+A reply that continues after a restart always streams, even when streaming is off or the requester is offline, so the part it already showed stays in the message.
 When no requester can be identified, MindRoom streams.
 
 ## Presence
@@ -4257,11 +4251,12 @@ The partial text stays in the message, followed by a note explaining how it ende
 | Note | Cause |
 |------|-------|
 | `**[Response cancelled by user]**` | The user stopped the response. |
-| `**[Response interrupted by service restart]**` | MindRoom restarted while the response was being generated and did not continue it. |
+| `**[Response interrupted by service restart]**` | MindRoom restarted while the response was being generated; the reply continues below the note once MindRoom is back, or ends there if nothing is left to continue. |
 | `**[Response interrupted]**` | The response was interrupted for another reason. |
 | `**[Response interrupted by an error: <error description>]**` | Generation failed; the description says why. |
 
-If MindRoom stops or crashes while a response is being generated, the message stays in progress, and when MindRoom starts again the agent answers again in that same message.
+A crash, an orderly shutdown, or an agent restarted by a configuration or MCP change, including during an approved tool call, keeps the partial reply and its tool calls, and the agent continues it in the same message once MindRoom is back.
+The agent is told which visible tool calls already finished so it does not repeat side effects; calls hidden by `show_tool_calls: false` cannot be passed on, so it is only warned that they may have run.
 
 ## Large Messages
 
@@ -17572,6 +17567,7 @@ Smaller changes that need operator action:
   In a sandbox runner, set every proxy variable, or only `all_proxy`, to the same HTTP(S) proxy, or the browser does not start.
   See [Egress Proxy for Browsers](https://docs.mindroom.chat/tools/web-scraping-and-browser/#egress-proxy-for-browsers) for the full rules.
 - **Boolean tool settings**: stored tool config values for boolean fields, including credential seeds read from environment variables or files, must be JSON booleans, JSON `null`, or exactly `true` or `false`; any other value makes the tool fail to load with an error naming the field.
+- **Restart resume setting**: `defaults.auto_resume_after_restart` is removed and fails validation, so delete it from `config.yaml`; a reply interrupted by a restart always continues in the same message.
 - **Delegation records**: a delegation still running during the upgrade finishes normally, but its workspace `run.json`, `events.jsonl`, and `transcript.md` stop updating.
 
 ### Compaction Archive

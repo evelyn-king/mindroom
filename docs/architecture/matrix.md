@@ -25,7 +25,7 @@ Silent schedules use the custom `io.mindroom.scheduled.trigger` timeline event s
 Ingress admits that hidden event only from a managed sender, leaves it out of the visible-message projection, and classifies cold-history copies as context-only.
 Journal dispatch validates and normalizes a live or recovered trigger into the existing formatted-message turn path, while an intentional no-report result records the turn and settles the trigger without a visible response.
 Conversation history is hydrated on demand rather than pre-warmed at join: a bounded backward walk fills one room or thread and records the membership epoch it filled under, so a rejoin rebuilds from what the new membership can see instead of merging two memberships into one conversation.
-A read that must come straight from the homeserver, such as the thread-summary pin check, restart auto-resume, and thread-root proofs for tools, walks only a bounded window of recent room history.
+A read that must come straight from the homeserver, such as the thread-summary pin check and thread-root proofs for tools, walks only a bounded window of recent room history.
 A root older than that window is reported as unproven, so those callers fail closed.
 Sync loops are wrapped with `sync_forever_with_restart()` for automatic restart on connection failures.
 

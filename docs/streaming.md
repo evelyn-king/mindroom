@@ -54,6 +54,7 @@ Raise `update_interval` to reduce load on the homeserver, or lower it for smooth
 Even when streaming is enabled, MindRoom streams a response only when the user who sent the message is `online` or `unavailable`; for an `offline` requester, the placeholder is replaced with the complete response.
 Everyone in the room sees the same edits.
 If the presence check fails, for example because the homeserver has presence disabled, MindRoom does not stream.
+A reply that continues after a restart always streams, even when streaming is off or the requester is offline, so the part it already showed stays in the message.
 When no requester can be identified, MindRoom streams.
 
 ## Presence
@@ -100,11 +101,12 @@ The partial text stays in the message, followed by a note explaining how it ende
 | Note | Cause |
 |------|-------|
 | `**[Response cancelled by user]**` | The user stopped the response. |
-| `**[Response interrupted by service restart]**` | MindRoom restarted while the response was being generated and did not continue it. |
+| `**[Response interrupted by service restart]**` | MindRoom restarted while the response was being generated; the reply continues below the note once MindRoom is back, or ends there if nothing is left to continue. |
 | `**[Response interrupted]**` | The response was interrupted for another reason. |
 | `**[Response interrupted by an error: <error description>]**` | Generation failed; the description says why. |
 
-If MindRoom stops or crashes while a response is being generated, the message stays in progress, and when MindRoom starts again the agent answers again in that same message.
+A crash, an orderly shutdown, or an agent restarted by a configuration or MCP change, including during an approved tool call, keeps the partial reply and its tool calls, and the agent continues it in the same message once MindRoom is back.
+The agent is told which visible tool calls already finished so it does not repeat side effects; calls hidden by `show_tool_calls: false` cannot be passed on, so it is only warned that they may have run.
 
 ## Large Messages
 

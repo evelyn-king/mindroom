@@ -206,9 +206,3 @@ With `defer_reaction` set, each message that can wait gets the reaction once; wr
 When a user edits a message that already received an agent response, the agent regenerates its reply for the updated content and edits its previous reply in place.
 Edits by agents never trigger regeneration.
 When another agent's reply finishes with a mention of this agent, it reaches this agent as a new message.
-
-## Automatic Restart Resumption
-
-`defaults.auto_resume_after_restart` (boolean, default `true`) makes the router post resume prompts after a restart in threads whose responses were interrupted.
-Set it to `false` to suppress those prompts and resume the work manually.
-Work that was superseded by later messages, or whose requester or room membership no longer applies, is not resumed.

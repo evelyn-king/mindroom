@@ -222,7 +222,6 @@ These settings are global-only:
 | `coalescing.debounce_ms` | `1000` | Milliseconds (>= 0) to wait after media for more attachments or a trailing caption before replying; text replies immediately |
 | `show_stop_button` | `true` | Add a 🛑 reaction while an agent responds; see [Stop Button](https://docs.mindroom.chat/chat-commands/#stop-button) |
 | `max_consecutive_agent_replies` | `50` | Consecutive agent or team messages (>= 1) before agents stop waking each other; see [Agents mentioning other agents](https://docs.mindroom.chat/authorization/#agents-mentioning-other-agents) |
-| `auto_resume_after_restart` | `true` | Resume interrupted threads after a restart; see [Automatic Restart Resumption](https://docs.mindroom.chat/configuration/threads/#automatic-restart-resumption) |
 | `max_preload_chars` | `50000` | Cap (>= 1) on preloaded context files; see [File-Based Context Loading](#file-based-context-loading) |
 | `tool_output_auto_save_threshold_bytes` | `51200` | Larger tool outputs are saved to the workspace; see [Workspace and tool output files](https://docs.mindroom.chat/tools/execution-and-coding/#workspace-and-tool-output-files) |
 | `worker_grantable_credentials` | `null` | Shared credential services available inside isolated workers (`null` grants none); Google OAuth client and token services and `google_vertex_adc` cannot be granted. See [Credential leases](https://docs.mindroom.chat/deployment/sandbox-proxy/#credential-leases) |
