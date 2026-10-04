@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mindroom.config.agent import AgentConfig
-from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig, RouterConfig
 from mindroom.constants import STREAM_STATUS_ERROR, STREAM_STATUS_KEY
@@ -22,8 +21,10 @@ from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
 from mindroom.orchestration.runtime import SYNC_RESTART_CANCEL_MSG
 from mindroom.response_runner import ResponseRequest, ResponseRunner
+from mindroom.response_sources import ResponseSources
 from mindroom.streaming import _INTERRUPTED_RESPONSE_NOTE, build_restart_interrupted_body
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
+from tests.access_schema_support import with_current_room_member_access
 from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_ACCESS_TOKEN,
@@ -70,14 +71,15 @@ def _response_envelope() -> MessageEnvelope:
 def _make_bot(tmp_path: Path) -> AgentBot:
     runtime_paths = test_runtime_paths(tmp_path)
     config = bind_runtime_paths(
-        Config(
-            agents={
-                "general": AgentConfig(display_name="General Agent", rooms=["!team:localhost"]),
-                "research": AgentConfig(display_name="Research Agent", rooms=["!team:localhost"]),
-            },
-            models={"default": ModelConfig(provider="ollama", id="test-model")},
-            router=RouterConfig(model="default"),
-            authorization=AuthorizationConfig(default_room_access=True),
+        with_current_room_member_access(
+            Config(
+                agents={
+                    "general": AgentConfig(display_name="General Agent", rooms=["!team:localhost"]),
+                    "research": AgentConfig(display_name="Research Agent", rooms=["!team:localhost"]),
+                },
+                models={"default": ModelConfig(provider="ollama", id="test-model")},
+                router=RouterConfig(model="default"),
+            ),
         ),
         runtime_paths,
     )
@@ -142,6 +144,10 @@ async def test_team_non_streaming_has_scheduler_context(tmp_path: Path) -> None:
     ):
         await bot._response_runner.generate_team_response_helper(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$user_event",),
+                    logical_source_event_ids=("$user_event",),
+                ),
                 thread_history=[],
                 prompt="Please coordinate and schedule a reminder",
                 user_id="@user:localhost",
@@ -190,6 +196,10 @@ async def test_team_non_streaming_cancellation_edits_placeholder(tmp_path: Path)
     ):
         await bot._response_runner.generate_team_response_helper(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$user_event",),
+                    logical_source_event_ids=("$user_event",),
+                ),
                 thread_history=[],
                 prompt="Please coordinate and schedule a reminder",
                 user_id="@user:localhost",
@@ -242,6 +252,10 @@ async def test_team_non_streaming_sync_restart_edits_placeholder_with_restart_no
     ):
         await bot._response_runner.generate_team_response_helper(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$user_event",),
+                    logical_source_event_ids=("$user_event",),
+                ),
                 thread_history=[],
                 prompt="Please coordinate and schedule a reminder",
                 user_id="@user:localhost",
@@ -307,6 +321,10 @@ async def test_team_streaming_has_scheduler_context(tmp_path: Path) -> None:
     ):
         await bot._response_runner.generate_team_response_helper(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$user_event",),
+                    logical_source_event_ids=("$user_event",),
+                ),
                 thread_history=[],
                 prompt="Please collaborate and schedule a reminder",
                 user_id="@user:localhost",
@@ -351,6 +369,10 @@ async def test_team_late_cancellation_during_post_effects_propagates(tmp_path: P
         task = asyncio.create_task(
             bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$user_event",),
+                        logical_source_event_ids=("$user_event",),
+                    ),
                     thread_history=[],
                     prompt="Please coordinate and schedule a reminder",
                     user_id="@user:localhost",

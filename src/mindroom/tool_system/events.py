@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -12,7 +13,7 @@ from agno.models.response import ToolExecution
 from mindroom.redaction import redact_sensitive_data, redact_sensitive_text
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
 _TOOL_TRACE_KEY = "io.mindroom.tool_trace"
 _TOOL_TRACE_VERSION = 2
@@ -32,6 +33,14 @@ _StructuredResultDict = dict[str, object]
 _StructuredResultList = list[object]
 
 
+@dataclass
+class AuditedToolExecution(ToolExecution):
+    """Trusted hidden-call identity; never inserted into provider conversation messages."""
+
+    parent_bash_call_id: str | None = None
+    toolkit_name: str | None = None
+
+
 @dataclass(slots=True)
 class ToolTraceEntry:
     """Normalized representation of a tool event for message metadata."""
@@ -44,6 +53,8 @@ class ToolTraceEntry:
     # Internal continuation identity; public Matrix metadata omits this field.
     tool_call_id: str | None = field(default=None, compare=False)
     scope_key: str | None = field(default=None, compare=False)
+    parent_bash_call_id: str | None = field(default=None, compare=False)
+    toolkit_name: str | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
@@ -255,6 +266,11 @@ class CollectedStreamPresentation:
     def final_text(self) -> str:
         """Return collected deltas, falling back to the provider's canonical final body."""
         return self.response_text or self.canonical_final_body_candidate or ""
+
+    async def publish(self, progress: Callable[[StructuredStreamChunk], Awaitable[None]] | None) -> None:
+        """Show the current ordered presentation in a live reply, when a progress publisher is attached."""
+        if progress is not None:
+            await progress(StructuredStreamChunk(content=self.response_text, tool_trace=self.tool_trace))
 
 
 def _streaming_tool_call_id(tool: ToolExecution | None) -> str | None:
@@ -716,6 +732,9 @@ def format_tool_started_event(
     tool_args = {str(k): v for k, v in tool.tool_args.items()} if isinstance(tool.tool_args, dict) else {}
     text, trace = _format_tool_started(tool_name, tool_args, tool_index=tool_index)
     trace.tool_call_id = _streaming_tool_call_id(tool)
+    if isinstance(tool, AuditedToolExecution):
+        trace.parent_bash_call_id = tool.parent_bash_call_id
+        trace.toolkit_name = tool.toolkit_name
     return text, trace
 
 
@@ -730,6 +749,9 @@ def format_tool_completed_event(
     tool_args = {str(k): v for k, v in tool.tool_args.items()} if isinstance(tool.tool_args, dict) else {}
     text, trace = format_tool_combined(tool_name, tool_args, tool.result, tool_index=tool_index)
     trace.tool_call_id = _streaming_tool_call_id(tool)
+    if isinstance(tool, AuditedToolExecution):
+        trace.parent_bash_call_id = tool.parent_bash_call_id
+        trace.toolkit_name = tool.toolkit_name
     return text, trace
 
 
@@ -765,6 +787,10 @@ def serialize_tool_trace(
         if entry.truncated:
             event["truncated"] = True
         if include_internal:
+            if entry.parent_bash_call_id is not None:
+                event["parent_bash_call_id"] = entry.parent_bash_call_id
+            if entry.toolkit_name is not None:
+                event["toolkit_name"] = entry.toolkit_name
             if entry.tool_call_id is not None:
                 event["tool_call_id"] = entry.tool_call_id
             if entry.scope_key is not None:
@@ -783,6 +809,8 @@ def deserialize_tool_trace(stored: Sequence[Mapping[str, object]]) -> list[ToolT
         result_preview = event.get("result_preview")
         tool_call_id = event.get("tool_call_id")
         scope_key = event.get("scope_key")
+        parent_bash_call_id = event.get("parent_bash_call_id")
+        toolkit_name = event.get("toolkit_name")
         truncated = event.get("truncated")
         if (
             event_type not in {"tool_call_started", "tool_call_completed"}
@@ -792,6 +820,8 @@ def deserialize_tool_trace(stored: Sequence[Mapping[str, object]]) -> list[ToolT
             or (result_preview is not None and not isinstance(result_preview, str))
             or (tool_call_id is not None and (not isinstance(tool_call_id, str) or not tool_call_id))
             or (scope_key is not None and (not isinstance(scope_key, str) or not scope_key))
+            or (parent_bash_call_id is not None and not isinstance(parent_bash_call_id, str))
+            or (toolkit_name is not None and not isinstance(toolkit_name, str))
             or (truncated is not None and not isinstance(truncated, bool))
         ):
             msg = "Durable tool trace contains a malformed event"
@@ -805,9 +835,18 @@ def deserialize_tool_trace(stored: Sequence[Mapping[str, object]]) -> list[ToolT
                 truncated=truncated is True,
                 tool_call_id=cast("str | None", tool_call_id),
                 scope_key=cast("str | None", scope_key),
+                parent_bash_call_id=parent_bash_call_id,
+                toolkit_name=toolkit_name,
             ),
         )
     return restored
+
+
+def tool_trace_from_content(content: Mapping[str, object]) -> list[ToolTraceEntry]:
+    """Read back the tool calls one message shows."""
+    payload = content.get(_TOOL_TRACE_KEY)
+    events = cast("Mapping[str, object]", payload).get("events") if isinstance(payload, Mapping) else None
+    return deserialize_tool_trace(cast("list[Mapping[str, object]]", events) if isinstance(events, list) else [])
 
 
 def build_tool_trace_content(tool_trace: Sequence[ToolTraceEntry] | None) -> dict[str, object] | None:

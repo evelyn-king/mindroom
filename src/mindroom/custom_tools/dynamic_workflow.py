@@ -27,7 +27,9 @@ from mindroom.dynamic_workflows.runner import DynamicWorkflowExecutionError
 from mindroom.dynamic_workflows.service import DynamicWorkflowService
 from mindroom.dynamic_workflows.validation import DynamicWorkflowError, collect_workflow_spec_errors
 from mindroom.entity_resolution import entity_identity_registry
+from mindroom.helper_usage import get_helper_usage_owner, record_helper_usage
 from mindroom.tool_approval import tool_may_require_approval
+from mindroom.tool_call_budget import install_model_call_cap
 from mindroom.tool_system.automation_approval import NEVER_PREAPPROVE_TOOLKITS, build_automation_approval_config
 from mindroom.tool_system.catalog import TOOL_METADATA, ensure_tool_registry_loaded
 from mindroom.tool_system.runtime_context import (
@@ -45,7 +47,16 @@ if TYPE_CHECKING:
 # Agent-infrastructure toolkits that are built outside the tool registry and presume
 # a durable agent runtime; they can never be granted to workflow participants.
 _WORKFLOW_RESTRICTED_TOOLS = frozenset(
-    {"compact_context", "delegate", "dynamic_tools", "dynamic_workflow", "invite_router", "memory", "self_config"},
+    {
+        "compact_context",
+        "delegate",
+        "dynamic_tools",
+        "dynamic_workflow",
+        "invite_router",
+        "memory",
+        "self_config",
+        "skill_manage",
+    },
 )
 
 _MINIMAL_SPEC_EXAMPLE = (
@@ -681,6 +692,8 @@ async def _aexecute_ephemeral_agent_participant(
     )
     execution_identity = build_execution_identity_from_runtime_context(context)
     model = model_loading.get_model_instance(context.config, context.runtime_paths, model_name, execution_identity)
+    agent_id = f"dynamic_workflow_{participant_id}"
+    install_model_call_cap(model, entity_name=agent_id)
     run_config = _participant_run_config(context, toolkits_by_name)
     _reject_nonresumable_toolkits(toolkits_by_name, run_config)
     bridge = build_tool_hook_bridge(
@@ -690,13 +703,15 @@ async def _aexecute_ephemeral_agent_participant(
         runtime_paths=context.runtime_paths,
     )
     agent = Agent(
-        id=f"dynamic_workflow_{participant_id}",
+        id=agent_id,
         name=str(participant.get("name") or participant_id),
         role=str(participant.get("role") or participant.get("description") or "Dynamic Workflow participant."),
         model=model,
         tools=[prepend_tool_hook_bridge(toolkit, bridge) for toolkit in toolkits_by_name.values()],
         instructions=_participant_instructions(participant),
         markdown=True,
+        # An ephemeral participant is not a configured agent, so it takes the default budget.
+        tool_call_limit=context.config.defaults.max_tool_calls_per_turn,
         telemetry=False,
     )
     participant_context = replace(
@@ -820,6 +835,16 @@ def _workflow_allowed_tools(context: ToolRuntimeContext) -> frozenset[str]:
     persisted = load_scoped_credentials("dynamic_workflow", credentials_manager=credentials_manager, worker_target=None)
     if persisted:
         values.update(persisted)
+    if context.agent_name in context.config.agents:
+        # A dashboard save with this agent selected lands in its scoped store and overrides the global value.
+        scoped = load_scoped_credentials(
+            "dynamic_workflow",
+            credentials_manager=credentials_manager,
+            worker_target=context.resolve_worker_target(),
+            primary_built_tool=True,
+        )
+        if scoped:
+            values.update(scoped)
     for entry in context.config.resolve_entity(context.agent_name).tool_configs:
         if entry.name == "dynamic_workflow":
             values.update(entry.tool_config_overrides)
@@ -837,9 +862,12 @@ async def _arun_agent(context: ToolRuntimeContext, agent: Agent, prompt: str) ->
     # exceed 10 minutes. Consuming the event stream drives tool calls; yield_run_output makes
     # the final RunOutput the last streamed item, which works without a db.
     final_output: RunOutput | None = None
+    usage_owner = get_helper_usage_owner()
+    invocation_id = uuid4().hex
     with tool_runtime_context(context):
         event_stream = agent.arun(
             prompt,
+            run_id=invocation_id,
             user_id=context.requester_id,
             session_id=context.session_id,
             stream=True,
@@ -849,6 +877,14 @@ async def _arun_agent(context: ToolRuntimeContext, agent: Agent, prompt: str) ->
         async for event in event_stream:
             if isinstance(event, RunOutput):
                 final_output = event
+                if usage_owner is not None and agent.db is None:
+                    await record_helper_usage(
+                        event,
+                        owner=usage_owner,
+                        invocation_id=invocation_id,
+                        kind="dynamic_workflow",
+                        requester_id=context.requester_id,
+                    )
     if final_output is None:
         msg = "Dynamic Workflow participant run produced no output."
         raise DynamicWorkflowExecutionError(msg)

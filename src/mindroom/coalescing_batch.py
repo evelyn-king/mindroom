@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -27,6 +27,7 @@ from .dispatch_source import (
     source_kind_from_content,
 )
 from .handled_turns import SourceEventMetadata, TurnRecord
+from .matrix.member_display_names import room_member_display_names
 from .prompt_message_tags import render_msg_tag
 from .timestamp_formatting import normalize_timestamp_ms
 
@@ -94,6 +95,7 @@ class PendingEvent:
     event: PreparedIngress
     room: nio.MatrixRoom
     enqueue_time: float = field(default_factory=time.time)
+    text_debounce_seconds: float = 0.0
     dispatch_metadata: tuple[PendingDispatchMetadata, ...] = ()
 
 
@@ -148,12 +150,16 @@ def _tagged_pending_message(
     pending_event: PendingEvent,
     *,
     timestamp_formatter: TimestampFormatter | None,
+    member_display_names: Mapping[str, str],
 ) -> str:
+    event = pending_event.event
+    sender = event.sender if event.acts_for_requester else event.requester_user_id or event.sender
     return render_msg_tag(
-        sender=pending_event.event.requester_user_id or pending_event.event.sender,
-        body=dispatch_prompt_for_event(pending_event.event),
-        event_id=pending_event.event.event_id,
-        ts=_format_event_timestamp(pending_event.event.server_timestamp, timestamp_formatter),
+        sender=sender,
+        body=dispatch_prompt_for_event(event),
+        event_id=event.event_id,
+        ts=_format_event_timestamp(event.server_timestamp, timestamp_formatter),
+        display_name=member_display_names.get(sender),
     )
 
 
@@ -162,8 +168,14 @@ def _rendered_pending_messages(
     *,
     timestamp_formatter: TimestampFormatter | None,
 ) -> str:
+    # Every event in one batch shares the coalescing key's room.
+    member_display_names = room_member_display_names(pending_events[-1].room)
     return "\n".join(
-        _tagged_pending_message(pending_event, timestamp_formatter=timestamp_formatter)
+        _tagged_pending_message(
+            pending_event,
+            timestamp_formatter=timestamp_formatter,
+            member_display_names=member_display_names,
+        )
         for pending_event in pending_events
     )
 
@@ -198,6 +210,7 @@ def tagged_coalesced_prompt(
     source_event_metadata: dict[str, SourceEventMetadata],
     *,
     timestamp_formatter: TimestampFormatter,
+    member_display_names: Mapping[str, str],
 ) -> str | None:
     """Render a persisted coalesced turn with the same model-facing message tags."""
     rendered_messages: list[str] = []
@@ -212,6 +225,7 @@ def tagged_coalesced_prompt(
                 body=prompt,
                 event_id=source_event_id,
                 ts=timestamp_formatter(metadata.timestamp_ms),
+                display_name=member_display_names.get(metadata.sender),
             ),
         )
     return _messages_envelope(
@@ -334,17 +348,43 @@ def _batch_dispatch_policy_source_kind(ordered_pending_events: list[PendingEvent
     raise ValueError(msg)
 
 
-def _batch_requester_user_id(key: CoalescingKey, primary_pending_event: PendingEvent) -> str:
-    """Resolve the batch requester from the primary event, falling back to a requester owner.
+def _pending_event_requester_user_id(key: CoalescingKey, pending_event: PendingEvent) -> str:
+    """Resolve one event's effective requester, falling back to a requester owner.
 
-    A follow-up owner carries no requester, so a requester-less primary event
-    falls back to the event sender, matching the per-message sender fallback.
+    A follow-up owner carries no requester, so a requester-less event falls
+    back to the event sender, matching the per-message sender fallback.
     """
-    if primary_pending_event.event.requester_user_id:
-        return primary_pending_event.event.requester_user_id
+    if pending_event.event.requester_user_id:
+        return pending_event.event.requester_user_id
     if isinstance(key.owner, RequesterCoalescingOwner):
         return key.owner.requester_user_id
-    return primary_pending_event.event.sender
+    return pending_event.event.sender
+
+
+def pending_event_run_identity(key: CoalescingKey, pending_event: PendingEvent) -> tuple[str, str | None]:
+    """Return who one queued event runs as, plus its author when an entity wrote it for that requester.
+
+    A batch runs as one requester and takes its origin from its latest event, so a
+    reply an entity wrote for a human never shares a batch with that human's messages.
+    """
+    event = pending_event.event
+    return _pending_event_requester_user_id(key, pending_event), event.sender if event.acts_for_requester else None
+
+
+def _batch_requester_user_id(key: CoalescingKey, ordered_pending_events: list[PendingEvent]) -> str:
+    """Resolve the one requester every event in the batch executes as.
+
+    The turn runs with this requester's authorization, credentials, and
+    approvals, so a batch mixing requesters would run one sender's messages
+    under another sender's identity.
+    """
+    requester_user_ids = {
+        _pending_event_requester_user_id(key, pending_event) for pending_event in ordered_pending_events
+    }
+    if len(requester_user_ids) == 1:
+        return next(iter(requester_user_ids))
+    msg = "Coalesced batch carried multiple requesters"
+    raise ValueError(msg)
 
 
 def _batch_hook_source(ordered_pending_events: list[PendingEvent]) -> str | None:
@@ -391,6 +431,7 @@ def _batch_source_event_metadata(ordered_pending_events: list[PendingEvent]) -> 
             sender=pending_event.event.requester_user_id or pending_event.event.sender,
             timestamp_ms=normalize_timestamp_ms(pending_event.event.server_timestamp),
             discovery_event_id=pending_event.event.discovery_event_id,
+            speaker=pending_event.event.sender if pending_event.event.acts_for_requester else None,
         )
         for pending_event in ordered_pending_events
     }
@@ -415,15 +456,21 @@ def build_prepared_turn(
     source_event_prompts = _batch_source_event_prompts(ordered_pending_events)
     source_event_metadata = _batch_source_event_metadata(ordered_pending_events)
     routed_aliases = tuple(filter(None, (item.discovery_event_id for item in source_event_metadata.values())))
+    requester_user_id = _batch_requester_user_id(key, ordered_pending_events)
     return PreparedTurn(
         room=primary_pending_event.room,
         event=replace(primary_pending_event.event, body=prompt_rendering.prompt),
-        requester_user_id=_batch_requester_user_id(key, primary_pending_event),
+        requester_user_id=requester_user_id,
         handled_turn=TurnRecord.create(
             source_event_ids,
             discovery_event_ids=routed_aliases,
             source_event_prompts=source_event_prompts,
-            source_event_metadata=source_event_metadata if len(source_event_ids) > 1 or routed_aliases else None,
+            source_event_metadata=(
+                source_event_metadata
+                if len(source_event_ids) > 1 or routed_aliases or primary_pending_event.event.acts_for_requester
+                else None
+            ),
+            requester_id=requester_user_id,
         ),
         ingress=DispatchIngressMetadata(
             source_kind=_batch_source_kind(ordered_pending_events),

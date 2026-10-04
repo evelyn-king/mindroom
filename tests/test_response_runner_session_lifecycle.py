@@ -29,7 +29,6 @@ from mindroom.ai import (
 from mindroom.bot import AgentBot
 from mindroom.cancellation import USER_STOP_CANCEL_MSG
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
-from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.dispatch_source import MESSAGE_SOURCE_KIND
@@ -53,6 +52,7 @@ from mindroom.response_runner import (
     ResponseRunner,
     _NonStreamingGeneration,
 )
+from mindroom.response_sources import ResponseSources
 from mindroom.streaming import StreamingDeliveryError, strip_visible_tool_markers
 from mindroom.tool_system.events import ToolTraceEntry
 from mindroom.tool_system.runtime_context import (
@@ -62,6 +62,7 @@ from mindroom.tool_system.worker_routing import (
     private_instance_scope_root_path,
     resolve_worker_key,
 )
+from tests.access_schema_support import with_current_room_member_access
 from tests.ai_user_id_helpers import (
     _build_response_runner,
     _config,
@@ -239,6 +240,10 @@ async def test_process_and_respond_propagates_before_response_cancellation_to_ru
         with pytest.raises(asyncio.CancelledError, match=USER_STOP_CANCEL_MSG):
             await coordinator._process_and_respond(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$user_msg",),
+                        logical_source_event_ids=("$user_msg",),
+                    ),
                     thread_history=(),
                     prompt="Hello",
                     response_envelope=request_envelope(
@@ -359,9 +364,14 @@ async def test_process_and_respond_emits_session_started_after_first_persisted_t
     storage = _SessionStorage()
     sequence: list[tuple[str, str | None, str | None, str | None]] = []
     saw_matrix_admin: list[bool] = []
+    active_states: list[bool] = []
 
     @hook(EVENT_SESSION_STARTED, priority=10)
     async def first(ctx: SessionHookContext) -> None:
+        active_states.append(ctx.is_active())
+        registry_state.registry = HookRegistry.empty()
+        active_states.append(ctx.is_active())
+        registry_state.registry = registry
         saw_matrix_admin.append(ctx.matrix_admin is not None)
         sequence.append(("first", ctx.scope.key, ctx.session_id, ctx.thread_id))
 
@@ -392,6 +402,7 @@ async def test_process_and_respond_emits_session_started_after_first_persisted_t
             ),
             enable_streaming=False,
         )
+        registry_state = coordinator.deps.tool_runtime.hook_context.hook_registry_state
 
         async def fake_ai_response(*_args: object, **_kwargs: object) -> str:
             context = get_tool_runtime_context()
@@ -437,6 +448,7 @@ async def test_process_and_respond_emits_session_started_after_first_persisted_t
         ("deliver", None, None, None),
     ]
     assert saw_matrix_admin == [True]
+    assert active_states == [True, False]
 
 
 @pytest.mark.asyncio
@@ -1308,15 +1320,16 @@ async def test_private_agent_response_runner_builds_execution_identity_from_requ
     """Private agent execution identity should use the request owner, not the transport sender."""
     runtime_paths = _runtime_paths(tmp_path)
     config = bind_runtime_paths(
-        Config(
-            agents={
-                "general": AgentConfig(
-                    display_name="General",
-                    private=AgentPrivateConfig(per="user", root="general_data"),
-                ),
-            },
-            models={"default": ModelConfig(provider="openai", id="test-model")},
-            authorization=AuthorizationConfig(default_room_access=True),
+        with_current_room_member_access(
+            Config(
+                agents={
+                    "general": AgentConfig(
+                        display_name="General",
+                        private=AgentPrivateConfig(per="user", root="general_data"),
+                    ),
+                },
+                models={"default": ModelConfig(provider="openai", id="test-model")},
+            ),
         ),
         runtime_paths,
     )
@@ -1375,7 +1388,7 @@ async def test_private_agent_response_runner_builds_execution_identity_from_requ
     assert execution_identity.requester_id == "@owner:localhost"
     assert execution_identity.room_id == "!test:localhost"
     worker_key = resolve_worker_key("user_agent", execution_identity, agent_name="general")
-    assert worker_key == "v1:default:user_agent:@owner:localhost:general"
+    assert worker_key == "v1:default:user_agent:~@owner:localhost:general"
     assert worker_key != resolve_worker_key(
         "user_agent",
         replace(execution_identity, requester_id=bot.matrix_id.full_id),
@@ -2193,7 +2206,11 @@ async def test_generate_response_appends_matrix_tool_prompt_context(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_generate_response_passes_resolved_correlation_id_to_ai_response(tmp_path: Path) -> None:
+@pytest.mark.parametrize("history_boundary_event_id", [None, "$selection"])
+async def test_generate_response_passes_resolved_correlation_id_to_ai_response(
+    tmp_path: Path,
+    history_boundary_event_id: str | None,
+) -> None:
     """Edit regeneration can correlate on a different event than the reply anchor."""
     runtime_paths = _runtime_paths(tmp_path)
     config = bind_runtime_paths(_config(), runtime_paths)
@@ -2219,12 +2236,15 @@ async def test_generate_response_passes_resolved_correlation_id_to_ai_response(t
         )
 
         await coordinator.generate_response(
-            _response_request(
-                prompt="Regenerate this edit",
-                user_id="@alice:localhost",
-                thread_id="$thread-root",
-                reply_to_event_id="$original",
-                correlation_id="$edit",
+            replace(
+                _response_request(
+                    prompt="Regenerate this edit",
+                    user_id="@alice:localhost",
+                    thread_id="$thread-root",
+                    reply_to_event_id="$original",
+                    correlation_id="$edit",
+                ),
+                history_boundary_event_id=history_boundary_event_id,
             ),
         )
 
@@ -2232,3 +2252,4 @@ async def test_generate_response_passes_resolved_correlation_id_to_ai_response(t
     ctx = seen_ctx[-1]
     assert ctx.reply_to_event_id == "$original"
     assert ctx.correlation_id == "$edit"
+    assert ctx.history_boundary_event_id == history_boundary_event_id

@@ -14,8 +14,10 @@ from agno.media import Audio
 
 from mindroom.attachments import _attachment_id_for_event, load_attachment
 from mindroom.background_tasks import wait_for_background_tasks
+from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
+from mindroom.config.models import RouterConfig
 from mindroom.constants import (
     ATTACHMENT_IDS_KEY,
     ORIGINAL_SENDER_KEY,
@@ -31,11 +33,13 @@ from mindroom.dispatch_handoff import PreparedIngress
 from mindroom.dispatch_source import TRUSTED_INTERNAL_RELAY_SOURCE_KIND, VOICE_SOURCE_KIND
 from mindroom.handled_turns import TurnRecord
 from mindroom.history.types import HistoryScope
+from mindroom.inbound_turn_normalizer import _VoiceNormalizationResult
 from mindroom.matrix.identity import MatrixID
 from mindroom.matrix.thread_history_result import thread_history_result
 from mindroom.message_target import MessageTarget
 from mindroom.visible_voice_echo import VisibleVoiceEchoRequest
 from mindroom.voice_handler import prepare_voice_message
+from tests.access_schema_support import with_current_room_member_access
 from tests.authorization_helpers import isolated_membership_index
 from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
@@ -48,6 +52,7 @@ from tests.conftest import (
     orchestrator_runtime_paths,
     replace_turn_controller_deps,
     runtime_paths_for,
+    serve_media_from_download,
     unwrap_extracted_collaborator,
     wrap_extracted_collaborators,
 )
@@ -118,10 +123,9 @@ def _make_voice_event(
 
 
 def _make_room(*user_ids: str) -> nio.MatrixRoom:
-    room = MagicMock(spec=nio.MatrixRoom)
-    room.room_id = "!test:example.com"
-    room.canonical_alias = None
-    room.users = {user_id: MagicMock() for user_id in user_ids}
+    room = nio.MatrixRoom("!test:example.com", user_ids[0] if user_ids else "@mindroom_router:localhost")
+    for user_id in user_ids:
+        room.add_member(user_id, None, None)
     room.members_synced = True
     return room
 
@@ -139,7 +143,7 @@ def _make_visible_router_echo_scenario(
     tmp_path: Path,
     *,
     agents: dict | None = None,
-    authorization: dict | None = None,
+    router_access: ResponderAccessConfig | None = None,
     voice_enabled: bool = True,
     send_response_return: str | None = "$voice_echo",
     send_response_side_effect: list[str] | None = None,
@@ -151,14 +155,16 @@ def _make_visible_router_echo_scenario(
     agent_user.matrix_id = MatrixID.parse("@mindroom_router:localhost")
 
     configured_agents = agents or {"home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]}}
-    config = _attach_runtime_paths(
+    config = with_current_room_member_access(
         Config(
             agents=configured_agents,
-            authorization=authorization or {"default_room_access": True},
+            router=RouterConfig(access=router_access),
             voice={"enabled": voice_enabled, "visible_router_echo": True},
         ),
-        tmp_path,
     )
+    if router_access is not None:
+        config.router.access = router_access
+    config = _attach_runtime_paths(config, tmp_path)
 
     bot = _agent_bot(
         agent_user=agent_user,
@@ -200,7 +206,7 @@ async def test_router_processes_own_voice_transcriptions(tmp_path) -> None:  # n
     bot = _agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
-        config=_attach_runtime_paths(Config(authorization={"default_room_access": True}), tmp_path),
+        config=_attach_runtime_paths(with_current_room_member_access(Config(authorization={})), tmp_path),
         rooms=["!test:example.com"],
     )
     turn_store = unwrap_extracted_collaborator(bot._turn_store)
@@ -250,7 +256,7 @@ async def test_router_ignores_non_voice_self_messages(tmp_path) -> None:  # noqa
     bot = _agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
-        config=_attach_runtime_paths(Config(authorization={"default_room_access": True}), tmp_path),
+        config=_attach_runtime_paths(with_current_room_member_access(Config(authorization={})), tmp_path),
         rooms=["!test:example.com"],
     )
     turn_store = unwrap_extracted_collaborator(bot._turn_store)
@@ -292,9 +298,11 @@ async def test_router_processes_own_sidecar_commands_using_original_sender(tmp_p
         agent_user=agent_user,
         storage_path=tmp_path,
         config=_attach_runtime_paths(
-            Config(
-                agents={"home": AgentConfig(display_name="Home", rooms=["!test:example.com"])},
-                authorization={"default_room_access": True},
+            with_current_room_member_access(
+                Config(
+                    agents={"home": AgentConfig(display_name="Home", rooms=["!test:example.com"])},
+                    authorization={},
+                ),
             ),
             tmp_path,
         ),
@@ -369,9 +377,11 @@ async def test_router_parses_sidecar_schedule_command_from_canonical_body(tmp_pa
         agent_user=agent_user,
         storage_path=tmp_path,
         config=_attach_runtime_paths(
-            Config(
-                agents={"home": AgentConfig(display_name="Home", rooms=["!test:example.com"])},
-                authorization={"default_room_access": True},
+            with_current_room_member_access(
+                Config(
+                    agents={"home": AgentConfig(display_name="Home", rooms=["!test:example.com"])},
+                    authorization={},
+                ),
             ),
             tmp_path,
         ),
@@ -382,6 +392,7 @@ async def test_router_parses_sidecar_schedule_command_from_canonical_body(tmp_pa
     bot.logger = MagicMock()
     replace_turn_controller_deps(bot, logger=bot.logger)
     bot.client = AsyncMock(spec=nio.AsyncClient)
+    serve_media_from_download(bot.client)
     bot.client.rooms = {}
     bot.client.download = AsyncMock(
         return_value=MagicMock(
@@ -448,12 +459,14 @@ async def test_router_treats_sidecar_skill_command_as_unknown_command(tmp_path) 
         agent_user=agent_user,
         storage_path=tmp_path,
         config=_attach_runtime_paths(
-            Config(
-                agents={
-                    "home": AgentConfig(display_name="Home", rooms=["!test:example.com"], skills=["demo"]),
-                    "research": AgentConfig(display_name="Research", rooms=["!test:example.com"], skills=["demo"]),
-                },
-                authorization={"default_room_access": True},
+            with_current_room_member_access(
+                Config(
+                    agents={
+                        "home": AgentConfig(display_name="Home", rooms=["!test:example.com"], skills=["demo"]),
+                        "research": AgentConfig(display_name="Research", rooms=["!test:example.com"], skills=["demo"]),
+                    },
+                    authorization={},
+                ),
             ),
             tmp_path,
         ),
@@ -523,7 +536,7 @@ async def test_router_skips_unauthorized_sidecar_commands_before_hydration(tmp_p
     bot = _agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
-        config=_attach_runtime_paths(Config(authorization={"default_room_access": True}), tmp_path),
+        config=_attach_runtime_paths(with_current_room_member_access(Config(authorization={})), tmp_path),
         rooms=["!test:example.com"],
     )
     turn_store = unwrap_extracted_collaborator(bot._turn_store)
@@ -557,7 +570,7 @@ async def test_router_skips_unauthorized_sidecar_commands_before_hydration(tmp_p
     )
 
     with (
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=False),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=False),
         patch("mindroom.commands.handler.schedule_task", new_callable=AsyncMock) as mock_schedule,
     ):
         assert isinstance(event, nio.RoomMessageFile)
@@ -574,9 +587,11 @@ async def test_router_skips_unauthorized_sidecar_commands_before_hydration(tmp_p
 async def test_prepare_voice_message_includes_original_sender_and_attachment_metadata(tmp_path) -> None:  # noqa: ANN001
     """Audio normalization should preserve sender identity and attachment IDs."""
     config = _attach_runtime_paths(
-        Config(
-            authorization={"default_room_access": True},
-            voice={"enabled": True},
+        with_current_room_member_access(
+            Config(
+                authorization={},
+                voice={"enabled": True},
+            ),
         ),
         tmp_path,
     )
@@ -615,9 +630,11 @@ async def test_prepare_voice_message_includes_original_sender_and_attachment_met
 async def test_prepare_voice_message_sanitizes_user_authored_internal_metadata(tmp_path) -> None:  # noqa: ANN001
     """Voice normalization should trust only system-owned internal metadata."""
     config = _attach_runtime_paths(
-        Config(
-            authorization={"default_room_access": True},
-            voice={"enabled": True},
+        with_current_room_member_access(
+            Config(
+                authorization={},
+                voice={"enabled": True},
+            ),
         ),
         tmp_path,
     )
@@ -666,7 +683,7 @@ async def test_prepare_voice_message_sanitizes_user_authored_internal_metadata(t
 @pytest.mark.asyncio
 async def test_prepare_voice_message_marks_raw_audio_fallback_and_thread(tmp_path) -> None:  # noqa: ANN001
     """Fallback normalization should keep thread metadata and the raw-audio flag."""
-    config = _attach_runtime_paths(Config(authorization={"default_room_access": True}), tmp_path)
+    config = _attach_runtime_paths(with_current_room_member_access(Config(authorization={})), tmp_path)
     room = _make_room("@mindroom_home:example.com", "@alice:example.com")
     event = _make_voice_event(
         sender="@alice:example.com",
@@ -712,10 +729,12 @@ async def test_router_ignores_audio_events_from_internal_agents(tmp_path) -> Non
     agent_user.matrix_id = MatrixID.parse("@mindroom_router:example.com")
 
     config = _attach_runtime_paths(
-        Config(
-            agents={"assistant": {"display_name": "Assistant"}},
-            authorization={"default_room_access": True},
-            voice={"enabled": True},
+        with_current_room_member_access(
+            Config(
+                agents={"assistant": {"display_name": "Assistant"}},
+                authorization={},
+                voice={"enabled": True},
+            ),
         ),
         tmp_path,
     )
@@ -750,7 +769,7 @@ async def test_router_ignores_audio_events_from_internal_agents(tmp_path) -> Non
     with (
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         await bot._on_media_message(room, event)
 
@@ -772,9 +791,11 @@ async def test_agent_handles_audio_without_router_when_voice_disabled(tmp_path) 
         agent_user=agent_user,
         storage_path=tmp_path,
         config=_attach_runtime_paths(
-            Config(
-                agents={"home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]}},
-                authorization={"default_room_access": True},
+            with_current_room_member_access(
+                Config(
+                    agents={"home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]}},
+                    authorization={},
+                ),
             ),
             tmp_path,
         ),
@@ -799,7 +820,7 @@ async def test_agent_handles_audio_without_router_when_voice_disabled(tmp_path) 
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
@@ -855,9 +876,11 @@ async def test_agent_handles_audio_with_router_present_in_single_agent_room(tmp_
         agent_user=agent_user,
         storage_path=tmp_path,
         config=_attach_runtime_paths(
-            Config(
-                agents={"home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]}},
-                authorization={"default_room_access": True},
+            with_current_room_member_access(
+                Config(
+                    agents={"home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]}},
+                    authorization={},
+                ),
             ),
             tmp_path,
         ),
@@ -880,7 +903,7 @@ async def test_agent_handles_audio_with_router_present_in_single_agent_room(tmp_
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
@@ -896,10 +919,12 @@ async def test_agent_handles_audio_with_router_present_in_single_agent_room(tmp_
 async def test_router_and_agent_share_audio_normalization_when_router_is_present(tmp_path) -> None:  # noqa: ANN001
     """Router-present rooms should still normalize one audio event only once."""
     config = _attach_runtime_paths(
-        Config(
-            agents={"home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]}},
-            authorization={"default_room_access": True},
-            voice={"enabled": True, "visible_router_echo": False},
+        with_current_room_member_access(
+            Config(
+                agents={"home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]}},
+                authorization={},
+                voice={"enabled": True, "visible_router_echo": False},
+            ),
         ),
         tmp_path,
     )
@@ -940,7 +965,7 @@ async def test_router_and_agent_share_audio_normalization_when_router_is_present
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
@@ -963,7 +988,7 @@ async def test_router_posts_visible_voice_echo_when_enabled(tmp_path) -> None:  
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         mock_voice.return_value = f"{VOICE_PREFIX}@home turn on the lights"
@@ -995,7 +1020,7 @@ async def test_router_voice_echo_skips_transcription_placeholder_when_voice_is_d
 
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         await bot._on_media_message(room, event)
@@ -1033,7 +1058,7 @@ async def test_router_posts_transcription_placeholder_before_voice_is_ready(tmp_
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", side_effect=transcribe_voice),
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         bot._delivery_gateway.send_text.side_effect = send_visible_echo
@@ -1088,12 +1113,12 @@ async def test_concurrent_voice_redelivery_shares_visible_echo_lifecycle(tmp_pat
         source_kind_override=VOICE_SOURCE_KIND,
     )
 
-    async def normalize_voice(*_args: object, **_kwargs: object) -> tuple[PreparedIngress, str]:
+    async def normalize_voice(*_args: object, **_kwargs: object) -> _VoiceNormalizationResult:
         nonlocal normalization_count
         normalization_count += 1
         normalization_started.set()
         await allow_normalization.wait()
-        return normalized_event, event.event_id
+        return _VoiceNormalizationResult(event=normalized_event)
 
     async def send_placeholder(_request: object) -> str:
         placeholder_send_started.set()
@@ -1102,11 +1127,11 @@ async def test_concurrent_voice_redelivery_shares_visible_echo_lifecycle(tmp_pat
 
     with (
         patch.object(
-            bot._turn_controller,
-            "_normalize_voice_event_or_fallback",
+            bot._turn_controller.deps.normalizer,
+            "prepare_voice_event",
             new=AsyncMock(side_effect=normalize_voice),
         ),
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         bot._delivery_gateway.send_text.side_effect = send_placeholder
         await bot._turn_controller.handle_media_event(room, event)
@@ -1147,7 +1172,7 @@ async def test_voice_echo_finishes_after_config_is_disabled_mid_transcription(tm
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", side_effect=transcribe_voice),
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         bot._delivery_gateway.send_text.side_effect = send_placeholder
@@ -1172,7 +1197,7 @@ async def test_voice_echo_edit_failure_retries_existing_placeholder(tmp_path) ->
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         mock_voice.return_value = f"{VOICE_PREFIX}@home turn on the lights"
@@ -1357,17 +1382,17 @@ async def test_transcript_wins_when_fallback_edit_is_in_flight(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_voice_readiness_failure_replaces_placeholder_with_fallback(tmp_path) -> None:  # noqa: ANN001
-    """A readiness failure after placeholder delivery should leave terminal fallback text."""
+async def test_voice_preparation_failure_replaces_placeholder_with_fallback(tmp_path) -> None:  # noqa: ANN001
+    """A preparation failure after placeholder delivery should leave terminal fallback text."""
     bot, room, event = _make_visible_router_echo_scenario(tmp_path)
 
     with (
         patch.object(
-            bot._turn_controller.deps.resolver,
-            "build_ingress_envelope",
-            side_effect=RuntimeError("readiness failed"),
+            bot._turn_controller.deps.normalizer,
+            "prepare_voice_event",
+            side_effect=RuntimeError("transcription failed"),
         ),
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         await bot._turn_controller.handle_media_event(room, event)
         await drain_coalescing(bot)
@@ -1403,7 +1428,7 @@ async def test_voice_readiness_cancellation_schedules_terminal_placeholder_fallb
             "prepare_voice_event",
             side_effect=wait_for_cancellation,
         ),
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         await bot._turn_controller.handle_media_event(room, event)
         await asyncio.wait_for(normalization_started.wait(), timeout=1)
@@ -1444,7 +1469,7 @@ async def test_voice_placeholder_is_owned_by_runtime_shutdown(tmp_path) -> None:
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", side_effect=transcribe_voice),
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         bot._delivery_gateway.send_text.side_effect = send_placeholder
@@ -1479,7 +1504,7 @@ async def test_voice_placeholder_finish_is_owned_by_runtime_shutdown(tmp_path) -
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         mock_voice.return_value = f"{VOICE_PREFIX}@home turn on the lights"
@@ -1503,7 +1528,7 @@ async def test_router_visible_voice_echo_is_deduplicated_on_redelivery(tmp_path)
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         mock_voice.return_value = f"{VOICE_PREFIX}@home turn on the lights"
@@ -1522,20 +1547,17 @@ async def test_router_visible_voice_echo_is_deduplicated_on_redelivery(tmp_path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
 async def test_router_visible_voice_echo_respects_reply_permissions(tmp_path) -> None:  # noqa: ANN001
     """Router should not post visible echoes when it cannot reply to the sender."""
     bot, room, event = _make_visible_router_echo_scenario(
         tmp_path,
-        authorization={
-            "default_room_access": True,
-            "agent_reply_permissions": {ROUTER_AGENT_NAME: ["@bob:example.com"]},
-        },
+        router_access=ResponderAccessConfig(current_room_members=False, users=["@bob:example.com"]),
     )
 
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
     ):
         await bot._on_media_message(room, event)
 
@@ -1563,7 +1585,7 @@ async def test_router_visible_voice_echo_keeps_multi_agent_handoff(tmp_path) -> 
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.router_relay.suggest_responder_for_message", new_callable=AsyncMock, return_value="home"),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
@@ -1607,7 +1629,7 @@ async def test_router_visible_voice_echo_marks_raw_audio_fallback(tmp_path) -> N
 
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         await bot._on_media_message(room, event)
@@ -1642,7 +1664,7 @@ async def test_router_visible_voice_echo_is_not_duplicated_when_handoff_retries(
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.router_relay.suggest_responder_for_message", new_callable=AsyncMock, return_value="home"),
         patch(
             "mindroom.visible_response_reconciliation.find_response_event_ids_via_room_messages",
@@ -1692,7 +1714,7 @@ async def test_router_visible_voice_echo_is_not_duplicated_when_handoff_retries_
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.router_relay.suggest_responder_for_message", new_callable=AsyncMock, return_value="home"),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
@@ -1715,7 +1737,7 @@ async def test_router_visible_voice_echo_is_not_duplicated_when_handoff_retries_
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.router_relay.suggest_responder_for_message", new_callable=AsyncMock, return_value="home"),
         patch(
             "mindroom.visible_response_reconciliation.find_response_event_ids_via_room_messages",
@@ -1743,13 +1765,15 @@ async def test_router_routes_transcribed_audio_when_multiple_agents_are_present(
     agent_user.matrix_id = MatrixID.parse("@mindroom_router:localhost")
 
     config = _attach_runtime_paths(
-        Config(
-            agents={
-                "home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]},
-                "research": {"display_name": "ResearchAgent", "rooms": ["!test:example.com"]},
-            },
-            authorization={"default_room_access": True},
-            voice={"enabled": True, "visible_router_echo": False},
+        with_current_room_member_access(
+            Config(
+                agents={
+                    "home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]},
+                    "research": {"display_name": "ResearchAgent", "rooms": ["!test:example.com"]},
+                },
+                authorization={},
+                voice={"enabled": True, "visible_router_echo": False},
+            ),
         ),
         tmp_path,
     )
@@ -1781,7 +1805,7 @@ async def test_router_routes_transcribed_audio_when_multiple_agents_are_present(
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.router_relay.suggest_responder_for_message", new_callable=AsyncMock, return_value="home"),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
@@ -1821,13 +1845,15 @@ async def test_router_routes_transcribed_audio_when_multiple_agents_are_present(
 async def test_transcribed_mentions_target_the_mentioned_agent_when_router_absent(tmp_path) -> None:  # noqa: ANN001
     """A transcript mention should make the mentioned agent respond directly."""
     config = _attach_runtime_paths(
-        Config(
-            agents={
-                "home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]},
-                "research": {"display_name": "ResearchAgent", "rooms": ["!test:example.com"]},
-            },
-            authorization={"default_room_access": True},
-            voice={"enabled": True},
+        with_current_room_member_access(
+            Config(
+                agents={
+                    "home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]},
+                    "research": {"display_name": "ResearchAgent", "rooms": ["!test:example.com"]},
+                },
+                authorization={},
+                voice={"enabled": True},
+            ),
         ),
         tmp_path,
     )
@@ -1864,7 +1890,7 @@ async def test_transcribed_mentions_target_the_mentioned_agent_when_router_absen
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
@@ -1887,13 +1913,15 @@ async def test_transcribed_mentions_target_the_mentioned_agent_when_router_absen
 async def test_caption_mentions_still_target_agent_when_stt_drops_the_mention(tmp_path) -> None:  # noqa: ANN001
     """Inherited audio-caption mentions should still target the agent when STT omits them."""
     config = _attach_runtime_paths(
-        Config(
-            agents={
-                "home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]},
-                "research": {"display_name": "ResearchAgent", "rooms": ["!test:example.com"]},
-            },
-            authorization={"default_room_access": True},
-            voice={"enabled": True},
+        with_current_room_member_access(
+            Config(
+                agents={
+                    "home": {"display_name": "HomeAssistant", "rooms": ["!test:example.com"]},
+                    "research": {"display_name": "ResearchAgent", "rooms": ["!test:example.com"]},
+                },
+                authorization={},
+                voice={"enabled": True},
+            ),
         ),
         tmp_path,
     )
@@ -1940,7 +1968,7 @@ async def test_caption_mentions_still_target_agent_when_stt_drops_the_mention(tm
     with (
         patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
         patch("mindroom.voice_handler._handle_voice_message", new_callable=AsyncMock) as mock_voice,
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")

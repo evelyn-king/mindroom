@@ -17,12 +17,11 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from mindroom import constants
+from mindroom.path_confinement import resolve_path_within_root
 from mindroom.runtime_env_policy import (
-    CREDENTIALS_ENCRYPTION_KEY_ENV,
     KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY,
     SANDBOX_RUNTIME_ENV_BY_KEY,
     SHARED_CREDENTIALS_PATH_ENV,
-    credentials_encryption_key_value,
     is_trusted_tool_runtime_env_file_name,
     sandbox_runner_runtime_state_env,
     sandbox_subprocess_system_env,
@@ -166,6 +165,10 @@ def request_execution_env(
     agent_vault_env = constants.worker_proxy_execution_env(worker_local_env)
     if execution_env:
         protected_env_names = _protected_dedicated_worker_execution_env_names(runtime_paths)
+        if protected_env_names:
+            # The primary's HOME is a host path; a dedicated worker keeps its own HOME until the
+            # workspace HOME contract replaces it, so only the incoming request env drops it.
+            protected_env_names |= {"HOME"}
         env = {key: value for key, value in execution_env.items() if key not in protected_env_names}
         env.update(agent_vault_env)
         return env
@@ -204,7 +207,6 @@ def tool_runtime_paths_with_request_env(
     execution_env: dict[str, str],
     *,
     include_base_execution_env: bool = True,
-    include_credentials_encryption_key: bool = False,
     trusted_env_overlay: Mapping[str, str] | None = None,
 ) -> RuntimePaths:
     """Return runtime paths overlaid with one tool-request env snapshot."""
@@ -237,12 +239,6 @@ def tool_runtime_paths_with_request_env(
     if trusted_env_overlay:
         env_file_values.update(trusted_env_overlay)
         process_env.update(trusted_env_overlay)
-    if include_credentials_encryption_key:
-        credentials_encryption_key = credentials_encryption_key_value(
-            runtime_paths.env_value(CREDENTIALS_ENCRYPTION_KEY_ENV),
-        )
-        if credentials_encryption_key is not None:
-            process_env[CREDENTIALS_ENCRYPTION_KEY_ENV] = credentials_encryption_key
     return constants.RuntimePaths(
         config_path=runtime_paths.config_path,
         config_dir=runtime_paths.config_dir,
@@ -303,6 +299,7 @@ def worker_subprocess_env(paths: LocalWorkerStatePaths) -> dict[str, str]:
     env["PIP_CACHE_DIR"] = str(paths.cache_dir / "pip")
     env["UV_CACHE_DIR"] = str(paths.cache_dir / "uv")
     env["PYTHONPYCACHEPREFIX"] = str(paths.cache_dir / "pycache")
+    env["TMPDIR"] = str(paths.tmp_dir)
     env["VIRTUAL_ENV"] = str(paths.venv_dir)
 
     env["PATH"] = constants.subprocess_path_with_prepends(
@@ -353,8 +350,11 @@ def subprocess_worker_command(
     *,
     python_executable: str | None = None,
 ) -> list[str]:
-    """Build the sandbox subprocess worker command line."""
-    return [python_executable or sys.executable, "-m", "mindroom.api.sandbox_runner", subprocess_worker_arg]
+    """Build the sandbox subprocess worker command line.
+
+    `-P -s`: a workspace cwd or `HOME` must not shadow MindRoom modules or inject site code.
+    """
+    return [python_executable or sys.executable, "-P", "-s", "-m", "mindroom.api.sandbox_runner", subprocess_worker_arg]
 
 
 class WorkspaceEnvHookError(RuntimeError):
@@ -391,16 +391,16 @@ def resolve_workspace_env_hook_path(base_dir: Path | str | None) -> Path | None:
     if not candidate.exists():
         return None
     try:
-        candidate_resolved = candidate.resolve()
+        candidate_resolved = resolve_path_within_root(base_resolved, candidate, symlinks="internal")
     except OSError as exc:
         msg = f"Failed to resolve .mindroom/worker-env.sh: {exc}"
         raise WorkspaceEnvHookError(msg) from exc
-    if not candidate_resolved.is_relative_to(base_resolved):
+    except ValueError:
         msg = (
             f".mindroom/worker-env.sh resolves outside of {base_resolved}; "
             "agent-editable workspace hooks must stay inside the resolved tool workspace."
         )
-        raise WorkspaceEnvHookError(msg)
+        raise WorkspaceEnvHookError(msg) from None
     if not candidate_resolved.is_file():
         return None
     try:

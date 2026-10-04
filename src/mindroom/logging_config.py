@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import logging.config
 import os
+import sys
 from datetime import UTC, datetime
 from io import StringIO
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import structlog
 
@@ -17,11 +18,17 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
     from typing import TextIO
 
-    from structlog.typing import ExceptionRenderer, ExcInfo
+    from structlog.typing import ExceptionRenderer, ExcInfo, Processor
 
     from mindroom.constants import RuntimePaths
 
-__all__ = ["bound_log_context", "get_logger", "setup_logging"]
+__all__ = [
+    "bound_log_context",
+    "configure_default_logging",
+    "get_logger",
+    "setup_logging",
+    "uses_default_logging",
+]
 
 
 _DEFAULT_LOGGER_LEVELS = {
@@ -88,6 +95,35 @@ def _redact_log_event_preserving_exc_info(
     redacted = redact_log_event(logger, method_name, redacted_input)
     redacted["exc_info"] = exc_info
     return redacted
+
+
+# structlog's builtin console renderer prints Rich tracebacks with every frame's
+# locals: resolved config, credentials, subprocess environments. Processes that
+# never call `setup_logging`, such as subprocess entrypoints and the sandbox
+# runner, log through these processors instead.
+_DEFAULT_PROCESSORS: list[Processor] = [
+    structlog.contextvars.merge_contextvars,
+    structlog.processors.add_log_level,
+    structlog.processors.StackInfoRenderer(),
+    structlog.dev.set_exc_info,
+    structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+    cast("Processor", _redact_log_event_preserving_exc_info),
+    structlog.dev.ConsoleRenderer(
+        colors=False,
+        exception_formatter=_RedactingExceptionFormatter(structlog.dev.plain_traceback),
+    ),
+]
+
+
+def configure_default_logging() -> None:
+    """Restore the logging a process uses until it calls `setup_logging`."""
+    structlog.reset_defaults()
+    structlog.configure(processors=_DEFAULT_PROCESSORS)
+
+
+def uses_default_logging() -> bool:
+    """Return whether the processors are still the ones `configure_default_logging` installed."""
+    return structlog.get_config()["processors"] is _DEFAULT_PROCESSORS
 
 
 def _normalize_log_level(level: str) -> str:
@@ -174,7 +210,8 @@ def setup_logging(
         _redact_log_event_preserving_exc_info,
     ]
     log_format = os.getenv("MINDROOM_LOG_FORMAT", "text").strip().lower()
-    renderer_name = "json" if log_format == "json" else "text"
+    use_colors = sys.stderr.isatty() and not os.getenv("NO_COLOR")
+    renderer_name = "json" if log_format == "json" else ("colored" if use_colors else "text")
     handler_level, loggers = _build_logger_levels(
         global_level=level,
         override_config=os.getenv("MINDROOM_LOGGER_LEVELS"),
@@ -240,7 +277,7 @@ def setup_logging(
                     "level": handler_level,
                     "class": "logging.StreamHandler",
                     "stream": "ext://sys.stderr",
-                    "formatter": "json" if renderer_name == "json" else "colored",
+                    "formatter": renderer_name,
                     "filters": ["nio_validation"],
                 },
                 "file": {
@@ -297,3 +334,7 @@ def get_logger(name: str = __name__) -> structlog.stdlib.BoundLogger:
 def bound_log_context(**context: object) -> AbstractContextManager[None]:
     """Temporarily bind structured log fields for the current async/task scope."""
     return structlog.contextvars.bound_contextvars(**context)
+
+
+if not structlog.is_configured():
+    configure_default_logging()

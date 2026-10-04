@@ -10,25 +10,32 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import batched
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
+from uuid import UUID
 
 from mindroom.history_recovery import (
     HistoryRecoveryOutcome,
     RoomHistoryRecovery,
 )
+from mindroom.tool_approval_grants import ApprovalGrant, ApprovalGrantRevocation  # noqa: TC001
 
 from . import (
     approval_continuations,
+    approval_grants,
     approvals,
     background_approvals,
     interactive_questions,
     journal,
+    legacy_turn_records,
+    membership_hooks,
     outbox,
     reads,
+    response_attempts,
     turn_records,
 )
 from .approval_card_state import (  # noqa: TC001 - part of this module's runtime return types
     ApprovalCardReservation,
+    ApprovalDecisionMetadata,
     RecordedApprovalDecision,
 )
 from .approval_continuations import (  # noqa: TC001 - runtime return and input types
@@ -42,30 +49,47 @@ from .approvals import (  # noqa: TC001 - part of this module's runtime return t
 )
 from .background_approvals import BackgroundApprovalDecision  # noqa: TC001
 from .membership_state import claim_active_membership_epoch
-from .models import AdmissionResult, DeliveryAcknowledgement, DeliveryProjectionPendingError
-from .projection import discard_delivery_event, drop_refetched_message, install_refetched_revision, project
+from .models import (
+    AdmissionResult,
+    DeliveryAcknowledgement,
+    DeliveryProjectionPendingError,
+    DeliveryStage,
+    IngestionConsumer,
+    IngestionConsumerBindingError,
+    ResponseRecoveryState,
+)
+from .projection import (
+    discard_delivery_event,
+    drop_refetched_message,
+    install_refetched_revision,
+    is_tombstoned,
+    project,
+    tombstoned_event_ids,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
     from mindroom.interactive_models import InteractivePrompt
+    from mindroom.response_sources import ResponseAttempt
+    from mindroom.turn_record import TurnRecord
 
     from .backend import Backend, Transaction
     from .interactive_questions import InteractiveSelection
     from .models import (
+        AdmissionFacts,
         ConversationCursor,
         ConversationPage,
-        DeliveryStage,
-        DepartureOutcome,
-        DepartureSource,
         EventKind,
         HydrationCoverage,
         InboundEvent,
+        IngestionBatchAdmission,
         JournalEvent,
         MatrixDelivery,
         PendingPage,
         RefreshRequest,
+        RoomMembershipPosition,
         SemanticConsumer,
         TerminalTurnWrite,
         UnreadableMatrixDelivery,
@@ -83,12 +107,77 @@ _DEFAULT_APPROVAL_CONTINUATION_OWNER_LIMIT = 100
 _HYDRATION_INSTALL_CHUNK_SIZE = 256
 
 
+def _consumer(transaction: Transaction, principal_id: str, generation: UUID, stream_id: UUID | None) -> IngestionConsumer:  # fmt: skip
+    if stream_id is None:
+        transaction.execute("INSERT INTO matrix_sync_consumers (principal_id, consumer_generation, stream_id) VALUES (?, ?, NULL) ON CONFLICT (principal_id) DO NOTHING", (principal_id, str(generation)))  # fmt: skip
+    else:
+        transaction.execute("UPDATE matrix_sync_consumers SET stream_id = ? WHERE principal_id = ? AND consumer_generation = ? AND (stream_id IS NULL OR stream_id = ?) AND NOT EXISTS (SELECT 1 FROM matrix_sync_consumers WHERE stream_id = ?)", (str(stream_id), principal_id, str(generation), str(stream_id), str(stream_id)))  # fmt: skip
+    row = transaction.fetchone("SELECT * FROM matrix_sync_consumers WHERE principal_id = ?", (principal_id,))
+    if row is None:
+        raise IngestionConsumerBindingError
+    try:
+        consumer = IngestionConsumer(UUID(str(row["consumer_generation"])), None if row["stream_id"] is None else UUID(str(row["stream_id"])))  # fmt: skip
+    except (KeyError, TypeError, ValueError) as error:
+        raise IngestionConsumerBindingError from error
+    if stream_id is not None and consumer != IngestionConsumer(generation, stream_id):
+        raise IngestionConsumerBindingError
+    return consumer
+
+
+def _snapshot_interactive_source(
+    transaction: Transaction,
+    principal_id: str,
+    event: InboundEvent,
+) -> None:
+    """Freeze an interactive source only after its visible target is durable."""
+    if interactive_questions.snapshot_source_candidate(
+        transaction,
+        principal_id,
+        event,
+    ) and outbox.has_attempted_unacknowledged_prompt_delivery(
+        transaction,
+        principal_id,
+        room_id=event.room_id,
+        membership_epoch=journal.current_membership_epoch(transaction, principal_id, event.room_id),
+    ):
+        msg = f"Matrix delivery projection is pending in room {event.room_id!r}"
+        raise DeliveryProjectionPendingError(msg)
+
+
+def _admit_ingestion_batch(
+    transaction: Transaction,
+    principal_id: str,
+    admission: IngestionBatchAdmission,
+) -> AdmissionFacts:
+    """Apply one ingestion receipt with the interactive source snapshot it admits."""
+    return journal.admit_ingestion_batch(
+        transaction,
+        principal_id,
+        admission,
+        snapshot=_snapshot_interactive_source,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PrincipalStore:
     """Everything one bot may durably do, scoped to that bot."""
 
     _backend: Backend
     _principal_id: str
+
+    async def load_or_create_ingestion_consumer(self, *, new_generation: UUID) -> IngestionConsumer:  # noqa: D102
+        return await self._backend.write(lambda tx: _consumer(tx, self._principal_id, new_generation, None))
+
+    async def bind_ingestion_stream(self, *, generation: UUID, stream_id: UUID) -> IngestionConsumer:  # noqa: D102
+        try:
+            return await self._backend.write(lambda tx: _consumer(tx, self._principal_id, generation, stream_id))
+        except Exception as error:
+            if getattr(error, "sqlite_errorname", None) != "SQLITE_CONSTRAINT_UNIQUE" and getattr(error, "sqlstate", None) != "23505":  # fmt: skip
+                raise
+            owner = await self._backend.read(lambda tx: tx.fetchone("SELECT principal_id FROM matrix_sync_consumers WHERE stream_id = ?", (str(stream_id),)))  # fmt: skip
+            if owner is not None and owner["principal_id"] != self._principal_id:
+                raise IngestionConsumerBindingError from error
+            raise
 
     async def admit(
         self,
@@ -100,10 +189,20 @@ class PrincipalStore:
             lambda transaction: _admit(transaction, self._principal_id, event, projected),
         )
 
+    async def admit_ingestion_batch(
+        self,
+        admission: IngestionBatchAdmission,
+    ) -> AdmissionFacts:
+        """Atomically persist one trusted nio batch."""
+        return await self._backend.write(
+            lambda tx: _admit_ingestion_batch(tx, self._principal_id, admission),
+        )
+
     async def pending(
         self,
         *,
         limit: int = _DEFAULT_PENDING_LIMIT,
+        room_id: str | None = None,
         after_receipt_order: int | None = None,
         runtime_generation: str = "unmanaged",
     ) -> PendingPage:
@@ -113,6 +212,7 @@ class PrincipalStore:
                 transaction,
                 self._principal_id,
                 limit=limit,
+                room_id=room_id,
                 after_receipt_order=after_receipt_order,
                 runtime_generation=runtime_generation,
             ),
@@ -128,6 +228,96 @@ class PrincipalStore:
         """Return whether one event still owes semantic work."""
         return await self._backend.read(
             lambda transaction: journal.is_pending(transaction, self._principal_id, event_id),
+        )
+
+    async def response_recovery_state(
+        self,
+        *,
+        turn_record: TurnRecord,
+        agent_name: str,
+        redaction_target: Callable[[JournalEvent], str | None],
+    ) -> ResponseRecoveryState:
+        """Read one response's durable handoff through the reserved recovery lane."""
+
+        def load(transaction: Transaction) -> ResponseRecoveryState:
+            source_event_ids = turn_record.source_event_ids
+            turn_id = turn_record.anchor_event_id
+            records = {
+                event_id: turn_records.load_record(transaction, agent_name, event_id)
+                for event_id in turn_record.indexed_event_ids
+            }
+            pending = tuple(
+                journal.is_pending(transaction, self._principal_id, event_id) for event_id in source_event_ids
+            )
+            delivery = (
+                None
+                if turn_id is None
+                else outbox.load(
+                    transaction,
+                    self._principal_id,
+                    delivery_id=turn_id,
+                    stage=DeliveryStage.FINAL,
+                )
+            )
+            return ResponseRecoveryState(
+                approval_owned=any(
+                    outbox.approval_owns_delivery(transaction, self._principal_id, event_id)
+                    for event_id in source_event_ids
+                ),
+                pending_sources=pending,
+                redacted_sources=tuple(
+                    not is_pending
+                    and journal.source_has_redaction_handoff(
+                        transaction,
+                        self._principal_id,
+                        event_id,
+                        turn_record,
+                        records.get(event_id),
+                        redaction_target,
+                    )
+                    for event_id, is_pending in zip(source_event_ids, pending, strict=True)
+                ),
+                turn_records=tuple(records.values()),
+                final_delivery=delivery,
+                sources_settled_by_departure=(
+                    not any(pending)
+                    and journal.sources_settled_by_departure(transaction, self._principal_id, source_event_ids)
+                ),
+                source_tombstones=tuple(
+                    (
+                        turn_record.conversation_target is not None
+                        and is_tombstoned(
+                            transaction,
+                            self._principal_id,
+                            room_id=turn_record.conversation_target.room_id,
+                            event_id=event_id,
+                        )
+                    )
+                    or (
+                        (current := records.get(event_id)) is not None and event_id in current.redacted_source_event_ids
+                    )
+                    for event_id in source_event_ids
+                ),
+            )
+
+        return await self._backend.recovery_read(load)
+
+    async def is_room_member_join_suppressed(self, room_id: str, event_id: str, user_id: str) -> bool:
+        """Check one admitted join against earlier baselines and completed hook delivery."""
+        return await self._backend.read(
+            lambda transaction: membership_hooks.is_suppressed(
+                transaction,
+                self._principal_id,
+                room_id,
+                event_id,
+                user_id,
+            ),
+        )
+
+    async def mark_room_member_join_completed(self, room_id: str, user_id: str) -> None:
+        """Record successful hook delivery without rewriting any other member's marker."""
+        await self._backend.write(
+            lambda transaction: membership_hooks.mark_completed(transaction, self._principal_id, room_id, user_id),
         )
 
     async def settle(self, event_id: str) -> None:
@@ -222,6 +412,22 @@ class PrincipalStore:
             lambda transaction: journal.current_membership_epoch(transaction, self._principal_id, room_id),
         )
 
+    async def membership_position(self, room_id: str) -> RoomMembershipPosition:
+        """Return the journal tenure that owns this room's events and deliveries."""
+        return await self._backend.read(
+            lambda transaction: journal.membership_position(
+                transaction,
+                self._principal_id,
+                room_id,
+            ),
+        )
+
+    async def ingestion_membership_position(self, room_id: str) -> RoomMembershipPosition | None:
+        """Return the producer position, or None until its first membership admission."""
+        return await self._backend.read(
+            lambda transaction: journal.ingestion_membership_position(transaction, self._principal_id, room_id),
+        )
+
     async def interactive_prompt_is_current(
         self,
         *,
@@ -237,24 +443,6 @@ class PrincipalStore:
                 room_id=room_id,
                 question_event_id=question_event_id,
                 expected=expected,
-            ),
-        )
-
-    async def fence_departure(
-        self,
-        room_id: str,
-        *,
-        source: DepartureSource,
-        report_observation_id: str | None = None,
-    ) -> DepartureOutcome:
-        """Apply one observation of a departure, invalidating at most once per departure."""
-        return await self._backend.write(
-            lambda transaction: journal.fence_departure(
-                transaction,
-                self._principal_id,
-                room_id,
-                source=source,
-                report_observation_id=report_observation_id,
             ),
         )
 
@@ -286,62 +474,20 @@ class PrincipalStore:
             ),
         )
 
-    async def note_membership_restarted(
-        self,
-        room_id: str,
-        *,
-        expected_membership_epoch: int | None = None,
-    ) -> None:
-        """Rearm one room after a confirmed join."""
-        await self._backend.write(
-            lambda transaction: journal.note_membership_restarted(
-                transaction,
-                self._principal_id,
-                room_id,
-                expected_membership_epoch=expected_membership_epoch,
-            ),
-        )
-
-    async def close_preceding_reported_departure(
-        self,
-        room_id: str,
-        join_event_id: str,
-    ) -> None:
-        """Close the reported departure immediately preceding one join."""
-        await self._backend.write(
-            lambda transaction: journal.close_preceding_reported_departure(
-                transaction,
-                self._principal_id,
-                room_id,
-                join_event_id,
-            ),
-        )
-
-    async def close_reported_departure_run(
-        self,
-        room_id: str,
-        run_epoch: int,
-    ) -> None:
-        """Close one contiguous reported-departure run."""
-        await self._backend.write(
-            lambda transaction: journal.close_reported_departure_run(
-                transaction,
-                self._principal_id,
-                room_id,
-                run_epoch,
-            ),
-        )
-
-    async def retire_owed_departure_reports(self, room_id: str) -> None:
-        """Forget sync reports that can no longer arrive for one room."""
-        await self._backend.write(
-            lambda transaction: journal.retire_owed_departure_reports(transaction, self._principal_id, room_id),
-        )
-
-    async def rooms_owing_departure_reports(self) -> frozenset[str]:
-        """Return every room whose local departure is still owed a sync report."""
+    async def is_event_redacted(self, *, room_id: str, event_id: str) -> bool:
+        """Read exact projection tombstone authority for this principal."""
         return await self._backend.read(
-            lambda transaction: journal.rooms_owing_departure_reports(transaction, self._principal_id),
+            lambda transaction: is_tombstoned(transaction, self._principal_id, room_id, event_id),
+        )
+
+    async def redacted_event_ids(self, room_id: str, event_ids: tuple[str, ...]) -> frozenset[str]:
+        """Read recorded context tombstones in one transaction and one offload."""
+        return await self._backend.read(
+            lambda transaction: frozenset(
+                event_id
+                for batch in batched(event_ids, 256)
+                for event_id in tombstoned_event_ids(transaction, self._principal_id, room_id, batch)
+            ),
         )
 
     async def read_conversation(
@@ -543,8 +689,8 @@ class PrincipalStore:
         revision_sender: str,
         revision_transaction_id: str | None = None,
         content: Mapping[str, object],
-    ) -> bool:
-        """Install a point-refetched revision if its refresh token still holds."""
+    ) -> int | None:
+        """Install a point-refetched revision if its refresh token still holds, returning its stored size."""
         return await self._backend.write(
             lambda transaction: install_refetched_revision(
                 transaction,
@@ -585,6 +731,7 @@ class PrincipalStore:
         thread_id: str | None,
         payload: Mapping[str, object],
         result: Mapping[str, object] | None = None,
+        response_attempt: ResponseAttempt | None = None,
         event_type: str = "m.room.message",
         edits_event_id: str | None = None,
         settle_source_event_ids: tuple[str, ...] = (),
@@ -616,6 +763,7 @@ class PrincipalStore:
                 thread_id=thread_id,
                 payload=payload,
                 result=result,
+                response_attempt=response_attempt,
                 edits_event_id=edits_event_id,
                 settle_source_event_ids=settle_source_event_ids,
                 permanent_failure_reason=permanent_failure_reason,
@@ -641,15 +789,23 @@ class PrincipalStore:
         sending_device_id: str | None = None,
     ) -> MatrixDelivery | None:
         """Freeze one delivery before network I/O and return the row as it stood."""
-        return await self._backend.write(
-            lambda transaction: outbox.claim(
+
+        def claim(transaction: Transaction) -> MatrixDelivery | None:
+            if stage is DeliveryStage.FINAL and approval_continuations.retire_superseded_failure_for_source(
+                transaction,
+                self._principal_id,
+                event_id=delivery_id,
+            ):
+                return None
+            return outbox.claim(
                 transaction,
                 self._principal_id,
                 delivery_id=delivery_id,
                 stage=stage,
                 sending_device_id=sending_device_id,
-            ),
-        )
+            )
+
+        return await self._backend.write(claim)
 
     async def record_matrix_delivery_device(
         self,
@@ -666,6 +822,17 @@ class PrincipalStore:
                 delivery_id=delivery_id,
                 stage=stage,
                 device_id=device_id,
+            ),
+        )
+
+    async def owns_matrix_response(self, *, room_id: str, event_id: str) -> bool:
+        """Return whether this journal owns the response in the current room membership."""
+        return await self._backend.read(
+            lambda transaction: outbox.owns_response(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                event_id=event_id,
             ),
         )
 
@@ -798,18 +965,27 @@ class PrincipalStore:
                 stage=stage,
                 event_id=event_id,
             )
+            if bound:
+                delivery = transaction.fetchone(
+                    "SELECT edits_event_id FROM matrix_delivery_outbox WHERE principal_id = ? AND delivery_id = ? AND stage = ?",
+                    (self._principal_id, delivery_id, stage.value),
+                )
+                if delivery is not None:
+                    response_attempts.bind_response_target(
+                        transaction,
+                        self._principal_id,
+                        delivery_id,
+                        str(delivery["edits_event_id"] or event_id),
+                    )
             # A caller that lost the acknowledgement must not write the record
             # either. The row already names another event, and a terminal
             # record pointing somewhere else is the disagreement this whole
             # transaction exists to prevent.
-            if bound and terminal_turn is not None:
-                turn_records.upsert(
-                    transaction,
-                    terminal_turn.agent_name,
-                    index_event_ids=terminal_turn.index_event_ids,
-                    anchor_event_id=terminal_turn.anchor_event_id,
-                    record_json=terminal_turn.record_json,
-                )
+            committed_terminal = (
+                turn_records.commit_terminal(transaction, terminal_turn)
+                if bound and may_project and terminal_turn is not None
+                else None
+            )
             if bound and may_project:
                 for delivered_projection in delivered_projections:
                     project(
@@ -826,7 +1002,7 @@ class PrincipalStore:
                     event_id=event_id,
                 )
             if bound:
-                return DeliveryAcknowledgement(settled_event_id=event_id, bound=True)
+                return DeliveryAcknowledgement(settled_event_id=event_id, bound=True, terminal_turn=committed_terminal)
             # Lost the row. Whatever is on it now is the answer this delivery
             # resolves to, and the caller has to be told that rather than its
             # own event id -- everything downstream records what `flush`
@@ -862,6 +1038,55 @@ class PrincipalStore:
                 event_type=event_type,
                 after=after,
             ),
+        )
+
+    async def initial_response_delivery_id(self, event_id: str) -> str | None:
+        """Resolve this principal's exact INITIAL ACK, including retired cleanup proof."""
+        return await self._backend.read(
+            lambda transaction: outbox.initial_response_delivery_id(transaction, self._principal_id, event_id),
+        )
+
+    async def response_delivery_id(self, *, room_id: str, event_id: str) -> str | None:
+        """Resolve a visible response to its current exact delivery owner."""
+        return await self._backend.read(
+            lambda transaction: outbox.response_delivery_id(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                event_id=event_id,
+            ),
+        )
+
+    async def deleted_initial_deliveries(
+        self,
+        *,
+        agent_name: str,
+        after: tuple[int, str] | None = None,
+    ) -> tuple[MatrixDelivery | UnreadableMatrixDelivery, ...]:
+        """Discover exact deleted-source INITIAL debt, including acknowledged sends."""
+        return await self._backend.read(
+            lambda transaction: outbox.deleted_initials(
+                transaction,
+                self._principal_id,
+                agent_name=agent_name,
+                after=after,
+            ),
+        )
+
+    async def recovery_initial_deliveries(
+        self,
+        *,
+        after: tuple[int, str] | None = None,
+    ) -> tuple[MatrixDelivery | UnreadableMatrixDelivery, ...]:
+        """Page acknowledged INITIAL candidates, including potentially interrupted FINALs."""
+        return await self._backend.read(
+            lambda transaction: outbox.recovery_initials(transaction, self._principal_id, after=after),
+        )
+
+    async def retire_deleted_initial(self, *, delivery_id: str) -> None:
+        """Fence an INITIAL whose visible cleanup and record detachment finished."""
+        await self._backend.write(
+            lambda transaction: outbox.retire_deleted_initial(transaction, self._principal_id, delivery_id),
         )
 
     async def reserve_approval_card_deliveries(
@@ -976,7 +1201,7 @@ class PrincipalStore:
         card_event_id: str,
         requested_status: Literal["approved", "denied", "expired"],
         reason: str | None,
-        resolution: Mapping[str, Any],
+        metadata: ApprovalDecisionMetadata,
     ) -> RecordedApprovalDecision:
         """Atomically record one native card and its exact-call decision."""
         return await self._backend.write(
@@ -986,7 +1211,70 @@ class PrincipalStore:
                 card_event_id=card_event_id,
                 requested_status=requested_status,
                 reason=reason,
-                resolution=resolution,
+                metadata=metadata,
+            ),
+        )
+
+    async def create_approval_grant(
+        self,
+        *,
+        room_id: str,
+        card_event_id: str,
+        sender_id: str,
+        seconds: int,
+        metadata: ApprovalDecisionMetadata,
+        reason: str | None = None,
+        current_binding: str | None = None,
+    ) -> tuple[RecordedApprovalDecision, ...]:
+        """Commit the originating decision, fixed grant, and matching pending decisions."""
+        return await self._backend.write(
+            lambda transaction: approval_grants.create(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                card_event_id=card_event_id,
+                sender_id=sender_id,
+                seconds=seconds,
+                metadata=metadata,
+                reason=reason,
+                current_binding=current_binding,
+            ),
+        )
+
+    async def approval_grant_for_card(self, *, room_id: str, card_event_id: str) -> ApprovalGrant | None:
+        """Load a grant independently of its retired card."""
+        return await self._backend.read(
+            lambda transaction: approval_grants.for_card(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                card_event_id=card_event_id,
+            ),
+        )
+
+    async def maintain_approval_grants(self, *, grant_id: str | None = None) -> tuple[str, ...]:
+        """Retire spent payloads and enqueue revocations after their approval edits."""
+        return await self._backend.write(
+            lambda transaction: approval_grants.maintain(transaction, self._principal_id, grant_id=grant_id),
+        )
+
+    async def revoke_approval_grant(
+        self,
+        *,
+        room_id: str,
+        card_event_id: str,
+        sender_id: str,
+        grant_id: str,
+    ) -> ApprovalGrantRevocation | None:
+        """Record durable revocation debt for ordered acknowledgement delivery."""
+        return await self._backend.write(
+            lambda transaction: approval_grants.revoke(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                card_event_id=card_event_id,
+                sender_id=sender_id,
+                grant_id=grant_id,
             ),
         )
 
@@ -1003,7 +1291,7 @@ class PrincipalStore:
                 card_event_id=None,
                 requested_status="expired",
                 reason=None,
-                resolution=None,
+                metadata=None,
                 delivery_id=delivery_id,
             ),
         )
@@ -1016,6 +1304,18 @@ class PrincipalStore:
                 self._principal_id,
                 delivery_id=delivery_id,
                 card_event_id=card_event_id,
+            ),
+        )
+
+    async def remember_terminal_approval_alias(self, *, room_id: str, card_event_id: str, delivery_id: str) -> None:
+        """Retain a transport-verified receipt alias without changing its decision."""
+        await self._backend.write(
+            lambda transaction: approvals.remember_terminal_alias(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                card_event_id=card_event_id,
+                delivery_id=delivery_id,
             ),
         )
 
@@ -1106,6 +1406,26 @@ class PrincipalStore:
             ),
         )
 
+    async def edited_approval_sources_for_user_stop(
+        self,
+        *,
+        room_id: str,
+        response_event_id: str,
+        source_event_id: str,
+        stop_receipt_order: int,
+    ) -> tuple[str, ...]:
+        """Resolve edit-owned approvals and finished FINALs within one STOP cutoff."""
+        return await self._backend.read(
+            lambda transaction: response_attempts.edited_attempt_sources_before_stop(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                response_event_id=response_event_id,
+                source_event_id=source_event_id,
+                stop_receipt_order=stop_receipt_order,
+            ),
+        )
+
     async def claim_approval_continuation(
         self,
         approval_id: str,
@@ -1132,9 +1452,13 @@ class PrincipalStore:
         run_id: str,
         session_id: str,
         calls: tuple[ApprovalCall, ...],
+        runtime_model_name: str | None = None,
         response_text: str | None = None,
         response_tool_trace: tuple[dict[str, object], ...] | None = None,
         response_presentation_state: dict[str, object] | None = None,
+        delegation_storage_bindings: dict[str, dict[str, object]] | None = None,
+        cli_call: dict[str, object] | None = None,
+        continuation_count: int | None = None,
     ) -> ApprovalContinuation | None:
         """Replace one claimed generation with the next exact Agno pause."""
         return await self._backend.write(
@@ -1146,9 +1470,13 @@ class PrincipalStore:
                 run_id=run_id,
                 session_id=session_id,
                 calls=calls,
+                runtime_model_name=runtime_model_name,
                 response_text=response_text,
                 response_tool_trace=response_tool_trace,
                 response_presentation_state=response_presentation_state,
+                delegation_storage_bindings=delegation_storage_bindings,
+                cli_call=cli_call,
+                continuation_count=continuation_count,
             ),
         )
 
@@ -1187,6 +1515,17 @@ class PrincipalStore:
                 expected_state=expected_state,
                 expected_generation=expected_generation,
                 expected_runtime_generation=expected_runtime_generation,
+            ),
+        )
+
+    async def release_approval_continuation(self, approval_id: str, *, expected_generation: int) -> bool:
+        """Hand an interrupted continuation's still-pending sources back to ordinary replay."""
+        return await self._backend.write(
+            lambda transaction: approval_continuations.release(
+                transaction,
+                self._principal_id,
+                approval_id=approval_id,
+                expected_generation=expected_generation,
             ),
         )
 
@@ -1272,22 +1611,8 @@ def _admit(
 ) -> AdmissionResult:
     """Admit one event after any already-visible outbox delivery is projected."""
     result = journal.admit(transaction, principal_id, event, projected)
-    if (
-        result is AdmissionResult.ADMITTED
-        and interactive_questions.snapshot_source_candidate(
-            transaction,
-            principal_id,
-            event,
-        )
-        and outbox.has_attempted_unacknowledged_prompt_delivery(
-            transaction,
-            principal_id,
-            room_id=event.room_id,
-            membership_epoch=journal.current_membership_epoch(transaction, principal_id, event.room_id),
-        )
-    ):
-        msg = f"Matrix delivery projection is pending in room {event.room_id!r}"
-        raise DeliveryProjectionPendingError(msg)
+    if result is AdmissionResult.ADMITTED:
+        _snapshot_interactive_source(transaction, principal_id, event)
     return result
 
 
@@ -1302,6 +1627,7 @@ def _enqueue_matrix_delivery(
     thread_id: str | None,
     payload: Mapping[str, object],
     result: Mapping[str, object] | None,
+    response_attempt: ResponseAttempt | None,
     edits_event_id: str | None,
     settle_source_event_ids: tuple[str, ...],
     permanent_failure_reason: str | None,
@@ -1382,6 +1708,32 @@ def _enqueue_matrix_delivery(
     )
     if transaction_id is None:
         return None
+    if response_attempt is not None:
+        if response_attempt.sources.pending_event_ids[0] != delivery_id:
+            message = "Conflicting response attempt identity: driving event"
+            raise ValueError(message)
+        frozen = (
+            transaction.fetchone(
+                """SELECT delivery.edits_event_id FROM matrix_delivery_outbox AS delivery
+                JOIN response_attempts AS attempt
+                  ON attempt.principal_id = delivery.principal_id AND attempt.driving_event_id = delivery.delivery_id
+                WHERE delivery.principal_id = ? AND delivery.delivery_id = ? AND delivery.stage = ?""",
+                (principal_id, delivery_id, stage.value),
+            )
+            if attempted
+            else None
+        )
+        if attempted and (frozen is None or frozen["edits_event_id"] != edits_event_id):
+            message = "Cannot replace an attempted delivery identity"
+            raise ValueError(message)
+        response_attempts.register_response_attempt(
+            transaction,
+            principal_id,
+            attempt=response_attempt,
+            room_id=room_id,
+            membership_epoch=membership_epoch,
+            response_event_id=edits_event_id,
+        )
     journal.settle_many(transaction, principal_id, settle_source_event_ids)
     return transaction_id
 
@@ -1419,6 +1771,7 @@ def _settle_history_recovery(
         principal_id,
         recovery,
         exhausted_server=exhausted_server,
+        attempted_policy_rank=attempted_policy_rank,
     )
 
 
@@ -1646,10 +1999,10 @@ class TurnRecordStore:
         index_event_ids: Sequence[str],
         anchor_event_id: str,
         record_json: str,
-    ) -> None:
-        """Store one record under every event that indexes it."""
-        await self._backend.write(
-            lambda transaction: turn_records.upsert(
+    ) -> str | None:
+        """Store a record and return its committed state, or reject a changed owner."""
+        return await self._backend.write(
+            lambda transaction: turn_records.write_record(
                 transaction,
                 self._agent_name,
                 index_event_ids=index_event_ids,
@@ -1667,7 +2020,7 @@ class TurnRecordStore:
     ) -> int:
         """Fill only the indexes with no record yet, for migration. Returns how many."""
         return await self._backend.write(
-            lambda transaction: turn_records.adopt_missing(
+            lambda transaction: legacy_turn_records.adopt_missing(
                 transaction,
                 self._agent_name,
                 index_event_ids=index_event_ids,
@@ -1680,6 +2033,12 @@ class TurnRecordStore:
         """Return every record this agent holds, for a warm-up."""
         return await self._backend.read(
             lambda transaction: turn_records.load_all(transaction, self._agent_name),
+        )
+
+    async def load(self, event_id: str) -> TurnRecord | None:
+        """Read one exact record without depending on a runtime ledger cache."""
+        return await self._backend.read(
+            lambda transaction: turn_records.load_record(transaction, self._agent_name, event_id),
         )
 
     async def forget(self, *, index_event_ids: Sequence[str]) -> None:

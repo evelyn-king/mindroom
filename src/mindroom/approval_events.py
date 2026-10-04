@@ -6,11 +6,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
+from mindroom.legacy_approval_payloads import legacy_approval_card_id
 from mindroom.matrix.event_info import EventInfo
 from mindroom.matrix.large_messages import sidecar_upload_is_usable
 from mindroom.matrix.visible_body import visible_content_from_content
+from mindroom.tool_approval_grants import AUTO_APPROVE_OPTIONS
 
-PendingApprovalStatus = Literal["pending", "approved", "denied", "expired"]
+_PendingApprovalStatus = Literal["pending", "approved", "denied", "expired"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,17 +26,17 @@ class PendingApproval:
     requester_id: str
     approver_user_id: str
     tool_name: str
-    arguments_preview: dict[str, Any]
     arguments_preview_truncated: bool
     timeout_seconds: int
     created_at_ms: int
-    initial_status: PendingApprovalStatus
+    initial_status: _PendingApprovalStatus
     approvable: bool = True
     full_arguments_available: bool = False
     thread_id: str | None = None
     agent_name: str | None = None
     requested_at: str | None = None
     expires_at: str | None = None
+    auto_approve_options: tuple[int, ...] = ()
 
     @classmethod
     def from_card_event(cls, event: dict[str, Any], *, room_id: str) -> PendingApproval:
@@ -52,7 +54,7 @@ class PendingApproval:
 
         event_id = _required_str(event, "event_id")
         sender = _required_str(event, "sender")
-        approval_id = _content_str(content, "approval_id") or _content_str(content, "tool_call_id")
+        approval_id = legacy_approval_card_id(content)
         tool_name = _content_str(content, "tool_name")
         approver_user_id = _content_str(content, "approver_user_id")
         if approval_id is None or tool_name is None or approver_user_id is None:
@@ -62,10 +64,6 @@ class PendingApproval:
         if status not in {"pending", "approved", "denied", "expired"}:
             msg = "Approval card event has an invalid status."
             raise ValueError(msg)
-
-        arguments = content.get("arguments")
-        if not isinstance(arguments, dict):
-            arguments = {"value": arguments}
 
         requested_at = _content_str(content, "requested_at")
         expires_at = _content_str(content, "expires_at")
@@ -83,20 +81,22 @@ class PendingApproval:
             requester_id=requester_id,
             approver_user_id=approver_user_id,
             tool_name=tool_name,
-            arguments_preview=cast("dict[str, Any]", arguments),
             arguments_preview_truncated=bool(content.get("arguments_truncated")),
             timeout_seconds=timeout_seconds,
             created_at_ms=created_at_ms,
-            initial_status=cast("PendingApprovalStatus", status),
+            initial_status=cast("_PendingApprovalStatus", status),
             approvable=_approvable(content),
             full_arguments_available=_full_arguments_available(content),
             thread_id=thread_id,
             agent_name=agent_name,
             requested_at=requested_at,
             expires_at=expires_at,
+            auto_approve_options=tuple(content["auto_approve_options"])
+            if content.get("auto_approve_options") == list(AUTO_APPROVE_OPTIONS)
+            else (),
         )
 
-    def latest_status(self, latest_edit: dict[str, Any] | None) -> PendingApprovalStatus:
+    def latest_status(self, latest_edit: dict[str, Any] | None) -> _PendingApprovalStatus:
         """Return the visible approval status after applying the latest cached edit."""
         if latest_edit is None:
             return self.initial_status
@@ -105,7 +105,7 @@ class PendingApproval:
             return self.initial_status
         status = visible_content_from_content(cast("dict[str, object]", content)).get("status")
         if status in {"pending", "approved", "denied", "expired"}:
-            return cast("PendingApprovalStatus", status)
+            return cast("_PendingApprovalStatus", status)
         return self.initial_status
 
 

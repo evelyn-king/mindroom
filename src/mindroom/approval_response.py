@@ -6,24 +6,30 @@ import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import TYPE_CHECKING, cast
 
 from mindroom import approval_manager
+from mindroom.approval_failure import prepare_approval_failure
 from mindroom.constants import (
     STREAM_STATUS_APPROVAL_PENDING,
     STREAM_STATUS_COMPLETED,
     STREAM_STATUS_KEY,
     STREAM_STATUS_PENDING,
 )
+from mindroom.delegation.recovery import cancel_approval_delegations
 from mindroom.delivery_gateway import DeliveryStage, EditTextRequest
-from mindroom.event_journal import ApprovalCall, ApprovalContinuation
+from mindroom.event_journal import ApprovalCall, ApprovalContinuation, approval_arguments_digest
 from mindroom.event_journal import ApprovalDecision as ContinuationDecision
 from mindroom.message_target import MessageTarget
+from mindroom.redaction import redact_sensitive_text
+from mindroom.response_sources import ResponseAttempt
 from mindroom.tool_approval import (
     POLICY_CONFIRMATION_APPROVAL_TYPE,
     evaluate_tool_approval,
     resolve_tool_approval_approver,
 )
+from mindroom.tool_approval_grants import grant_operation
 from mindroom.tool_system.events import serialize_tool_trace, tool_markers_match_trace
 
 _USER_STOP_FAILURE_REASON = "cancelled_by_user"
@@ -38,7 +44,7 @@ def _require_successful_edit(succeeded: bool, failure_reason: str) -> None:
 _USER_STOP_VISIBLE_NOTE = "**[Response cancelled by user]**"
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from agno.models.response import ToolExecution
 
@@ -74,6 +80,7 @@ def _team_config_names_by_provider_id(state: dict[str, object]) -> dict[str, str
     if not isinstance(stored_members, list):
         return {}
     config_names_by_provider_id: dict[str, str] = {}
+    member_identities: set[str] = set()
     for member in stored_members:
         if not isinstance(member, dict):
             continue
@@ -81,8 +88,25 @@ def _team_config_names_by_provider_id(state: dict[str, object]) -> dict[str, str
         provider_id = stored_member.get("id")
         config_name = stored_member.get("config_name")
         if isinstance(provider_id, str) and provider_id and isinstance(config_name, str) and config_name:
+            if {provider_id, config_name} & member_identities:
+                msg = "Paused approval tool has ambiguous frozen member identity"
+                raise RuntimeError(msg)
+            member_identities.update((provider_id, config_name))
             config_names_by_provider_id[provider_id] = config_name
     return config_names_by_provider_id
+
+
+def _resolve_team_member_identity(member_id: str, config_names_by_provider_id: dict[str, str]) -> tuple[str, str]:
+    """Resolve an exact requirement identity to its frozen presentation ID and config name."""
+    matches = [
+        (provider_id, config_name)
+        for provider_id, config_name in config_names_by_provider_id.items()
+        if member_id in (provider_id, config_name)
+    ]
+    if len(matches) != 1:
+        msg = "Paused approval tool has no unique frozen member config identity"
+        raise RuntimeError(msg)
+    return matches[0]
 
 
 def identify_approval_tools(
@@ -93,13 +117,13 @@ def identify_approval_tools(
     """Resolve exact paused call IDs, names, and invoking member ownership."""
     config_names_by_provider_id = _team_config_names_by_provider_id(paused.response_presentation_state)
     owners = {
-        requirement.tool_execution.tool_call_id: config_names_by_provider_id.get(requirement.member_agent_id)
+        requirement.tool_execution.tool_call_id: _resolve_team_member_identity(
+            requirement.member_agent_id,
+            config_names_by_provider_id,
+        )[1]
         for requirement in paused.requirements
         if requirement.tool_execution is not None and requirement.member_agent_id
     }
-    if any(owner is None for owner in owners.values()):
-        msg = "Paused approval tool has no frozen member config identity"
-        raise RuntimeError(msg)
     identified: list[tuple[ToolExecution, str, str, str]] = []
     for tool in paused.tools:
         if not tool.tool_call_id or not tool.tool_name:
@@ -110,7 +134,7 @@ def identify_approval_tools(
                 tool,
                 tool.tool_call_id,
                 tool.tool_name,
-                owners.get(tool.tool_call_id) or default_agent_name,
+                paused.approval_agent_name or owners.get(tool.tool_call_id) or default_agent_name,
             ),
         )
     return tuple(identified)
@@ -129,6 +153,7 @@ def require_ordered_pause_presentation(paused: PausedAttempt, *, show_tool_calls
         if requirement.tool_execution is not None and requirement.tool_execution.tool_call_id
     }
     is_team_presentation = paused.response_presentation_state.get("kind") == "team_stream"
+    config_names_by_provider_id = _team_config_names_by_provider_id(paused.response_presentation_state)
     for tool in paused.tools:
         call_id = tool.tool_call_id
         matches = [
@@ -142,6 +167,8 @@ def require_ordered_pause_presentation(paused: PausedAttempt, *, show_tool_calls
         _, entry = matches[0]
         requirement = requirements_by_call_id.get(call_id)
         member_id = requirement.member_agent_id if requirement is not None else None
+        if member_id is not None:
+            member_id, _ = _resolve_team_member_identity(member_id, config_names_by_provider_id)
         expected_scope = f"agent:{member_id}" if member_id is not None else ("team" if is_team_presentation else None)
         if entry.scope_key != expected_scope:
             msg = "Approval suspension requires an ordered presentation for every pending tool"
@@ -171,7 +198,7 @@ class ApprovalResponseCoordinator:
     runtime_paths: RuntimePaths
     store: PrincipalStore
     delivery_gateway: DeliveryGateway
-    retry_sources: Callable[[tuple[str, ...]], None]
+    retry_sources: Callable[[str, tuple[str, ...]], None]
 
     async def create(self, continuation: ApprovalContinuation) -> ApprovalContinuation:
         """Persist one born-bound paused run against its original sources."""
@@ -186,6 +213,7 @@ class ApprovalResponseCoordinator:
         identified: tuple[tuple[ToolExecution, str, str, str], ...],
         *,
         requester_id: str,
+        toolkit_owners: Mapping[tuple[str, str], str | None],
     ) -> _ApprovalPausePlan:
         """Evaluate policy once and normalize exact calls with integer deadlines."""
         config = self.config()
@@ -218,6 +246,8 @@ class ApprovalResponseCoordinator:
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 invoking_agent=invoking_agent,
+                toolkit_name=toolkit_owners.get((invoking_agent, tool_name)),
+                arguments_digest=approval_arguments_digest(tool.tool_args),
                 expires_at_ns=int((now + timedelta(seconds=decisions[tool_call_id][1])).timestamp() * 1_000_000_000),
                 decision=decisions[tool_call_id][0],
                 reason=(
@@ -227,8 +257,11 @@ class ApprovalResponseCoordinator:
                 ),
                 human_approval_required=decisions[tool_call_id][2],
             )
-            for _tool, tool_call_id, tool_name, invoking_agent in identified
+            for tool, tool_call_id, tool_name, invoking_agent in identified
         )
+        if any(call.toolkit_name is None for call in calls):
+            msg = "Paused tool has no configured toolkit origin and cannot support restartable approval"
+            raise RuntimeError(msg)
         gated_calls = tuple(call for call in calls if call.decision is None)
         return _ApprovalPausePlan(
             tools=tuple(tool for tool, _tool_call_id, _tool_name, _invoking_agent in identified),
@@ -262,6 +295,8 @@ class ApprovalResponseCoordinator:
                 approval_id=f"{continuation.approval_id}-{continuation.generation}-{index}",
                 continuation_id=continuation.approval_id,
                 continuation_generation=continuation.generation,
+                entity_name=continuation.entity_name,
+                response_event_id=continuation.response_event_id,
                 tool_call_id=call.tool_call_id,
                 tool_name=call.tool_name,
                 arguments=deepcopy(dict(tool.tool_args or {})),
@@ -271,6 +306,11 @@ class ApprovalResponseCoordinator:
                 expires_at_ns=call.expires_at_ns,
                 agent_name=call.invoking_agent,
                 thread_id=target.resolved_thread_id,
+                grant_operation=(
+                    grant_operation(config, call.tool_name, dict(tool.tool_args or {}))
+                    if tool.approval_type == POLICY_CONFIRMATION_APPROVAL_TYPE
+                    else None
+                ),
             )
             if card is None:
                 raise RuntimeError(failure_reason)
@@ -314,7 +354,7 @@ class ApprovalResponseCoordinator:
                 raise RuntimeError(failure_reason)
             continuation = refreshed
         if continuation.state == "ready":
-            self.retry_sources(continuation.source_event_ids)
+            self.retry_sources(continuation.room_id, continuation.source_event_ids)
 
     async def advance_pause(
         self,
@@ -327,7 +367,11 @@ class ApprovalResponseCoordinator:
         """Replace one claim with Agno's next exact pause generation."""
         require_ordered_pause_presentation(paused, show_tool_calls=current.show_tool_calls)
         identified = identify_approval_tools(paused, default_agent_name=current.entity_name)
-        plan = await self.plan_pause(identified, requester_id=current.requester_id)
+        plan = await self.plan_pause(
+            identified,
+            requester_id=current.requester_id,
+            toolkit_owners=paused.toolkit_owners,
+        )
         approval_pending = plan.waiting_text is not None
         visible_tool_trace = tuple(paused.tool_trace) if current.show_tool_calls else ()
         visible_text = paused.response_text or plan.waiting_text or pending_text
@@ -338,9 +382,13 @@ class ApprovalResponseCoordinator:
             run_id=paused.run_id,
             session_id=paused.session_id,
             calls=plan.calls,
+            runtime_model_name=paused.runtime_model_name,
+            continuation_count=max(current.continuation_count, paused.continuation_count),
             response_text=paused.response_text,
             response_tool_trace=serialize_tool_trace(paused.tool_trace, include_internal=True),
             response_presentation_state=paused.response_presentation_state,
+            delegation_storage_bindings=paused.delegation_storage_bindings,
+            cli_call=paused.cli_call,
         )
         if publishing is None:
             msg = "Could not persist the chained approval pause"
@@ -386,7 +434,7 @@ class ApprovalResponseCoordinator:
             expected_runtime_generation=continuation.runtime_generation,
         )
         if failing is not None:
-            self.retry_sources(failing.source_event_ids)
+            self.retry_sources(failing.room_id, failing.source_event_ids)
         return failing
 
     async def fail_publication(self, approval_id: str, *, reason: str) -> ApprovalContinuation | None:
@@ -408,17 +456,26 @@ class ApprovalResponseCoordinator:
             return True
         if await self.successful_final_delivery(current) is not None:
             return False
-        if current.state != "failing":
-            current = await self.request_failure(current, reason)
-            if current is None:
-                return False
         manager = approval_manager.get_approval_store()
-        if manager is None or not await manager.expire_continuation_cards(current.approval_id):
+        current = await prepare_approval_failure(
+            current,
+            reason,
+            request_failure=partial(self.request_failure, current),
+            expire_cards=None if manager is None else manager.expire_continuation_cards,
+        )
+        if current is None:
             return False
-        failed_delivery = await self.final_delivery(current)
-        if failed_delivery is not None and failed_delivery.permanently_failed:
-            return await self.store.finish_approval_continuation(current.approval_id)
-        visible_reason = visible_text or (_USER_STOP_VISIBLE_NOTE if reason == _USER_STOP_FAILURE_REASON else reason)
+        await cancel_approval_delegations(
+            current,
+            config=self.config(),
+            runtime_paths=self.runtime_paths,
+            reason=reason,
+        )
+        if await self.store.finish_approval_continuation(current.approval_id):
+            return True
+        visible_reason = visible_text or (
+            _USER_STOP_VISIBLE_NOTE if reason == _USER_STOP_FAILURE_REASON else redact_sensitive_text(reason)
+        )
         target = continuation_target(current)
         delivered = await self.delivery_gateway.edit_text(
             EditTextRequest(
@@ -427,10 +484,33 @@ class ApprovalResponseCoordinator:
                 new_text=visible_reason,
                 extra_content={STREAM_STATUS_KEY: stream_status},
                 delivery_turn_id=current.source_event_ids[0],
+                response_attempt=ResponseAttempt(current.entity_name, current.sources),
                 defer_source_handoff=True,
             ),
         )
         return delivered and await self.store.finish_approval_continuation(current.approval_id)
+
+    async def release_to_replay(self, continuation: ApprovalContinuation, reason: str) -> bool:
+        """End an interrupted continuation's cards and hand its pending sources back to ordinary replay."""
+        manager = approval_manager.get_approval_store()
+        current = await prepare_approval_failure(
+            continuation,
+            reason,
+            request_failure=partial(self.request_failure, continuation),
+            expire_cards=None if manager is None else manager.expire_continuation_cards,
+        )
+        if current is None:
+            return False
+        await cancel_approval_delegations(
+            current,
+            config=self.config(),
+            runtime_paths=self.runtime_paths,
+            reason=reason,
+        )
+        return await self.store.release_approval_continuation(
+            current.approval_id,
+            expected_generation=current.generation,
+        )
 
     async def successful_final_delivery(
         self,

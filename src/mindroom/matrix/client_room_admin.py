@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, MutableMapping
+from collections.abc import Callable, Iterable, MutableMapping
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import nio
 
 from mindroom.logging_config import get_logger
+from mindroom.matrix.event_types import CALL_MEMBER_EVENT_TYPE
+from mindroom.matrix.room_reconciliation import RoomStateSnapshot, read_state_event
 from mindroom.thread_tags import THREAD_TAGS_EVENT_TYPE
 
 if TYPE_CHECKING:
@@ -25,15 +28,9 @@ _DEFAULT_STATE_EVENT_POWER_LEVEL = 50
 _DEFAULT_USER_POWER_LEVEL = 0
 _POWER_USER_POWER_LEVEL = 50
 
-# Element Call membership state event (deployed MSC3401 flavor). Regular room
-# members must be able to publish it to join a call, so it is pinned to PL0 —
-# the same convention Element uses for call-capable rooms. Mirrors
-# ``mindroom.matrix_rtc.events.CALL_MEMBER_EVENT_TYPE`` (kept as a literal here
-# to avoid a core -> matrix_rtc dependency).
-_CALL_MEMBER_EVENT_TYPE = "org.matrix.msc3401.call.member"
 _MANAGED_ROOM_EVENT_POWER_LEVELS = {
     THREAD_TAGS_EVENT_TYPE: 0,
-    _CALL_MEMBER_EVENT_TYPE: 0,
+    CALL_MEMBER_EVENT_TYPE: 0,
 }
 _TERMINAL_ROOM_JOIN_ERROR_CODES = frozenset(
     {
@@ -48,6 +45,7 @@ class RoomJoinOutcome(StrEnum):
     """Typed outcome for one Matrix room join attempt."""
 
     JOINED = "joined"
+    ACCESS_DENIED = "access_denied"
     RETRYABLE_FAILURE = "retryable_failure"
     TERMINAL_FAILURE = "terminal_failure"
 
@@ -64,6 +62,25 @@ async def invite_to_room(
         return True
     logger.error("matrix_room_invite_failed", room_id=room_id, user_id=user_id, error=str(response))
     return False
+
+
+async def admin_join_room_user(client: nio.AsyncClient, room_id: str, user_id: str) -> bool:
+    """Join one user through the Synapse-compatible admin API without changing invites."""
+    if not client.access_token:
+        return False
+    path = f"/_synapse/admin/v1/join/{quote(room_id, safe='')}"
+    response = await client.send(
+        "POST",
+        path,
+        data=json.dumps({"user_id": user_id}),
+        headers={
+            "Authorization": f"Bearer {client.access_token}",
+            "Content-Type": "application/json",
+        },
+    )
+    succeeded = 200 <= response.status < 300
+    response.release()
+    return succeeded
 
 
 def _create_room_initial_state(
@@ -105,6 +122,7 @@ async def create_room(
     admin_users: list[str] | None = None,
     *,
     encrypted: bool = False,
+    initial_state: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Create a new Matrix room."""
     room_config: dict[str, Any] = {"name": name}
@@ -113,6 +131,8 @@ async def create_room(
     if topic:
         room_config["topic"] = topic
     room_config["initial_state"] = _create_room_initial_state(client, power_users, admin_users, encrypted=encrypted)
+    if initial_state:
+        room_config["initial_state"].extend(initial_state)
 
     response = await client.room_create(**room_config)
     if isinstance(response, nio.RoomCreateResponse):
@@ -127,9 +147,14 @@ async def create_room(
     return None
 
 
-async def room_encryption_enabled(client: nio.AsyncClient, room_id: str) -> bool | None:
+async def room_encryption_enabled(
+    client: nio.AsyncClient,
+    room_id: str,
+    *,
+    snapshot: RoomStateSnapshot | None = None,
+) -> bool | None:
     """Return whether a room has encryption enabled, or None when the state is unreadable."""
-    response = await client.room_get_state_event(room_id, _ROOM_ENCRYPTION_EVENT_TYPE)
+    response = await read_state_event(client, room_id, _ROOM_ENCRYPTION_EVENT_TYPE, snapshot=snapshot)
     if isinstance(response, nio.RoomGetStateEventResponse):
         return True
     if isinstance(response, nio.RoomGetStateEventError) and response.status_code == "M_NOT_FOUND":
@@ -138,13 +163,18 @@ async def room_encryption_enabled(client: nio.AsyncClient, room_id: str) -> bool
     return None
 
 
-async def ensure_room_encryption_enabled(client: nio.AsyncClient, room_id: str) -> bool:
+async def ensure_room_encryption_enabled(
+    client: nio.AsyncClient,
+    room_id: str,
+    *,
+    snapshot: RoomStateSnapshot | None = None,
+) -> bool:
     """Enable Matrix encryption on a room if it is not already enabled.
 
     Enabling encryption is irreversible; this helper never disables it.
     Returns whether the room is encrypted after the call.
     """
-    enabled = await room_encryption_enabled(client, room_id)
+    enabled = await room_encryption_enabled(client, room_id, snapshot=snapshot)
     if enabled:
         return True
     if enabled is None:
@@ -181,13 +211,15 @@ async def ensure_managed_room_power_levels(
     client: nio.AsyncClient,
     room_id: str,
     admin_user_ids: Iterable[str] = (),
+    *,
+    snapshot: RoomStateSnapshot | None = None,
 ) -> bool:
     """Reconcile managed-room power levels with one read-modify-write.
 
     Applies the PL0 state events used by MindRoom clients and grants configured
     room admins power level 100 in one conditional PUT.
     """
-    current_response = await client.room_get_state_event(room_id, _POWER_LEVELS_EVENT_TYPE)
+    current_response = await read_state_event(client, room_id, _POWER_LEVELS_EVENT_TYPE, snapshot=snapshot)
     if not isinstance(current_response, nio.RoomGetStateEventResponse):
         logger.error(
             "Failed to read room power levels for managed room reconciliation",
@@ -208,8 +240,7 @@ async def ensure_managed_room_power_levels(
     for event_type, power_level in _MANAGED_ROOM_EVENT_POWER_LEVELS.items():
         desired_content = _with_event_power_level(desired_content, event_type, power_level)
     concrete_admin_ids = {user_id for user_id in admin_user_ids if user_id}
-    if concrete_admin_ids:
-        desired_content = _with_room_admin_power_levels(desired_content, concrete_admin_ids)
+    desired_content = _with_room_admin_power_levels(desired_content, concrete_admin_ids)
     if desired_content == current_content:
         logger.debug(
             "Managed room power levels already configured",
@@ -217,6 +248,11 @@ async def ensure_managed_room_power_levels(
             admin_user_ids=sorted(concrete_admin_ids),
         )
         return True
+
+    if snapshot is not None:
+        # Topics and other policy operations may have awaited since this snapshot.
+        # A required read-modify-write must preserve current grants, not restore old ones.
+        return await ensure_managed_room_power_levels(client, room_id, concrete_admin_ids)
 
     response = await client.room_put_state(
         room_id=room_id,
@@ -307,34 +343,31 @@ async def room_admin_power_user(
     return None
 
 
-async def ensure_room_admin_power_levels(
+async def ensure_room_admin_power_levels(  # noqa: PLR0911 - each unsafe Matrix state is a separate fail-closed exit
     client: nio.AsyncClient,
     room_id: str,
     user_ids: Iterable[str],
+    *,
+    snapshot: RoomStateSnapshot | None = None,
+    write_allowed: Callable[[], bool] | None = None,
 ) -> bool:
-    """Grant Matrix room admin power to users without revoking existing admins."""
+    """Grant Matrix room admin power while respecting a caller's live write authority."""
     concrete_user_ids = {user_id for user_id in user_ids if user_id}
     if not concrete_user_ids:
         return True
 
-    current_response = await client.room_get_state_event(room_id, _POWER_LEVELS_EVENT_TYPE)
-    if not isinstance(current_response, nio.RoomGetStateEventResponse):
+    current_response = await read_state_event(client, room_id, _POWER_LEVELS_EVENT_TYPE, snapshot=snapshot)
+    if not isinstance(current_response, nio.RoomGetStateEventResponse) or not isinstance(
+        current_response.content,
+        dict,
+    ):
         logger.error(
-            "Failed to read room power levels for admin reconciliation",
+            "Failed to read valid room power levels for admin reconciliation",
             room_id=room_id,
             user_ids=sorted(concrete_user_ids),
             error=_describe_matrix_response_error(current_response),
         )
         return False
-    if not isinstance(current_response.content, dict):
-        logger.error(
-            "Room power levels state has unexpected content shape",
-            room_id=room_id,
-            user_ids=sorted(concrete_user_ids),
-            content=current_response.content,
-        )
-        return False
-
     current_content = current_response.content
     desired_content = _with_room_admin_power_levels(current_content, concrete_user_ids)
     if desired_content == current_content:
@@ -345,6 +378,12 @@ async def ensure_room_admin_power_levels(
             power_level=_ROOM_ADMIN_POWER_LEVEL,
         )
         return True
+
+    if snapshot is not None:
+        return await ensure_room_admin_power_levels(client, room_id, concrete_user_ids, write_allowed=write_allowed)
+
+    if write_allowed is not None and not write_allowed():
+        return False
 
     response = await client.room_put_state(
         room_id=room_id,
@@ -408,9 +447,14 @@ def _describe_matrix_response_error(response: object) -> str:
     return str(response)
 
 
-async def _get_room_join_rule(client: nio.AsyncClient, room_id: str) -> str | None:
+async def _get_room_join_rule(
+    client: nio.AsyncClient,
+    room_id: str,
+    *,
+    snapshot: RoomStateSnapshot | None = None,
+) -> str | None:
     """Read the current join rule from room state."""
-    response = await client.room_get_state_event(room_id, "m.room.join_rules")
+    response = await read_state_event(client, room_id, "m.room.join_rules", snapshot=snapshot)
     if isinstance(response, nio.RoomGetStateEventResponse):
         join_rule = response.content.get("join_rule")
         if isinstance(join_rule, str):
@@ -462,9 +506,11 @@ async def ensure_room_join_rule(
     client: nio.AsyncClient,
     room_id: str,
     target_join_rule: RoomJoinRule,
+    *,
+    snapshot: RoomStateSnapshot | None = None,
 ) -> bool:
     """Ensure a room has the desired join rule."""
-    current_join_rule = await _get_room_join_rule(client, room_id)
+    current_join_rule = await _get_room_join_rule(client, room_id, snapshot=snapshot)
     if current_join_rule == target_join_rule:
         logger.debug("Room join rule already configured", room_id=room_id, join_rule=target_join_rule)
         return True
@@ -551,9 +597,11 @@ async def ensure_room_name(
     client: nio.AsyncClient,
     room_id: str,
     name: str,
+    *,
+    snapshot: RoomStateSnapshot | None = None,
 ) -> bool:
     """Ensure a room or Space has the desired display name."""
-    current_response = await client.room_get_state_event(room_id, "m.room.name")
+    current_response = await read_state_event(client, room_id, "m.room.name", snapshot=snapshot)
     if isinstance(current_response, nio.RoomGetStateEventResponse) and current_response.content.get("name") == name:
         logger.debug("Room name already configured", room_id=room_id, name=name)
         return True
@@ -583,6 +631,7 @@ async def add_room_to_space(
     via_server_name: str,
     *,
     suggested: bool = True,
+    snapshot: RoomStateSnapshot | None = None,
 ) -> bool:
     """Ensure a room is linked as a child of a root Space."""
     desired_content = {
@@ -590,7 +639,7 @@ async def add_room_to_space(
         "suggested": suggested,
     }
 
-    current_response = await client.room_get_state_event(space_id, "m.space.child", room_id)
+    current_response = await read_state_event(client, space_id, "m.space.child", room_id, snapshot=snapshot)
     if isinstance(current_response, nio.RoomGetStateEventResponse) and current_response.content == desired_content:
         logger.debug("Room already linked under root space", space_id=space_id, room_id=room_id)
         return True
@@ -626,11 +675,12 @@ async def join_room(client: nio.AsyncClient, room_id: str) -> RoomJoinOutcome:
             )
         logger.info("matrix_room_joined", room_id=room_id)
         return RoomJoinOutcome.JOINED
-    outcome = (
-        RoomJoinOutcome.TERMINAL_FAILURE
-        if isinstance(response, nio.JoinError) and response.status_code in _TERMINAL_ROOM_JOIN_ERROR_CODES
-        else RoomJoinOutcome.RETRYABLE_FAILURE
-    )
+    if isinstance(response, nio.JoinError) and response.status_code in _TERMINAL_ROOM_JOIN_ERROR_CODES:
+        outcome = RoomJoinOutcome.TERMINAL_FAILURE
+    elif isinstance(response, nio.JoinError) and response.status_code == "M_FORBIDDEN":
+        outcome = RoomJoinOutcome.ACCESS_DENIED
+    else:
+        outcome = RoomJoinOutcome.RETRYABLE_FAILURE
     logger.warning(
         "matrix_room_join_failed",
         room_id=room_id,
@@ -700,6 +750,7 @@ async def leave_room(client: nio.AsyncClient, room_id: str) -> bool:
 __all__ = [
     "RoomJoinOutcome",
     "add_room_to_space",
+    "admin_join_room_user",
     "create_room",
     "create_space",
     "ensure_managed_room_power_levels",

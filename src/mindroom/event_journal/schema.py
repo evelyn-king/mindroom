@@ -52,6 +52,91 @@ POSTGRES_DIALECT = _SchemaDialect(
 
 _TABLES = (
     """
+    CREATE TABLE IF NOT EXISTS response_attempts (
+        principal_id TEXT NOT NULL,
+        driving_event_id TEXT NOT NULL,
+        entity_name TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        membership_epoch BIGINT NOT NULL,
+        response_event_id TEXT,
+        logical_source_key TEXT NOT NULL,
+        selected_receipt_order BIGINT NOT NULL,
+        edit_receipt_order BIGINT,
+        PRIMARY KEY (principal_id, driving_event_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS response_attempt_sources (
+        principal_id TEXT NOT NULL,
+        driving_event_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        source_ordinal BIGINT NOT NULL,
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('logical', 'discovery')),
+        PRIMARY KEY (principal_id, driving_event_id, source_kind, source_ordinal),
+        UNIQUE (principal_id, driving_event_id, source_kind, event_id),
+        FOREIGN KEY (principal_id, driving_event_id)
+            REFERENCES response_attempts (principal_id, driving_event_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS approval_grant_locks (
+        principal_id TEXT PRIMARY KEY
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS approval_grant_cards (
+        principal_id TEXT NOT NULL,
+        continuation_id TEXT NOT NULL,
+        continuation_generation BIGINT NOT NULL,
+        tool_call_id TEXT NOT NULL,
+        delivery_id TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        requester_id TEXT NOT NULL,
+        entity_name TEXT NOT NULL,
+        invoking_agent TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        responder_principal_id TEXT NOT NULL,
+        responder_epoch BIGINT NOT NULL,
+        membership_epoch BIGINT NOT NULL,
+        grant_id TEXT,
+        PRIMARY KEY (principal_id, delivery_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS approval_grants (
+        principal_id TEXT NOT NULL,
+        grant_id TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        card_event_id TEXT NOT NULL,
+        requester_id TEXT NOT NULL,
+        entity_name TEXT NOT NULL,
+        invoking_agent TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        responder_principal_id TEXT NOT NULL,
+        responder_epoch BIGINT NOT NULL,
+        membership_epoch BIGINT NOT NULL,
+        expires_at_ns BIGINT NOT NULL,
+        revoked_at_ns BIGINT,
+        resolution_json TEXT NOT NULL,
+        original_delivery_id TEXT NOT NULL,
+        PRIMARY KEY (principal_id, grant_id),
+        UNIQUE (principal_id, card_event_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS matrix_sync_consumers (
+        principal_id TEXT NOT NULL PRIMARY KEY,
+        consumer_generation TEXT NOT NULL,
+        stream_id TEXT UNIQUE,
+        next_sequence BIGINT NOT NULL DEFAULT 1
+            CHECK (next_sequence >= 0 AND next_sequence <= 9223372036854775807)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS journal_events (
         receipt_order {receipt_order_column},
         principal_id TEXT NOT NULL,
@@ -69,6 +154,25 @@ _TABLES = (
         membership_epoch BIGINT NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('pending', 'settled')),
         UNIQUE (principal_id, event_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS room_member_joins (
+        principal_id TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        baseline_receipt_order BIGINT,
+        completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+        PRIMARY KEY (principal_id, room_id, user_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS matrix_ingestion_membership (
+        principal_id TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        membership TEXT NOT NULL CHECK (membership IN ('join', 'leave')),
+        membership_epoch BIGINT NOT NULL CHECK (membership_epoch >= 0),
+        PRIMARY KEY (principal_id, room_id)
     )
     """,
     """
@@ -112,39 +216,9 @@ _TABLES = (
         principal_id TEXT NOT NULL,
         room_id TEXT NOT NULL,
         membership_epoch BIGINT NOT NULL,
-        -- A departure has been fenced and the bot has not been seen back in
-        -- the room since. The bot cannot leave a room it is not in, so a
-        -- second local departure while this holds is the same one arriving
-        -- twice rather than a new one.
+        -- Application work may run only within an active membership tenure.
         departure_fenced INTEGER NOT NULL DEFAULT 0,
-        -- Departures already fenced locally whose sync report has not arrived.
-        -- A count rather than a flag: leave/rejoin/leave owes two reports, and
-        -- one bit would let the second echo fence a membership it did not end.
-        owed_departure_reports BIGINT NOT NULL DEFAULT 0,
         PRIMARY KEY (principal_id, room_id)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS reported_departures (
-        report_order {receipt_order_column},
-        -- Matrix may replay an old leave after a later join has re-armed the
-        -- room. Event identity, or the sync token when the event was omitted,
-        -- keeps that replay from fencing again.
-        principal_id TEXT NOT NULL,
-        observation_id {ordered_text} NOT NULL,
-        room_id TEXT NOT NULL,
-        -- The latest journal receipt visible when this observation arrived.
-        -- Synthetic sync-token observations have no event row of their own,
-        -- so this is what still orders a later explicit join after them.
-        journal_order BIGINT NOT NULL,
-        -- Consecutive leave/ban observations are aliases for one ended
-        -- membership. They share its epoch so only the run's first observation
-        -- consumes a locally owed report.
-        run_epoch BIGINT NOT NULL,
-        -- A join closes the whole alias run. Keeping closure beside every
-        -- alias lets any replayed subset recover the same answer.
-        run_closed INTEGER NOT NULL DEFAULT 0,
-        UNIQUE (principal_id, observation_id)
     )
     """,
     """
@@ -219,6 +293,10 @@ _TABLES = (
         room_id TEXT NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('repairable', 'truncated', 'repaired')),
         revision BIGINT NOT NULL DEFAULT 0,
+        -- The widest bounded walk spent on this exact missing interval. A new
+        -- revision resets it because an older gap says nothing about the new
+        -- one; a wider caller may then make exactly one sequential attempt.
+        attempted_policy_rank BIGINT NOT NULL DEFAULT 0,
         PRIMARY KEY (principal_id, room_id)
     )
     """,
@@ -327,6 +405,8 @@ _TABLES = (
         decision TEXT CHECK (decision IS NULL OR decision IN ('approved', 'denied', 'expired')),
         reason TEXT,
         human_approval_required BOOLEAN,
+        toolkit_name TEXT,
+        arguments_digest TEXT,
         PRIMARY KEY (principal_id, approval_id, generation, tool_call_id),
         UNIQUE (principal_id, approval_id, generation, call_ordinal),
         FOREIGN KEY (principal_id, approval_id)
@@ -353,13 +433,8 @@ _TABLES = (
     """,
     """
     CREATE TABLE IF NOT EXISTS journal_identity (
-        -- One row, ever. A Matrix sync token is only meaningful next to the
-        -- store that consumed the events it already covers: resuming from a
-        -- token saved before this database was created would skip every event
-        -- between, and nothing downstream would notice the gap. The generation
-        -- is written once when the store is first opened and never rewritten,
-        -- so a checkpoint that names a different one is from a database that
-        -- no longer exists.
+        -- Stable database identity checked against the install's journal
+        -- binding before opening its turn, delivery, and recovery state.
         singleton BOOLEAN NOT NULL PRIMARY KEY,
         generation TEXT NOT NULL
     )
@@ -369,9 +444,20 @@ _TABLES = (
 
 _INDEXES = (
     """
-    CREATE INDEX IF NOT EXISTS reported_departures_open
-    ON reported_departures (principal_id, room_id, report_order)
-    WHERE run_closed = 0
+    CREATE INDEX IF NOT EXISTS response_attempt_identity ON response_attempts (
+        principal_id, room_id, membership_epoch, response_event_id, entity_name,
+        edit_receipt_order
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS response_attempt_source_lookup
+        ON response_attempt_sources (principal_id, event_id, driving_event_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS approval_grants_scope ON approval_grants (principal_id, scope_key, expires_at_ns)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS approval_grant_cards_scope ON approval_grant_cards (principal_id, scope_key)
     """,
     """
     CREATE INDEX IF NOT EXISTS interactive_selections_revision
@@ -380,6 +466,11 @@ _INDEXES = (
     """
     CREATE INDEX IF NOT EXISTS journal_events_pending
     ON journal_events (principal_id, receipt_order)
+    WHERE state = 'pending'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS journal_events_pending_room
+    ON journal_events (principal_id, room_id, receipt_order)
     WHERE state = 'pending'
     """,
     """
@@ -398,6 +489,12 @@ _INDEXES = (
     """
     CREATE INDEX IF NOT EXISTS visible_messages_revision
     ON visible_messages (principal_id, room_id, revision_event_id)
+    """,
+    """
+    -- A redaction blanks the held edit it names, so its cost must not grow
+    -- with how many edits a room member left waiting on absent targets.
+    CREATE INDEX IF NOT EXISTS unresolved_edits_edit_event
+    ON unresolved_edits (principal_id, room_id, edit_event_id)
     """,
     """
     CREATE INDEX IF NOT EXISTS visible_messages_refresh
@@ -430,6 +527,10 @@ _INDEXES = (
     """
     CREATE INDEX IF NOT EXISTS approval_continuations_owner_scan
     ON approval_continuations (entity_name/*bytes*/, approval_id/*bytes*/)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS turn_records_anchor
+    ON turn_records (agent_name, anchor_event_id)
     """,
 )
 

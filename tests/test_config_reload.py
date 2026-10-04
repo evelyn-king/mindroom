@@ -14,12 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
+from structlog.testing import capture_logs
 
+import mindroom.matrix.rooms as matrix_rooms
 import mindroom.orchestrator as orchestrator_module
 import mindroom.tool_system.plugin_imports as plugin_module
 from mindroom.bot import AgentBot
-from mindroom.config.agent import AgentConfig, CultureConfig, RoomConfig, TeamConfig
-from mindroom.config.calls import CallsConfig, CascadedCallProfile, RealtimeCallProfile
+from mindroom.config.agent import AgentConfig, RoomConfig, TeamConfig
+from mindroom.config.calls import CallsConfig, CascadedCallProfile, LiveCallProfile, RealtimeCallProfile
 from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig, RouterConfig
@@ -28,6 +30,7 @@ from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.delivery_gateway import SendTextRequest
 from mindroom.file_watcher import _tree_snapshot
 from mindroom.hooks import EVENT_MESSAGE_RECEIVED, HookRegistry
+from mindroom.matrix import client_room_admin
 from mindroom.matrix.client_room_admin import RoomJoinOutcome
 from mindroom.matrix.state import MatrixState
 from mindroom.matrix.users import AgentMatrixUser
@@ -41,6 +44,7 @@ from mindroom.orchestration.runtime import log_startup_phase_finished, log_start
 from mindroom.orchestrator import _MultiAgentOrchestrator, _watch_skills_task
 from mindroom.response_admission import ResponseAdmissionGate, ResponseAdmissionRefusedError
 from mindroom.response_runner import ResponseRequest
+from mindroom.response_sources import ResponseSources
 from mindroom.runtime_shutdown import SYNC_RESTART_SHUTDOWN
 from mindroom.startup_errors import PermanentStartupError
 from mindroom.tool_system.plugins import PluginReloadResult
@@ -58,7 +62,7 @@ from tests.conftest import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from mindroom.message_target import MessageTarget
 
@@ -84,7 +88,21 @@ def _calls_for(
     )
 
 
-def _cascaded_calls_for(agent_name: str, *, model: str | None) -> CallsConfig:
+def _delegated_calls_for(agent_name: str, *, model: str | None, backend: str) -> CallsConfig:
+    if backend == "live":
+        return CallsConfig(
+            enabled=True,
+            profiles={
+                "voice": LiveCallProfile(
+                    backend="live",
+                    model="gpt-live-1",
+                    credentials_service="openai_live",
+                    voice="marin",
+                    agent_model=model,
+                ),
+            },
+            agents={agent_name: "voice"},
+        )
     speech_service = SpeechServiceConfig(
         provider="openai_compatible",
         model="local-speech",
@@ -112,7 +130,18 @@ def _runtime_bound_config(config: Config, runtime_root: Path | None = None) -> C
 
 def setup_test_bot(bot: AgentBot, mock_client: AsyncMock) -> None:
     """Helper to setup a test bot with required attributes."""
+
+    async def change_membership(room_id: str, target_membership: str) -> bool:
+        if target_membership == "join":
+            return await client_room_admin.join_room(mock_client, room_id) is RoomJoinOutcome.JOINED
+        assert target_membership == "leave"
+        return await matrix_rooms.leave_room(mock_client, room_id)
+
     bot.client = mock_client
+    bot._room_lifecycle.deps = replace(
+        bot._room_lifecycle.deps,
+        change_membership=change_membership,
+    )
 
 
 def test_startup_phase_logging_helpers_emit_structured_timing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,7 +227,7 @@ def _write_plugin_removal_test_files(tmp_path: Path) -> Path:
 def _write_plugin_removal_test_config(tmp_path: Path, *, with_plugin: bool) -> None:
     """Write one minimal config for config-reload plugin teardown tests."""
     config_data = {
-        "models": {"default": {"provider": "anthropic", "id": "claude-sonnet-4-6"}},
+        "models": {"default": {"provider": "anthropic", "id": "claude-sonnet-5"}},
         "router": {"model": "default"},
         "agents": {
             "assistant": {
@@ -208,7 +237,7 @@ def _write_plugin_removal_test_config(tmp_path: Path, *, with_plugin: bool) -> N
                 "rooms": ["lobby"],
             },
         },
-        "authorization": {"global_users": ["@owner:localhost"]},
+        "administrators": ["@owner:localhost"],
         "plugins": [{"path": "./plugins/removed-task-plugin"}] if with_plugin else [],
     }
     (tmp_path / "config.yaml").write_text(
@@ -1424,6 +1453,84 @@ async def test_update_config_cancels_tasks_for_removed_plugins(
 
 
 @pytest.mark.asyncio
+async def test_initialize_and_reload_warn_about_foreign_homeserver_authorities(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Startup and every applied reload must name authorities homed on another homeserver."""
+    warning = (
+        "Administrators, room invitees, or room admins are on another homeserver; remove them unless you trust them"
+    )
+
+    def write_config(*, administrators: list[str], invite_users: list[str]) -> None:
+        config_data = {
+            "models": {"default": {"provider": "anthropic", "id": "claude-sonnet-5"}},
+            "router": {"model": "default"},
+            "agents": {"assistant": {"display_name": "Assistant", "model": "default", "rooms": ["lobby"]}},
+            "administrators": administrators,
+            "room_defaults": {"invite_users": invite_users},
+        }
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+
+    _patch_orchestrator_plugin_update_test_runtime(monkeypatch)
+    write_config(administrators=["@owner:localhost"], invite_users=["@test:m-test-4.mindroom.chat"])
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=orchestrator_runtime_paths(tmp_path))
+    with capture_logs() as startup_logs:
+        await orchestrator.initialize()
+
+    write_config(administrators=["@owner:localhost", "@admin:remote.example"], invite_users=["@owner:localhost"])
+    with capture_logs() as reload_logs:
+        updated = await orchestrator.config_reload._update_config()
+
+    assert updated is True
+    assert [log["user_ids"] for log in startup_logs if log["event"] == warning] == [["@test:m-test-4.mindroom.chat"]]
+    assert [log["user_ids"] for log in reload_logs if log["event"] == warning] == [["@admin:remote.example"]]
+
+
+@pytest.mark.asyncio
+async def test_initialize_and_reload_warn_about_unrestricted_file_access_next_to_worker_code_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Startup and every applied reload must flag path tools that can bypass a worker-isolated shell."""
+    warning = (
+        "Agent isolates code tools in a worker, but primary-process tools that are not confined "
+        "by file_access can read runtime secrets"
+    )
+
+    def write_config(agent_name: str) -> None:
+        config_data = {
+            "models": {"default": {"provider": "anthropic", "id": "claude-sonnet-5"}},
+            "router": {"model": "default"},
+            "agents": {
+                agent_name: {
+                    "display_name": agent_name.title(),
+                    "model": "default",
+                    "rooms": ["lobby"],
+                    "tools": ["shell", "gmail"],
+                    "worker_tools": ["shell"],
+                    "file_access": "unrestricted",
+                },
+            },
+        }
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+
+    _patch_orchestrator_plugin_update_test_runtime(monkeypatch)
+    write_config("coder")
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=orchestrator_runtime_paths(tmp_path))
+    with capture_logs() as startup_logs:
+        await orchestrator.initialize()
+
+    write_config("builder")
+    with capture_logs() as reload_logs:
+        updated = await orchestrator.config_reload._update_config()
+
+    assert updated is True
+    assert [log["agent"] for log in startup_logs if log["event"] == warning] == ["coder"]
+    assert [log["agent"] for log in reload_logs if log["event"] == warning] == ["builder"]
+
+
+@pytest.mark.asyncio
 async def test_update_config_serializes_live_plugin_reload_against_staged_plugin_commit(
     tmp_path: Path,
 ) -> None:
@@ -1474,7 +1581,7 @@ async def test_update_config_serializes_live_plugin_reload_against_staged_plugin
         new_entities=set(),
         removed_entities=set(),
         mindroom_user_changed=False,
-        matrix_room_access_changed=False,
+        room_access_changed=False,
         matrix_space_changed=False,
         authorization_changed=False,
     )
@@ -1630,6 +1737,10 @@ async def test_queued_config_reload_waits_for_in_flight_response_without_event_i
 
     runner = unwrap_extracted_collaborator(bot._response_runner)
     request = ResponseRequest(
+        sources=ResponseSources(
+            pending_event_ids=("$reply",),
+            logical_source_event_ids=("$reply",),
+        ),
         thread_history=(),
         prompt="Hello",
         response_envelope=request_envelope(
@@ -1696,39 +1807,53 @@ async def test_queued_config_reload_waits_for_in_flight_response_without_event_i
         await orchestrator.config_reload.cancel()
 
 
-def test_get_changed_agents_detects_culture_config_updates() -> None:
-    """Agent restarts should trigger when their culture mode/assignment changes."""
-    old_config = _runtime_bound_config(
-        Config(
-            agents={
-                "agent1": AgentConfig(display_name="Agent 1"),
+@pytest.mark.parametrize(
+    ("old_settings", "new_settings"),
+    [(None, {}), ({}, None), ({}, {"decline_reaction": "👍"}), ({}, {"debounce_seconds": 0})],
+)
+def test_participation_changes_restart_only_owning_agent(
+    old_settings: dict[str, object] | None,
+    new_settings: dict[str, object] | None,
+) -> None:
+    """Enabling, disabling, and tuning participation must refresh the owning agent."""
+    configs = [
+        Config.model_validate(
+            {
+                "agents": {
+                    "helper": {"display_name": "Helper", "participation": settings},
+                    "other": {"display_name": "Other"},
+                },
             },
-            cultures={
-                "engineering": CultureConfig(
-                    description="Engineering standards",
-                    agents=["agent1"],
-                    mode="automatic",
-                ),
-            },
-        ),
-    )
-    new_config = _runtime_bound_config(
-        Config(
-            agents={
-                "agent1": AgentConfig(display_name="Agent 1"),
-            },
-            cultures={
-                "engineering": CultureConfig(
-                    description="Engineering standards",
-                    agents=["agent1"],
-                    mode="agentic",
-                ),
-            },
-        ),
-    )
+        )
+        for settings in (old_settings, new_settings)
+    ]
+    assert _get_changed_agents(configs[0], configs[1], agent_bots={}) == {"helper"}
 
-    changed = _get_changed_agents(old_config, new_config, agent_bots={"agent1": AsyncMock()})
-    assert changed == {"agent1"}
+
+@pytest.mark.parametrize(
+    ("old_settings", "new_settings"),
+    [(None, {}), ({}, None), ({}, {"defer_reaction": "👍"}), ({}, {"instructions": "Continue for thanks"})],
+)
+def test_mid_turn_changes_restart_only_owning_agent(
+    old_settings: dict[str, object] | None,
+    new_settings: dict[str, object] | None,
+) -> None:
+    """Enabling, disabling, and tuning mid_turn must refresh the owning agent."""
+    configs = [
+        Config.model_validate(
+            {
+                "agents": {
+                    "helper": {
+                        "display_name": "Helper",
+                        "mid_turn": None if settings is None else {"judgment": {"provider": "typesafe"}, **settings},
+                    },
+                    "other": {"display_name": "Other"},
+                },
+            },
+        )
+        for settings in (old_settings, new_settings)
+    ]
+    assert _get_changed_agents(configs[0], configs[1], agent_bots={}) == {"helper"}
 
 
 def test_get_changed_agents_detects_tool_override_updates() -> None:
@@ -2012,13 +2137,13 @@ def test_config_update_plan_restarts_call_agent_when_profile_voice_changes() -> 
     assert plan.entities_to_restart == {"general"}
 
 
-def test_config_update_plan_restarts_call_agents_when_authorization_changes() -> None:
-    """Call tool contexts rebuild so authorization changes cannot leave stale policy."""
+def test_config_update_plan_restarts_call_agents_when_administrators_change() -> None:
+    """Call tool contexts rebuild so administrator changes cannot leave stale policy."""
     old_config = _runtime_bound_config(
         Config(
             agents={"general": AgentConfig(display_name="General Agent")},
             calls=_calls_for("general"),
-            authorization={"global_users": ["@allowed:example.org"]},
+            administrators=["@allowed:example.org"],
             router=RouterConfig(model="default"),
         ),
     )
@@ -2026,7 +2151,7 @@ def test_config_update_plan_restarts_call_agents_when_authorization_changes() ->
         Config(
             agents={"general": AgentConfig(display_name="General Agent")},
             calls=_calls_for("general"),
-            authorization={"global_users": ["@replacement:example.org"]},
+            administrators=["@replacement:example.org"],
             router=RouterConfig(model="default"),
         ),
     )
@@ -2135,8 +2260,9 @@ def test_config_update_plan_restarts_call_agent_when_worker_routing_changes() ->
     assert plan.entities_to_restart == {"general"}
 
 
-def test_config_update_plan_restarts_cascaded_call_agent_when_referenced_model_changes() -> None:
-    """An active cascaded call rebuilds when its named model definition changes."""
+@pytest.mark.parametrize("backend", ["cascaded", "live"])
+def test_config_update_plan_restarts_delegated_call_agent_when_referenced_model_changes(backend: str) -> None:
+    """An active delegated call rebuilds when its named model definition changes."""
     old_config = _runtime_bound_config(
         Config(
             agents={"general": AgentConfig(display_name="General Agent")},
@@ -2144,7 +2270,7 @@ def test_config_update_plan_restarts_cascaded_call_agent_when_referenced_model_c
                 "default": ModelConfig(provider="openai", id="default-model"),
                 "call": ModelConfig(provider="openai", id="old-model"),
             },
-            calls=_cascaded_calls_for("general", model="call"),
+            calls=_delegated_calls_for("general", model="call", backend=backend),
             router=RouterConfig(model="default"),
         ),
     )
@@ -2155,7 +2281,7 @@ def test_config_update_plan_restarts_cascaded_call_agent_when_referenced_model_c
                 "default": ModelConfig(provider="openai", id="default-model"),
                 "call": ModelConfig(provider="openai", id="new-model"),
             },
-            calls=_cascaded_calls_for("general", model="call"),
+            calls=_delegated_calls_for("general", model="call", backend=backend),
             router=RouterConfig(model="default"),
         ),
     )
@@ -2203,8 +2329,9 @@ def test_config_update_plan_restarts_realtime_call_agent_when_agent_model_change
     assert plan.entities_to_restart == {"general"}
 
 
-def test_config_update_plan_restarts_implicit_cascaded_call_agent_when_room_model_changes() -> None:
-    """Implicit cascaded model selection rebuilds when configured room routing changes."""
+@pytest.mark.parametrize("backend", ["cascaded", "live"])
+def test_config_update_plan_restarts_implicit_delegated_call_agent_when_room_model_changes(backend: str) -> None:
+    """Implicit delegated model selection rebuilds when configured room routing changes."""
     models = {
         "default": ModelConfig(provider="openai", id="default-model"),
         "focused": ModelConfig(provider="openai", id="focused-model"),
@@ -2215,7 +2342,7 @@ def test_config_update_plan_restarts_implicit_cascaded_call_agent_when_room_mode
             agents={"general": AgentConfig(display_name="General Agent", rooms=["lobby"])},
             models=models,
             room_models={"lobby": "focused"},
-            calls=_cascaded_calls_for("general", model=None),
+            calls=_delegated_calls_for("general", model=None, backend=backend),
             router=RouterConfig(model="default"),
         ),
     )
@@ -2224,7 +2351,7 @@ def test_config_update_plan_restarts_implicit_cascaded_call_agent_when_room_mode
             agents={"general": AgentConfig(display_name="General Agent", rooms=["lobby"])},
             models=models,
             room_models={"lobby": "fast"},
-            calls=_cascaded_calls_for("general", model=None),
+            calls=_delegated_calls_for("general", model=None, backend=backend),
             router=RouterConfig(model="default"),
         ),
     )
@@ -2244,7 +2371,7 @@ def test_config_update_plan_restarts_implicit_cascaded_call_agent_when_room_mode
 @pytest.mark.parametrize(
     "encryption_config",
     [
-        {"matrix_room_access": {"encrypt_managed_rooms": True}},
+        {"room_defaults": {"encrypted": True}},
         {"rooms": {"lobby": {"encrypted": True}}},
     ],
 )
@@ -2599,7 +2726,7 @@ async def test_agent_joins_new_rooms_on_config_reload(  # noqa: C901
         left_rooms[user_id].append(room_id)
         return True
 
-    monkeypatch.setattr("mindroom.bot_room_lifecycle.join_room", mock_join_room)
+    monkeypatch.setattr("mindroom.matrix.client_room_admin.join_room", mock_join_room)
     monkeypatch.setattr("mindroom.matrix.rooms.leave_room", mock_leave_room)
 
     # Mock restore_scheduled_tasks
@@ -2682,7 +2809,7 @@ async def test_router_updates_rooms_on_config_reload(
         left_rooms.append(room_id)
         return True
 
-    monkeypatch.setattr("mindroom.bot_room_lifecycle.join_room", mock_join_room)
+    monkeypatch.setattr("mindroom.matrix.client_room_admin.join_room", mock_join_room)
     monkeypatch.setattr("mindroom.matrix.rooms.leave_room", mock_leave_room)
 
     # Mock restore_scheduled_tasks
@@ -2692,7 +2819,10 @@ async def test_router_updates_rooms_on_config_reload(
         _config: Config,
         _runtime_paths: object,
         _conversation_reader: object,
+        *,
+        config_provider: Callable[[], Config | None] | None = None,
     ) -> int:
+        del config_provider
         return 0
 
     monkeypatch.setattr("mindroom.bot.restore_scheduled_tasks", mock_restore_scheduled_tasks)
@@ -2762,7 +2892,7 @@ async def test_new_agent_joins_rooms_on_config_reload(
         joined_rooms[user_id].append(room_id)
         return RoomJoinOutcome.JOINED
 
-    monkeypatch.setattr("mindroom.bot_room_lifecycle.join_room", mock_join_room)
+    monkeypatch.setattr("mindroom.matrix.client_room_admin.join_room", mock_join_room)
 
     # Mock restore_scheduled_tasks
     async def mock_restore_scheduled_tasks(
@@ -2835,7 +2965,7 @@ async def test_team_room_changes_on_config_reload(
         left_rooms[user_id].append(room_id)
         return True
 
-    monkeypatch.setattr("mindroom.bot_room_lifecycle.join_room", mock_join_room)
+    monkeypatch.setattr("mindroom.matrix.client_room_admin.join_room", mock_join_room)
     monkeypatch.setattr("mindroom.matrix.rooms.leave_room", mock_leave_room)
 
     # Mock restore_scheduled_tasks
@@ -3042,7 +3172,7 @@ async def test_room_membership_state_after_config_update(  # noqa: C901, PLR0915
         update_room_membership(client.user_id, room_id, "leave")
         return True
 
-    monkeypatch.setattr("mindroom.bot_room_lifecycle.join_room", mock_join_room)
+    monkeypatch.setattr("mindroom.matrix.client_room_admin.join_room", mock_join_room)
     monkeypatch.setattr("mindroom.matrix.rooms.leave_room", mock_leave_room)
 
     # Mock restore_scheduled_tasks
@@ -3052,7 +3182,10 @@ async def test_room_membership_state_after_config_update(  # noqa: C901, PLR0915
         _config: Config,
         _runtime_paths: object,
         _conversation_reader: object,
+        *,
+        config_provider: Callable[[], Config | None] | None = None,
     ) -> int:
+        del config_provider
         return 0
 
     monkeypatch.setattr("mindroom.bot.restore_scheduled_tasks", mock_restore_scheduled_tasks)
@@ -3179,6 +3312,10 @@ async def test_in_flight_response_count_nonzero_during_send_response(
 
     runner = unwrap_extracted_collaborator(bot._response_runner)
     request = ResponseRequest(
+        sources=ResponseSources(
+            pending_event_ids=("$reply",),
+            logical_source_event_ids=("$reply",),
+        ),
         thread_history=(),
         prompt="Hello",
         response_envelope=request_envelope(
@@ -3267,6 +3404,10 @@ async def test_in_flight_response_count_stays_per_entity_across_bots(
     task = asyncio.create_task(
         busy_runner._run_locked_response_lifecycle(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$reply",),
+                    logical_source_event_ids=("$reply",),
+                ),
                 thread_history=(),
                 prompt="Hello",
                 response_envelope=request_envelope(
@@ -3327,6 +3468,10 @@ async def test_closed_admission_defers_response_until_gate_reopens(
     task = asyncio.create_task(
         runner._run_locked_response_lifecycle(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$reply",),
+                    logical_source_event_ids=("$reply",),
+                ),
                 thread_history=(),
                 prompt="Hello",
                 response_envelope=request_envelope(
@@ -3389,6 +3534,10 @@ async def test_replaced_runtime_refuses_deferred_response_without_matrix_io(
     task = bot._response_runner.track_inbox_response(
         bot._response_runner.generate_response(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$reply",),
+                    logical_source_event_ids=("$reply",),
+                ),
                 thread_history=(),
                 prompt="Hello",
                 response_envelope=request_envelope(
@@ -3400,6 +3549,7 @@ async def test_replaced_runtime_refuses_deferred_response_without_matrix_io(
         ),
         name="test_reload_admission_race",
         recovery_proof_ready=lambda: False,
+        room_id="!room:example.org",
     )
     try:
         await asyncio.sleep(0)
@@ -3448,6 +3598,10 @@ async def test_shutdown_during_active_drain_cancels_reload(
     orchestrator.running = True
 
     mock_bot = MagicMock(spec=AgentBot)
+    mock_bot.pending_response_owner_count = 0
+    mock_bot.pending_response_phase_counts = {}
+    mock_bot.deferred_stop_phase = None
+    mock_bot.deferred_stop_required = False
     mock_bot.stop = AsyncMock()
     orchestrator.agent_bots["agent1"] = mock_bot
     # An admitted response that never finishes, so the drain never goes idle.

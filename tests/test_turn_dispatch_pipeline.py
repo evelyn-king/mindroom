@@ -14,14 +14,13 @@ import pytest
 from mindroom.coalescing import ReadyPendingEvent
 from mindroom.coalescing_batch import CoalescingKey, PendingEvent, RequesterCoalescingOwner
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
-from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import (
     ORIGINAL_SENDER_KEY,
     ROUTER_AGENT_NAME,
     SOURCE_KIND_KEY,
-    STREAM_STATUS_COMPLETED,
+    STREAM_STATUS_ERROR,
     STREAM_STATUS_KEY,
     RuntimePaths,
 )
@@ -32,9 +31,8 @@ from mindroom.delivery_gateway import (
     ResponseIdentity,
     SendTextRequest,
 )
-from mindroom.dispatch_handoff import PendingDispatchMetadata, PreparedIngress
+from mindroom.dispatch_handoff import PreparedIngress
 from mindroom.dispatch_source import (
-    AUTO_RESUME_MESSAGE,
     EXTERNAL_TRIGGER_SOURCE_KIND,
     MESSAGE_SOURCE_KIND,
     TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
@@ -46,7 +44,8 @@ from mindroom.handled_turns import TurnRecord
 from mindroom.hooks import (
     MessageEnvelope,
 )
-from mindroom.inbound_turn_normalizer import DispatchPayload
+from mindroom.inbound_turn_normalizer import DispatchPayload, InboundTurnNormalizer, _VoiceNormalizationResult
+from mindroom.ingress_lanes import IngressRetryError
 from mindroom.matrix.client import ResolvedVisibleMessage
 from mindroom.matrix.client_delivery import MatrixDeliveryFailure, MatrixDeliveryFailureKind
 from mindroom.matrix.conversation_hydration import HYDRATED_PROMPT_WINDOW_MESSAGES
@@ -61,10 +60,13 @@ from mindroom.response_runner import (
     ResponseRunner,
     _ResponseGenerationOutcome,
 )
+from mindroom.response_sources import ResponseSources
 from mindroom.teams import TeamIntent, TeamMode, TeamResolution
 from mindroom.text_ingress_dispatch import _run_claimed_response
-from mindroom.turn_controller import _IngressAdmissionOutcome, _PrecheckedEvent, _ReadyVoiceFallback
+from mindroom.turn_controller import _IngressAdmissionOutcome, _PrecheckedEvent
 from mindroom.turn_policy import PreparedDispatch, ResponseAction, _DispatchPlan
+from mindroom.voice_readiness import VoiceReadiness
+from tests.access_schema_support import with_current_room_member_access
 from tests.bot_helpers import (
     AgentBotTestBase,
     _agent_response_handled_turn,
@@ -91,7 +93,6 @@ from tests.conftest import (
     install_generate_response_mock,
     install_runtime_journal_support,
     install_send_response_mock,
-    make_pending_event,
     message_origin,
     patch_response_runner_module,
     prepared_dispatch_result,
@@ -102,6 +103,7 @@ from tests.conftest import (
     wrap_extracted_collaborators,
 )
 from tests.identity_helpers import entity_ids
+from tests.response_attempt_helpers import install_direct_response_admission
 from tests.threading_helpers import seed_hydrated_conversation, seed_thread_history
 from tests.turn_dispatch_helpers import dispatch_test_turn
 
@@ -167,65 +169,54 @@ class TestAgentBot(AgentBotTestBase):
             body="🎤 [Attached voice message]",
             source=voice_event.source,
         )
-        fallback_cleanup = MagicMock()
-        fallback = _ReadyVoiceFallback(
-            event=fallback_event,
-            ready=ReadyPendingEvent(
-                pending_event=make_pending_event(
-                    fallback_event,
-                    room,
-                    source_kind=VOICE_SOURCE_KIND,
-                    requester_user_id=voice_event.sender,
-                    dispatch_metadata=(
-                        PendingDispatchMetadata(
-                            kind="fallback_cleanup",
-                            payload=None,
-                            close=fallback_cleanup,
-                        ),
-                    ),
-                ),
-            ),
-        )
-
         turn_claim = TurnRecord.create([voice_event.event_id], completed=False)
         assert controller.deps.turn_store.try_claim_turn(turn_claim)
 
         with (
             patch.object(
-                controller,
-                "_normalize_voice_event_or_fallback",
+                InboundTurnNormalizer,
+                "prepare_voice_event",
                 new=AsyncMock(side_effect=RuntimeError("normalization failed")),
             ),
             patch.object(
-                controller,
-                "_ready_voice_fallback_event",
-                new=AsyncMock(return_value=fallback),
+                InboundTurnNormalizer,
+                "prepare_raw_voice_fallback_event",
+                new=AsyncMock(return_value=_VoiceNormalizationResult(event=fallback_event)),
             ),
             patch.object(
                 controller.deps.visible_voice_echo,
                 "await_publication",
                 new=AsyncMock(return_value=False),
             ) as await_publication,
+            pytest.raises(IngressRetryError),
         ):
-            result = await controller._ready_voice_event(
+            await controller._ready_voice_event(
                 room=room,
                 prechecked_event=_PrecheckedEvent(
                     event=voice_event,
                     requester_user_id=voice_event.sender,
                 ),
                 voice_target=target,
+                readiness=VoiceReadiness(
+                    normalizer=controller.deps.normalizer,
+                    turn_store=controller.deps.turn_store,
+                    visible_echo=controller.deps.visible_voice_echo,
+                    logger=controller.deps.logger,
+                ),
+                coalescing_thread_id="$thread-root",
                 dispatch_timing=None,
                 turn_claim=turn_claim,
             )
 
-        assert result is None
         await_publication.assert_awaited_once_with(
             room=room,
             source_event_id=voice_event.event_id,
             requester_user_id=voice_event.sender,
         )
-        fallback_cleanup.assert_called_once_with()
-        assert fallback.ready.pending_event.dispatch_metadata == ()
+        checkpoint = controller.deps.turn_store.prepared_voice_for_source(voice_event.event_id)
+        assert checkpoint is not None
+        assert checkpoint.body == "🎤 [Attached voice message]"
+        assert checkpoint.coalescing_thread_id == "$thread-root"
         assert controller.deps.turn_store.try_claim_turn(turn_claim)
         controller.deps.turn_store.release_pending_turn_claim(turn_claim)
 
@@ -551,8 +542,7 @@ class TestAgentBot(AgentBotTestBase):
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         _wrap_extracted_collaborators(bot)
         bot.client = _make_matrix_client_mock()
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!test:localhost"
+        room = nio.MatrixRoom("!test:localhost", bot.matrix_id.full_id)
         event = MagicMock(spec=nio.RoomMessageText)
         event.event_id = "$event"
         event.sender = "@user:localhost"
@@ -1307,16 +1297,11 @@ class TestAgentBot(AgentBotTestBase):
         fallback_relay = self._router_relay_event(reply_to="$latest:localhost", is_falling_back=True)
         replyless_relay = self._router_relay_event(reply_to=None)
         non_router_relay = self._router_relay_event(sender="@mindroom_general:localhost")
-        auto_resume_relay = self._router_relay_event(
-            reply_to="$interrupted_bot_message:localhost",
-            body=AUTO_RESUME_MESSAGE,
-        )
 
         assert validator.router_relay_original_event_id(explicit_relay) == "$user_msg:localhost"
         assert validator.router_relay_original_event_id(fallback_relay) is None
         assert validator.router_relay_original_event_id(replyless_relay) is None
         assert validator.router_relay_original_event_id(non_router_relay) is None
-        assert validator.router_relay_original_event_id(auto_resume_relay) is None
 
     @pytest.mark.asyncio
     async def test_external_trigger_to_private_agent_uses_trigger_owner_as_requester(
@@ -1332,13 +1317,11 @@ class TestAgentBot(AgentBotTestBase):
                         display_name="CalculatorAgent",
                         rooms=["!room:localhost"],
                         private=AgentPrivateConfig(per="user", root="calculator_data"),
+                        access={"users": ["@owner:localhost"]},
                     ),
                 },
                 models={"default": ModelConfig(provider="openai", id="test-model")},
-                authorization={
-                    "global_users": ["@owner:localhost"],
-                    "agent_reply_permissions": {"calculator": ["@owner:localhost"]},
-                },
+                administrators=["@owner:localhost"],
             ),
             tmp_path,
         )
@@ -1399,15 +1382,11 @@ class TestAgentBot(AgentBotTestBase):
                         display_name="CalculatorAgent",
                         rooms=["!room:localhost"],
                         private=AgentPrivateConfig(per="user", root="calculator_data"),
+                        access={"users": ["@mallory:localhost", "@victim:localhost"]},
                     ),
                 },
                 models={"default": ModelConfig(provider="openai", id="test-model")},
-                authorization={
-                    "global_users": ["@mallory:localhost", "@victim:localhost"],
-                    "agent_reply_permissions": {
-                        "calculator": ["@mallory:localhost", "@victim:localhost"],
-                    },
-                },
+                administrators=["@mallory:localhost", "@victim:localhost"],
             ),
             tmp_path,
         )
@@ -1466,6 +1445,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.client = _make_matrix_client_mock()
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!room:localhost"
+        room.members_synced = True
         event = nio.RoomMessageText.from_dict(
             {
                 "event_id": "$source",
@@ -1513,6 +1493,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.client = _make_matrix_client_mock()
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!room:localhost"
+        room.members_synced = True
         event = self._router_relay_event()
         ingress_started = asyncio.Event()
         release_ingress = asyncio.Event()
@@ -1561,6 +1542,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.client = _make_matrix_client_mock()
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!room:localhost"
+        room.members_synced = True
         event = nio.RoomMessageText.from_dict(
             {
                 "event_id": "$followup",
@@ -1669,6 +1651,139 @@ class TestAgentBot(AgentBotTestBase):
         assert metadata.payload is mock_reserve_waiting_human_message.return_value
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mention_kind", ["other_agent", "joined_human"])
+    @pytest.mark.parametrize("relay_sender", ["router", "self"])
+    async def test_relay_for_another_target_does_not_signal_active_response(
+        self,
+        mock_agent_user: AgentMatrixUser,
+        tmp_path: Path,
+        *,
+        mention_kind: str,
+        relay_sender: str,
+    ) -> None:
+        """A router handoff or this agent's own relay addressed elsewhere must not interrupt its active turn."""
+        config = self._config_for_storage(tmp_path)
+        runtime_paths = runtime_paths_for(config)
+        ids = entity_ids(config, runtime_paths)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        replace_turn_controller_deps(bot, runtime=replace(bot._runtime_view, client=_make_matrix_client_mock()))
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
+        room.add_member(bot.matrix_id.full_id, "Calculator", None)
+        room.add_member("@user:localhost", "User", None)
+        if mention_kind == "other_agent":
+            body = "@general could you help with this?"
+            mentioned_user_id = ids["general"].full_id
+        else:
+            body = "@person:localhost could you help with this?"
+            mentioned_user_id = "@person:localhost"
+            room.add_member(mentioned_user_id, "Person", None)
+        event = (
+            self._router_relay_event(body=body)
+            if relay_sender == "router"
+            else self._router_relay_event(sender=bot.matrix_id.full_id, body=body)
+        )
+        event.source["content"]["m.mentions"] = {"user_ids": [mentioned_user_id]}
+        prepared_event = PreparedIngress(
+            sender=event.sender,
+            event_id=event.event_id,
+            body=event.body,
+            source=event.source,
+            server_timestamp=event.server_timestamp,
+        )
+
+        with (
+            patch.object(bot._response_runner, "has_active_response_for_target", return_value=True),
+            patch.object(
+                bot._response_runner,
+                "reserve_waiting_human_message",
+                return_value=MagicMock(),
+            ) as reserve_waiting_human_message,
+            patch.object(bot._coalescing_gate, "admit", new=AsyncMock()) as admit,
+        ):
+            reservation_owner = bot._turn_controller.reserve_prompt_ingress_order(room, "@user:localhost")
+            outcome = await bot._turn_controller._dispatch_prepared_text_like_ingress(
+                room=room,
+                prepared_event=prepared_event,
+                requester_user_id="@user:localhost",
+                reservation_owner=reservation_owner,
+                coalescing_thread_id="$thread_root:localhost",
+            )
+            await asyncio.wait_for(reservation_owner.slot.settled.wait(), timeout=1.0)
+
+        assert outcome is _IngressAdmissionOutcome.DEFERRED
+        reserve_waiting_human_message.assert_not_called()
+        admit.assert_awaited_once()
+        ready_result = admit.await_args.kwargs["ready_result"]
+        assert isinstance(ready_result, ReadyPendingEvent)
+        assert all(item.kind != "queued_notice_reservation" for item in ready_result.pending_event.dispatch_metadata)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target_kind", ["self", "none", "absent_human"])
+    async def test_router_handoff_without_another_room_participant_signals_active_response(
+        self,
+        mock_agent_user: AgentMatrixUser,
+        tmp_path: Path,
+        *,
+        target_kind: str,
+    ) -> None:
+        """Only a handoff addressed to another joined participant suppresses the queued notice."""
+        config = self._config_for_storage(tmp_path)
+        runtime_paths = runtime_paths_for(config)
+        ids = entity_ids(config, runtime_paths)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        replace_turn_controller_deps(bot, runtime=replace(bot._runtime_view, client=_make_matrix_client_mock()))
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
+        room.add_member(bot.matrix_id.full_id, "Calculator", None)
+        room.add_member("@user:localhost", "User", None)
+        # A synced cache is what makes "absent" mean absent rather than "not fetched yet".
+        room.members_synced = True
+        if target_kind == "self":
+            body = "@calculator could you help with this?"
+            mentioned_user_ids = [ids["calculator"].full_id]
+        elif target_kind == "absent_human":
+            body = "@person:localhost could you help with this?"
+            mentioned_user_ids = ["@person:localhost"]
+        else:
+            body = "could you help with this?"
+            mentioned_user_ids = []
+        event = self._router_relay_event(body=body)
+        if mentioned_user_ids:
+            event.source["content"]["m.mentions"] = {"user_ids": mentioned_user_ids}
+        prepared_event = PreparedIngress(
+            sender=event.sender,
+            event_id=event.event_id,
+            body=event.body,
+            source=event.source,
+            server_timestamp=event.server_timestamp,
+        )
+
+        with (
+            patch.object(bot._response_runner, "has_active_response_for_target", return_value=True),
+            patch.object(
+                bot._response_runner,
+                "reserve_waiting_human_message",
+                return_value=MagicMock(),
+            ) as reserve_waiting_human_message,
+            patch.object(bot._coalescing_gate, "admit", new=AsyncMock()) as admit,
+        ):
+            reservation_owner = bot._turn_controller.reserve_prompt_ingress_order(room, "@user:localhost")
+            outcome = await bot._turn_controller._dispatch_prepared_text_like_ingress(
+                room=room,
+                prepared_event=prepared_event,
+                requester_user_id="@user:localhost",
+                reservation_owner=reservation_owner,
+                coalescing_thread_id="$thread_root:localhost",
+            )
+            await asyncio.wait_for(reservation_owner.slot.settled.wait(), timeout=1.0)
+
+        assert outcome is _IngressAdmissionOutcome.DEFERRED
+        reserve_waiting_human_message.assert_called_once()
+        admit.assert_awaited_once()
+        ready_result = admit.await_args.kwargs["ready_result"]
+        assert isinstance(ready_result, ReadyPendingEvent)
+        assert any(item.kind == "queued_notice_reservation" for item in ready_result.pending_event.dispatch_metadata)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("source_kind", ["hook", "hook_dispatch"])
     async def test_handle_message_inner_enqueues_trusted_hook_source_kind_as_gate_bypass(
         self,
@@ -1682,6 +1797,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.client = _make_matrix_client_mock()
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!room:localhost"
+        room.members_synced = True
         event = nio.RoomMessageText.from_dict(
             {
                 "event_id": f"${source_kind}",
@@ -1750,7 +1866,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.client = _make_matrix_client_mock()
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!room:localhost"
-        room.users = {"@user:localhost": MagicMock()}
+        room.users = {"@user:localhost": nio.MatrixUser("@user:localhost")}
         voice_event = _room_audio_event(sender="@user:localhost", event_id="$voice-followup", room_id=room.room_id)
         voice_event.source["content"]["m.relates_to"] = {"rel_type": "m.thread", "event_id": "$thread_root"}
         prepared_event = PreparedIngress(
@@ -2049,8 +2165,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.logger = MagicMock()
         _replace_turn_policy_deps(bot, logger=bot.logger)
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         event.body = "hello"
@@ -2149,8 +2264,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.logger = MagicMock()
         _replace_turn_policy_deps(bot, logger=bot.logger)
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         event.body = "hello"
@@ -2243,8 +2357,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.logger = MagicMock()
         _replace_turn_policy_deps(bot, logger=bot.logger)
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         event.body = "hello"
@@ -2323,8 +2436,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.logger = MagicMock()
         _replace_turn_policy_deps(bot, logger=bot.logger)
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         dispatch = PreparedDispatch(
@@ -2399,8 +2511,12 @@ class TestAgentBot(AgentBotTestBase):
 
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!test:localhost"
+        room.members_synced = True
         room.canonical_alias = None
-        room.users = {"@mindroom_calculator:localhost": MagicMock(), "@user:localhost": MagicMock()}
+        room.users = {
+            "@mindroom_calculator:localhost": nio.MatrixUser("@mindroom_calculator:localhost"),
+            "@user:localhost": nio.MatrixUser("@user:localhost"),
+        }
         event = _room_image_event(sender="@user:localhost", event_id="$img_event_fail", body="photo.jpg")
         event.source = {"content": {"body": "photo.jpg"}}
 
@@ -2429,7 +2545,7 @@ class TestAgentBot(AgentBotTestBase):
         )
 
         with (
-            patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
+            patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
             patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
             patch("mindroom.inbound_turn_normalizer.download_image", new_callable=AsyncMock, return_value=None),
             patch.object(ResponsePayloadPreparer, "_log_dispatch_latency"),
@@ -2490,7 +2606,7 @@ class TestAgentBot(AgentBotTestBase):
             SendTextRequest(
                 target=MessageTarget.resolve("!test:localhost", "$thread_root", "$event"),
                 response_text="[calculator] ⚠️ Error: boom",
-                extra_content={STREAM_STATUS_KEY: STREAM_STATUS_COMPLETED},
+                extra_content={STREAM_STATUS_KEY: STREAM_STATUS_ERROR},
             ),
         )
 
@@ -2627,20 +2743,21 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """Dispatch setup failures are system replies even when they occur on a team bot."""
         config = _runtime_bound_config(
-            Config(
-                agents={
-                    "general": AgentConfig(display_name="GeneralAgent", rooms=["!test:localhost"]),
-                },
-                teams={
-                    "team_bot": TeamConfig(
-                        display_name="Team Bot",
-                        role="Coordinate work",
-                        agents=["general"],
-                        rooms=["!test:localhost"],
-                    ),
-                },
-                models={"default": ModelConfig(provider="test", id="test-model")},
-                authorization=AuthorizationConfig(default_room_access=True),
+            with_current_room_member_access(
+                Config(
+                    agents={
+                        "general": AgentConfig(display_name="GeneralAgent", rooms=["!test:localhost"]),
+                    },
+                    teams={
+                        "team_bot": TeamConfig(
+                            display_name="Team Bot",
+                            role="Coordinate work",
+                            agents=["general"],
+                            rooms=["!test:localhost"],
+                        ),
+                    },
+                    models={"default": ModelConfig(provider="test", id="test-model")},
+                ),
             ),
             tmp_path,
         )
@@ -2673,7 +2790,7 @@ class TestAgentBot(AgentBotTestBase):
             SendTextRequest(
                 target=MessageTarget.resolve("!test:localhost", "$thread_root", "$event"),
                 response_text="[team_bot] ⚠️ Error: boom",
-                extra_content={STREAM_STATUS_KEY: STREAM_STATUS_COMPLETED},
+                extra_content={STREAM_STATUS_KEY: STREAM_STATUS_ERROR},
             ),
         )
 
@@ -2691,8 +2808,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.logger = MagicMock()
         _replace_turn_policy_deps(bot, logger=bot.logger)
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         dispatch = PreparedDispatch(
@@ -2765,8 +2881,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.logger = MagicMock()
         _replace_turn_policy_deps(bot, logger=bot.logger)
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         dispatch = PreparedDispatch(
@@ -2834,8 +2949,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.logger = MagicMock()
         _replace_turn_policy_deps(bot, logger=bot.logger)
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         dispatch = PreparedDispatch(
@@ -2911,8 +3025,7 @@ class TestAgentBot(AgentBotTestBase):
         delivery_gateway = SimpleNamespace(send_text=AsyncMock(return_value="$error"))
         _replace_turn_policy_deps(bot, logger=bot.logger)
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         stable_target = MessageTarget.resolve(
@@ -2985,8 +3098,7 @@ class TestAgentBot(AgentBotTestBase):
             response_runner=bot._response_runner,
         )
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         dispatch = PreparedDispatch(
@@ -3078,6 +3190,7 @@ class TestAgentBot(AgentBotTestBase):
                     response_kind="ai",
                     response_envelope=response_envelope,
                     correlation_id="corr-deliver-suppress-existing",
+                    sources=ResponseSources((response_envelope.source_event_id,), (response_envelope.source_event_id,)),
                 ),
                 tool_trace=None,
                 extra_content=None,
@@ -3100,6 +3213,7 @@ class TestAgentBot(AgentBotTestBase):
         """Failed edits of an existing visible response must keep the prior event visible but retryable."""
         config = self._config_for_storage(tmp_path)
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         response_envelope = _hook_envelope(body="hello", source_event_id="$event123")
         gateway = replace_delivery_gateway_deps(
@@ -3130,6 +3244,10 @@ class TestAgentBot(AgentBotTestBase):
                         response_kind="ai",
                         response_envelope=response_envelope,
                         correlation_id="corr-deliver-existing-failure",
+                        sources=ResponseSources(
+                            (response_envelope.source_event_id,),
+                            (response_envelope.source_event_id,),
+                        ),
                     ),
                     tool_trace=None,
                     extra_content=None,
@@ -3173,6 +3291,7 @@ class TestAgentBot(AgentBotTestBase):
                     response_kind="ai",
                     response_envelope=response_envelope,
                     correlation_id="corr-deliver-before-hook-crash",
+                    sources=ResponseSources((response_envelope.source_event_id,), (response_envelope.source_event_id,)),
                 ),
                 tool_trace=None,
                 extra_content=None,
@@ -3219,6 +3338,10 @@ class TestAgentBot(AgentBotTestBase):
                         response_kind="ai",
                         response_envelope=response_envelope,
                         correlation_id="corr-deliver-before-hook-cancel",
+                        sources=ResponseSources(
+                            (response_envelope.source_event_id,),
+                            (response_envelope.source_event_id,),
+                        ),
                     ),
                     tool_trace=None,
                     extra_content=None,
@@ -3245,8 +3368,7 @@ class TestAgentBot(AgentBotTestBase):
         tracker = _set_turn_store_tracker(bot, MagicMock())
         bot.logger = MagicMock()
 
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!room:localhost"
+        room = nio.MatrixRoom("!room:localhost", bot.matrix_id.full_id)
         event = MagicMock()
         event.event_id = "$event"
         dispatch = PreparedDispatch(

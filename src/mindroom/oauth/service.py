@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
+from mindroom.credentials import get_runtime_credentials_manager
 from mindroom.oauth.credential_binding import (
     OAuthCredentialBinding,
     OAuthCredentialBindingParseError,
@@ -13,6 +14,7 @@ from mindroom.oauth.credential_binding import (
     oauth_credential_binding_payload,
     parse_oauth_credential_binding_payload,
 )
+from mindroom.oauth.credential_lifecycle import OAuthCredentialContext, load_oauth_credentials_snapshot_sync
 from mindroom.oauth.providers import (
     OAuthConnectionRequired,
     OAuthProviderError,
@@ -22,13 +24,11 @@ from mindroom.oauth.state import consume_opaque_oauth_state, issue_opaque_oauth_
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
-    from mindroom.oauth.credential_lifecycle import OAuthCredentialContext
     from mindroom.oauth.providers import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 OAUTH_CONNECT_TOKEN_TTL_MINUTES = 10
 OAUTH_ACCESS_REJECTED_REASON = "access_rejected"
-OAUTH_REFRESH_FAILED_REASON = "refresh_failed"
 OAUTH_REFRESH_REJECTED_REASON = "refresh_rejected"
 OAUTH_MISSING_WRITE_SCOPE_REASON = "missing_write_scope"
 OAUTH_RESET_REQUIRED_REASON = "reset_required"
@@ -41,13 +41,13 @@ _GOOGLE_SERVICE_ACCOUNT_PROVIDER_IDS = frozenset(
         "google_drive",
         "google_gmail",
         "google_sheets",
+        "google_tasks",
     },
 )
 __all__ = [
     "OAUTH_ACCESS_REJECTED_REASON",
     "OAUTH_CONNECT_TOKEN_TTL_MINUTES",
     "OAUTH_MISSING_WRITE_SCOPE_REASON",
-    "OAUTH_REFRESH_FAILED_REASON",
     "OAUTH_REFRESH_REJECTED_REASON",
     "OAUTH_RESET_REQUIRED_REASON",
     "OAuthConnectTarget",
@@ -69,6 +69,7 @@ class OAuthConnectTarget:
 
     binding: OAuthCredentialBinding
     requester_id: str | None
+    connection_generation: str
 
 
 def _issue_oauth_connect_token(
@@ -77,13 +78,27 @@ def _issue_oauth_connect_token(
     worker_target: ResolvedWorkerTarget | None,
 ) -> str | None:
     """Create an opaque token that binds an OAuth link to one requester and target."""
-    if worker_target is None or worker_target.execution_identity is None or not worker_target.worker_key:
+    if (
+        worker_target is None
+        or worker_target.execution_identity is None
+        or not worker_target.execution_identity.requester_id
+        or not worker_target.worker_key
+    ):
         return None
     requester_id = worker_target.execution_identity.requester_id
 
     binding = oauth_credential_binding(provider, worker_target)
+    snapshot = load_oauth_credentials_snapshot_sync(
+        OAuthCredentialContext(
+            provider=provider,
+            runtime_paths=runtime_paths,
+            credentials_manager=get_runtime_credentials_manager(runtime_paths),
+            worker_target=worker_target,
+        ),
+    )
     payload = oauth_credential_binding_payload(binding)
     payload["requester_id"] = requester_id or ""
+    payload["connection_generation"] = snapshot.connection_generation
     return issue_opaque_oauth_state(
         runtime_paths,
         kind=_OAUTH_CONNECT_TOKEN_KIND,
@@ -107,7 +122,16 @@ def _connect_target_from_payload(provider: OAuthProvider, payload: dict[str, obj
         else:
             msg = "OAuth connect link target is invalid"
         raise OAuthProviderError(msg) from exc
-    return OAuthConnectTarget(binding=binding, requester_id=str(payload.get("requester_id") or "") or None)
+    requester_id = payload.get("requester_id")
+    connection_generation = payload.get("connection_generation")
+    if not isinstance(requester_id, str) or not isinstance(connection_generation, str) or not connection_generation:
+        msg = "OAuth connect link target is invalid"
+        raise OAuthProviderError(msg)
+    return OAuthConnectTarget(
+        binding=binding,
+        requester_id=requester_id or None,
+        connection_generation=connection_generation,
+    )
 
 
 def lookup_oauth_connect_token(provider: OAuthProvider, runtime_paths: RuntimePaths, token: str) -> OAuthConnectTarget:
@@ -242,20 +266,22 @@ def build_oauth_reconnect_instruction(
             "The original operation may have partially succeeded; do not automatically retry it after reconnecting."
         )
         expiry_guidance = "request a fresh reconnect link without repeating the original operation"
+    link_guidance = (
+        f"This link is valid for {OAUTH_CONNECT_TOKEN_TTL_MINUTES} minutes; if it expires, "
+        f"{expiry_guidance}: {connect_url}"
+        if "connect_token" in parse_qs(urlparse(connect_url).query)
+        else f"Reconnect here: {connect_url}"
+    )
     if oauth_connect_url_requires_host_browser(connect_url):
         return (
             f"{provider.display_name} session for this agent expired or is no longer valid. "
             "Open this MindRoom link in a browser on the computer where the MindRoom process is running, "
             "not on a phone or another computer. If needed, open this conversation there or copy the complete "
-            f"link into that browser. {retry_guidance} "
-            f"This link is valid for {OAUTH_CONNECT_TOKEN_TTL_MINUTES} minutes; if it expires, "
-            f"{expiry_guidance}: {connect_url}"
+            f"link into that browser. {retry_guidance} {link_guidance}"
         )
     return (
         f"{provider.display_name} session for this agent expired or is no longer valid. "
-        f"Reconnect it with this MindRoom link. {retry_guidance} "
-        f"This link is valid for {OAUTH_CONNECT_TOKEN_TTL_MINUTES} minutes; if it expires, "
-        f"{expiry_guidance}: {connect_url}"
+        f"Reconnect it with this MindRoom link. {retry_guidance} {link_guidance}"
     )
 
 
@@ -269,7 +295,7 @@ def oauth_connection_required(
     if reason == OAUTH_RESET_REQUIRED_REASON:
         instruction = (
             f"{context.provider.display_name} credentials for this requester cannot be read. "
-            "Use the authenticated MindRoom dashboard's Integrations page to reset this provider connection, "
+            "Use the Tools tab of the authenticated MindRoom dashboard to reset this provider connection, "
             "then reconnect and retry the request."
         )
         return OAuthConnectionRequired(
@@ -285,12 +311,6 @@ def oauth_connection_required(
     )
     if reason in {OAUTH_ACCESS_REJECTED_REASON, OAUTH_REFRESH_REJECTED_REASON}:
         instruction = build_oauth_reconnect_instruction(context.provider, connect_url, retry_safe=retry_safe)
-    elif reason == OAUTH_REFRESH_FAILED_REASON:
-        instruction = (
-            f"{context.provider.display_name} OAuth session for this agent could not be refreshed. "
-            "Retry the request. If refresh continues to fail, reconnect with this MindRoom link, then retry: "
-            f"{connect_url}"
-        )
     elif reason == OAUTH_MISSING_WRITE_SCOPE_REASON:
         instruction = (
             f"{context.provider.display_name} reconnect required to grant write access. "

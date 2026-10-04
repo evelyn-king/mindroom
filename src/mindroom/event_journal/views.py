@@ -20,14 +20,16 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from typing import Any, Literal
+    from typing import Literal
 
     from mindroom.history_recovery import (
         HistoryRecoveryOutcome,
         RoomHistoryRecovery,
     )
+    from mindroom.response_sources import ResponseAttempt
+    from mindroom.tool_approval_grants import ApprovalGrant, ApprovalGrantRevocation
 
-    from .approval_card_state import ApprovalCardReservation, RecordedApprovalDecision
+    from .approval_card_state import ApprovalCardReservation, ApprovalDecisionMetadata, RecordedApprovalDecision
     from .approvals import (
         StoredApprovalCard,
         UnreadableApprovalCard,
@@ -35,6 +37,7 @@ if TYPE_CHECKING:
     from .background_approvals import BackgroundApprovalDecision
     from .interactive_questions import InteractiveSelection
     from .models import (
+        AdmissionFacts,
         AdmissionResult,
         ConversationCursor,
         ConversationPage,
@@ -43,6 +46,7 @@ if TYPE_CHECKING:
         EventKind,
         HydrationCoverage,
         InboundEvent,
+        IngestionBatchAdmission,
         JournalEvent,
         MatrixDelivery,
         PendingPage,
@@ -66,6 +70,14 @@ class AdmissionView(Protocol):
         ...
 
 
+class IngestionBatchAdmissionView(Protocol):
+    """Admitting one authenticated nio batch, and nothing else."""
+
+    async def admit_ingestion_batch(self, admission: IngestionBatchAdmission) -> AdmissionFacts:  # fmt: skip
+        """Persist one record disposition, receipt, and frontier atomically."""
+        ...
+
+
 class ReplayView(Protocol):
     """Draining and settling the work the journal still owes."""
 
@@ -73,6 +85,7 @@ class ReplayView(Protocol):
         self,
         *,
         limit: int = ...,
+        room_id: str | None = None,
         after_receipt_order: int | None = None,
         runtime_generation: str = "unmanaged",
     ) -> PendingPage:
@@ -88,8 +101,16 @@ class ReplayView(Protocol):
         ...
 
 
-class DispatchView(ReplayView, AdmissionView, Protocol):
-    """Everything the dispatcher coordinates: admission, replay, and claims."""
+class DispatchView(ReplayView, Protocol):
+    """Everything the dispatcher coordinates: replay and semantic claims."""
+
+    async def is_room_member_join_suppressed(self, room_id: str, event_id: str, user_id: str) -> bool:
+        """Check one admitted join against earlier baselines and completed hook delivery."""
+        ...
+
+    async def mark_room_member_join_completed(self, room_id: str, user_id: str) -> None:
+        """Record successful room-member hook delivery."""
+        ...
 
     async def settle_many(self, event_ids: tuple[str, ...]) -> None:
         """Settle every event that one terminal turn accounted for."""
@@ -165,6 +186,10 @@ class ConversationReadView(Protocol):
     Nothing here can change a conversation, which is the point: a reader that
     could write one is a reader that can be made to.
     """
+
+    async def is_event_redacted(self, *, room_id: str, event_id: str) -> bool:
+        """Return exact principal/room/physical-event tombstone proof."""
+        ...
 
     async def read_conversation(
         self,
@@ -274,8 +299,8 @@ class HydrationView(Protocol):
         revision_sender: str,
         revision_transaction_id: str | None = None,
         content: Mapping[str, object],
-    ) -> bool:
-        """Install a point-refetched revision if its refresh token still holds."""
+    ) -> int | None:
+        """Install a point-refetched revision if its refresh token still holds, returning its stored size."""
         ...
 
     async def drop_refetched_message(self, request: RefreshRequest) -> bool:
@@ -311,6 +336,7 @@ class MatrixDeliveryView(Protocol):
         thread_id: str | None,
         payload: Mapping[str, object],
         result: Mapping[str, object] | None = None,
+        response_attempt: ResponseAttempt | None = None,
         event_type: str = "m.room.message",
         edits_event_id: str | None = None,
         settle_source_event_ids: tuple[str, ...] = (),
@@ -457,8 +483,38 @@ class ApprovalDeliveryView(MatrixDeliveryView, Protocol):
         card_event_id: str,
         requested_status: Literal["approved", "denied", "expired"],
         reason: str | None,
-        resolution: Mapping[str, Any],
+        metadata: ApprovalDecisionMetadata,
     ) -> RecordedApprovalDecision: ...
+
+    async def create_approval_grant(  # noqa: D102
+        self,
+        *,
+        room_id: str,
+        card_event_id: str,
+        sender_id: str,
+        seconds: int,
+        metadata: ApprovalDecisionMetadata,
+        reason: str | None = None,
+        current_binding: str | None = None,
+    ) -> tuple[RecordedApprovalDecision, ...]: ...
+
+    async def approval_grant_for_card(  # noqa: D102
+        self,
+        *,
+        room_id: str,
+        card_event_id: str,
+    ) -> ApprovalGrant | None: ...
+
+    async def maintain_approval_grants(self, *, grant_id: str | None = None) -> tuple[str, ...]: ...  # noqa: D102
+
+    async def revoke_approval_grant(  # noqa: D102
+        self,
+        *,
+        room_id: str,
+        card_event_id: str,
+        sender_id: str,
+        grant_id: str,
+    ) -> ApprovalGrantRevocation | None: ...
 
     async def expire_unacknowledged_approval_card(  # noqa: D102
         self,
@@ -467,6 +523,14 @@ class ApprovalDeliveryView(MatrixDeliveryView, Protocol):
     ) -> RecordedApprovalDecision: ...
 
     async def retire_approval_card(self, *, delivery_id: str, card_event_id: str) -> bool: ...  # noqa: D102
+    async def remember_terminal_approval_alias(  # noqa: D102
+        self,
+        *,
+        room_id: str,
+        card_event_id: str,
+        delivery_id: str,
+    ) -> None: ...
+
     async def is_terminal_approval_card(self, *, room_id: str, card_event_id: str) -> bool: ...  # noqa: D102
     async def pending_approval_card(self, *, room_id: str, card_event_id: str) -> StoredApprovalCard | None: ...  # noqa: D102
 
@@ -487,6 +551,7 @@ __all__ = [
     "DispatchView",
     "HistoryRecoveryRecordView",
     "HydrationView",
+    "IngestionBatchAdmissionView",
     "MatrixDeliveryView",
     "PendingTurnView",
     "RelationView",

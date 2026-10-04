@@ -10,8 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import nio
 import pytest
 
+from mindroom.bot import TeamBot
+from mindroom.cancellation import current_task_is_process_shutdown, request_task_cancel
 from mindroom.config.agent import AgentConfig
-from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.plugin import PluginEntryConfig
 from mindroom.delivery_gateway import (
@@ -30,9 +31,11 @@ from mindroom.hooks import (
     EVENT_MESSAGE_AFTER_RESPONSE,
     EVENT_MESSAGE_BEFORE_RESPONSE,
     EVENT_MESSAGE_CANCELLED,
+    EVENT_MESSAGE_FINAL_RESPONSE_TRANSFORM,
     AfterResponseContext,
     BeforeResponseContext,
     CancelledResponseContext,
+    FinalResponseTransformContext,
     HookRegistry,
     MessageEnvelope,
     hook,
@@ -46,6 +49,8 @@ from mindroom.message_target import MessageTarget
 from mindroom.post_response_effects import PostResponseEffectsDeps, ResponseOutcome
 from mindroom.response_lifecycle import ResponseLifecycle, ResponseLifecycleDeps
 from mindroom.response_runner import ResponseRequest
+from mindroom.response_sources import ResponseSources
+from tests.access_schema_support import with_current_room_member_access
 from tests.bot_helpers import make_test_team_bot
 from tests.conftest import (
     TEST_PASSWORD,
@@ -72,11 +77,12 @@ if TYPE_CHECKING:
 def _config(tmp_path: Path) -> Config:
     runtime_paths = test_runtime_paths(tmp_path)
     return bind_runtime_paths(
-        Config(
-            agents={
-                "code": AgentConfig(display_name="Code", rooms=["!room:localhost"]),
-            },
-            authorization=AuthorizationConfig(default_room_access=True),
+        with_current_room_member_access(
+            Config(
+                agents={
+                    "code": AgentConfig(display_name="Code", rooms=["!room:localhost"]),
+                },
+            ),
         ),
         runtime_paths,
     )
@@ -135,11 +141,13 @@ def _response_lifecycle(
         ResponseLifecycleDeps(
             response_hooks=response_hooks,
             logger=get_logger("tests.response_lifecycle"),
+            process_shutdown_requested=lambda: False,
         ),
         identity=ResponseIdentity(
             response_kind="ai",
             response_envelope=response_envelope,
             correlation_id=correlation_id,
+            sources=ResponseSources((response_envelope.source_event_id,), (response_envelope.source_event_id,)),
         ),
         pipeline_timing=None,
     )
@@ -346,6 +354,7 @@ async def test_response_hook_service_emit_cancelled(tmp_path: Path) -> None:
             response_kind="ai",
             response_envelope=_envelope(),
             correlation_id="corr-svc",
+            sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
         ),
         visible_response_event_id="$vis",
     )
@@ -377,6 +386,7 @@ async def test_response_hook_service_skips_when_no_hooks(tmp_path: Path) -> None
             response_kind="ai",
             response_envelope=_envelope(),
             correlation_id="corr-noop",
+            sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
         ),
     )
 
@@ -396,6 +406,10 @@ async def test_team_bot_empty_prompt_emits_cancelled_hook_once(tmp_path: Path) -
     ):
         outcome = await bot._response_runner.generate_team_response_helper(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$event",),
+                    logical_source_event_ids=("$event",),
+                ),
                 thread_history=[],
                 prompt="   ",
                 user_id="@user:localhost",
@@ -433,6 +447,7 @@ async def test_team_edit_regeneration_empty_prompt_emits_cancelled_hook_once(tmp
     room = nio.MatrixRoom(room_id="!room:localhost", own_user_id="@mindroom_team_bot:localhost")
     edit_event = MagicMock()
     edit_event.event_id = "$edit"
+    edit_event.server_timestamp = 1000
     edit_event.sender = "@user:localhost"
     edit_event.source = {}
     event_info = MagicMock(original_event_id="$original", thread_id=None, thread_id_from_edit=None)
@@ -474,9 +489,10 @@ async def test_team_edit_regeneration_empty_prompt_emits_cancelled_hook_once(tmp
             return_value=turn_record,
         ),
         patch.object(turn_store, "build_run_metadata", return_value={}),
+        patch.object(turn_store, "register_edit_revision", return_value=turn_record),
         patch.object(turn_store, "record_turn"),
         patch.object(turn_store, "remove_stale_runs_for_edit"),
-        patch.object(turn_store, "prepare_edit_response_source", return_value=False),
+        patch.object(turn_store, "prepare_edit_snapshot", return_value=False),
         patch.object(bot._ingress_hook_runner, "emit_message_received_hooks", new=AsyncMock(return_value=False)),
     ):
         await bot._edit_regenerator.handle_message_edit(
@@ -537,6 +553,7 @@ async def test_suppressed_final_delivery_emits_cancelled_hook(
                 response_kind="ai",
                 response_envelope=_envelope(),
                 correlation_id="corr-suppressed-final",
+                sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
             ),
             tool_trace=None,
             extra_content=None,
@@ -632,6 +649,94 @@ async def test_late_after_response_cancellation_preserves_delivery_result(
 
 
 @pytest.mark.asyncio
+async def test_process_shutdown_escapes_real_best_effort_after_response_hook(
+    tmp_path: Path,
+) -> None:
+    """Process stop must not run post-response effects after the real hook executor consumes cancellation."""
+    after_started = asyncio.Event()
+
+    @hook(EVENT_MESSAGE_AFTER_RESPONSE)
+    async def slow_after_response(ctx: AfterResponseContext) -> None:
+        del ctx
+        after_started.set()
+        await asyncio.Event().wait()
+
+    registry = HookRegistry.from_plugins([_plugin("test-process-stop-after", [slow_after_response])])
+    _, response_hooks = _response_hook_service(tmp_path, registry)
+    envelope = _envelope()
+    lifecycle = ResponseLifecycle(
+        ResponseLifecycleDeps(
+            response_hooks=response_hooks,
+            logger=get_logger("tests.response_lifecycle"),
+            process_shutdown_requested=current_task_is_process_shutdown,
+        ),
+        identity=ResponseIdentity(
+            response_kind="ai",
+            response_envelope=envelope,
+            correlation_id="corr-process-stop-after",
+            sources=ResponseSources((envelope.source_event_id,), (envelope.source_event_id,)),
+        ),
+        pipeline_timing=None,
+    )
+    post_effects = AsyncMock()
+
+    with patch("mindroom.response_lifecycle.apply_post_response_effects", new=post_effects):
+        task = asyncio.create_task(
+            lifecycle.finalize(
+                FinalDeliveryOutcome(
+                    terminal_status="completed",
+                    event_id="$response",
+                    is_visible_response=True,
+                    final_visible_body="visible response",
+                    delivery_kind="sent",
+                ),
+                build_post_response_outcome=lambda _outcome: ResponseOutcome(),
+                post_response_deps=PostResponseEffectsDeps(logger=get_logger("tests.post_response")),
+            ),
+        )
+        await asyncio.wait_for(after_started.wait(), timeout=1.0)
+        request_task_cancel(task, process_shutdown=True)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    post_effects.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_shutdown_escapes_real_best_effort_final_response_transform(
+    tmp_path: Path,
+) -> None:
+    """Process stop must not resume terminal delivery after a final-transform hook consumes cancellation."""
+    transform_started = asyncio.Event()
+
+    @hook(EVENT_MESSAGE_FINAL_RESPONSE_TRANSFORM)
+    async def slow_transform(ctx: FinalResponseTransformContext) -> None:
+        del ctx
+        transform_started.set()
+        await asyncio.Event().wait()
+
+    registry = HookRegistry.from_plugins([_plugin("test-process-stop-transform", [slow_transform])])
+    _, response_hooks = _response_hook_service(tmp_path, registry)
+    identity = ResponseIdentity(
+        response_kind="ai",
+        response_envelope=_envelope(),
+        correlation_id="corr-process-stop-transform",
+        sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
+    )
+    task = asyncio.create_task(
+        response_hooks._apply_final_response_transform(
+            identity=identity,
+            response_text="visible response",
+        ),
+    )
+    await asyncio.wait_for(transform_started.wait(), timeout=1.0)
+    request_task_cancel(task, process_shutdown=True)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("existing_event_id", "expected_visible_event_id"), [(None, None), ("$existing", "$existing")])
 async def test_deliver_final_delivery_failure_emits_cancelled_hook(
     tmp_path: Path,
@@ -680,6 +785,7 @@ async def test_deliver_final_delivery_failure_emits_cancelled_hook(
                     response_kind="ai",
                     response_envelope=_envelope(),
                     correlation_id="corr-delivery-failure",
+                    sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
                 ),
                 tool_trace=None,
                 extra_content=None,
@@ -759,6 +865,7 @@ async def test_final_only_provider_runs_before_response_then_after_response_once
                 response_kind="ai",
                 response_envelope=_envelope(),
                 correlation_id="corr-final-only-provider",
+                sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
             ),
             tool_trace=None,
             extra_content=None,
@@ -837,6 +944,7 @@ async def test_suppressed_placeholder_cleanup_failure_returns_typed_outcome_afte
                 response_kind="ai",
                 response_envelope=_envelope(),
                 correlation_id="corr-suppressed-cleanup-fail",
+                sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
             ),
             tool_trace=None,
             extra_content=None,
@@ -911,6 +1019,7 @@ async def test_suppressed_placeholder_cleanup_exception_returns_typed_outcome_af
                 response_kind="ai",
                 response_envelope=_envelope(),
                 correlation_id="corr-suppressed-cleanup-exception",
+                sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
             ),
             tool_trace=None,
             extra_content=None,

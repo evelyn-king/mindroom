@@ -9,6 +9,7 @@ from mindroom.constants import STREAM_STATUS_COMPLETED, STREAM_STATUS_KEY, VISIB
 from mindroom.delivery_gateway import SendTextRequest
 from mindroom.event_journal import DeliveryStage
 from mindroom.matrix.room_history_reads import find_response_event_ids_via_room_messages
+from mindroom.model_selection import command_result_content_to_dict
 from mindroom.turn_record import canonicalize_turn_record
 
 if TYPE_CHECKING:
@@ -129,6 +130,15 @@ class VisibleResponseReconciler:
         """Compact exact callback obligations without growing the handled-turn ledger."""
         await self.deps.settle_ignored_sources(handled_turn.source_event_ids)
 
+    async def settle_superseded_turn(self, handled_turn: TurnRecord, *, room_id: str) -> bool:
+        """Discard untouched replay only while exact visible delivery ownership allows it."""
+        assert handled_turn.anchor_event_id is not None
+        async with self.deps.delivery_gateway.supersession_scope(handled_turn.anchor_event_id, room_id) as allowed:
+            if not allowed:
+                return False
+            await self.settle_source_events_ignored(handled_turn)
+            return True
+
     async def record_pending_visible_response(self, handled_turn: TurnRecord, response_event_id: str) -> None:
         """Durably bind one visible response to its incomplete turn before generation."""
         await self.deps.turn_store.record_pending_turn(
@@ -194,6 +204,7 @@ class VisibleResponseReconciler:
             SendTextRequest(
                 target=target,
                 response_text=response_text,
+                extra_content=command_result_content_to_dict(handled_turn.command_result_extra_content),
                 skip_mentions=skip_mentions,
                 delivery_turn_id=delivery_turn_id or handled_turn.anchor_event_id,
                 delivery_stage=DeliveryStage.INITIAL if as_placeholder else DeliveryStage.FINAL,

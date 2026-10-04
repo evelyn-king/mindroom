@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import json
 import threading
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -17,8 +18,8 @@ from mindroom.approval_manager import (
     ToolApprovalTransportError,
 )
 from mindroom.constants import RuntimePaths, resolve_config_relative_path
-from mindroom.entity_resolution import is_human_requester_id
 from mindroom.logging_config import get_logger
+from mindroom.requester_identity import is_human_requester_id, resolve_human_requester_alias
 from mindroom.tool_system.approval_exemptions import tool_call_is_approval_exempt
 
 if TYPE_CHECKING:
@@ -48,6 +49,9 @@ __all__ = [
 
 # Agno copies this field onto the paused ToolExecution, preserving whether MindRoom added the confirmation boundary.
 POLICY_CONFIRMATION_APPROVAL_TYPE = "mindroom_policy"
+# The terminal card edit carries the reason twice, and nio encrypts it as ASCII-escaped JSON that base64 grows by 4/3.
+# Escaping turns one emoji into 12 bytes, so the reply is bounded by escaped size to keep the edit below the event limit.
+_MAX_RESOLUTION_REASON_JSON_BYTES = 2000
 _SCRIPT_CACHE: dict[tuple[str, int], ModuleType] = {}
 _SCRIPT_CACHE_LOCK = threading.Lock()
 logger = get_logger(__name__)
@@ -83,8 +87,12 @@ class MatrixApprovalAction:
     room_id: str
     sender_id: str
     card_event_id: str | None
-    status: Literal["approved", "denied"]
+    status: Literal["approved", "denied"] | None
     reason: str | None
+    auto_approve_seconds: int | None = None
+    action: Literal["revoke_auto_approval"] | None = None
+    grant_id: str | None = None
+    current_binding: str | None = None
 
 
 def _check_callable_from_module(
@@ -166,9 +174,10 @@ def resolve_tool_approval_approver(
     """Return the human requester allowed to resolve one approval request."""
     if requester_id is None or not requester_id.startswith("@") or ":" not in requester_id:
         return None
-    if not is_human_requester_id(requester_id, config, runtime_paths):
+    canonical_requester_id = resolve_human_requester_alias(requester_id, config, runtime_paths)
+    if not is_human_requester_id(canonical_requester_id, config, runtime_paths):
         return None
-    return requester_id
+    return canonical_requester_id
 
 
 async def evaluate_tool_approval(
@@ -211,18 +220,49 @@ async def evaluate_tool_approval(
     return result, timeout_seconds
 
 
+def _bounded_resolution_reason(reason: str) -> str:
+    """Return the longest prefix whose ASCII-escaped JSON string body fits the reason budget."""
+    escaped_bytes = 0
+    for index, character in enumerate(reason):
+        escaped_bytes += len(json.dumps(character)) - 2
+        if escaped_bytes > _MAX_RESOLUTION_REASON_JSON_BYTES:
+            return reason[:index]
+    return reason
+
+
 async def handle_matrix_approval_action(
     action: MatrixApprovalAction,
     *,
+    authorize_responder: Callable[[str], bool],
     before_consume: Callable[[], Awaitable[None]] | None = None,
 ) -> ApprovalActionResult:
     """Resolve a durable continuation card anchored to its Matrix event."""
     manager = approval_manager.get_approval_store()
     if manager is None:
-        return ApprovalActionResult(consumed=False, resolved=False)
-    sanitized_reason = action.reason.strip() if isinstance(action.reason, str) and action.reason.strip() else None
+        return ApprovalActionResult(consumed=False)
+    sanitized_reason = (
+        _bounded_resolution_reason(action.reason.strip())
+        if isinstance(action.reason, str) and action.reason.strip()
+        else None
+    )
     if action.card_event_id is None:
-        return ApprovalActionResult(consumed=False, resolved=False)
+        return ApprovalActionResult(consumed=False)
+    if (
+        action.action == "revoke_auto_approval"
+        and action.grant_id is not None
+        and action.status is None
+        and action.auto_approve_seconds is None
+    ):
+        return await manager.handle_grant_revocation(
+            room_id=action.room_id,
+            sender_id=action.sender_id,
+            card_event_id=action.card_event_id,
+            grant_id=action.grant_id,
+            authorize_responder=authorize_responder,
+            before_consume=before_consume,
+        )
+    if action.status is None or action.action is not None or action.grant_id is not None:
+        return ApprovalActionResult(consumed=False)
     return await manager.handle_card_response(
         room_id=action.room_id,
         sender_id=action.sender_id,
@@ -230,6 +270,9 @@ async def handle_matrix_approval_action(
         status=action.status,
         reason=sanitized_reason,
         before_consume=before_consume,
+        authorize_responder=authorize_responder,
+        auto_approve_seconds=action.auto_approve_seconds,
+        current_binding=action.current_binding,
     )
 
 

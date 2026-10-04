@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 
     from mcp import ClientSession
 
-    from mindroom.config.auth import AuthorizationConfig
     from mindroom.mcp.config import MCPServerConfig
     from mindroom.mcp.errors import MCPError
     from mindroom.tool_system.worker_routing import ResolvedWorkerKeyScope
@@ -113,7 +112,6 @@ class MCPServerState:
     config: MCPServerConfig
     config_generation: int = 0
     oauth_provider_id: str | None = None
-    oauth_authorization: AuthorizationConfig | None = None
     oauth_credential_scope: MCPOAuthCredentialScope | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     call_lock: _AsyncReadWriteLock = field(default_factory=_AsyncReadWriteLock)
@@ -127,6 +125,9 @@ class MCPServerState:
     last_error: MCPError | None = None
     consecutive_failures: int = 0
     refresh_task: asyncio.Task[None] | None = None
+    stale_refresh_not_before: float = 0.0
+    # Catalog hash dependents last heard about, so a refresh that publishes without notifying cannot hide a change.
+    notified_catalog_hash: str | None = None
     refresh_revision: int = 0
     oauth_lease_version: MCPOAuthLeaseVersion | None = None
     oauth_session_lease_version: MCPOAuthLeaseVersion | None = None

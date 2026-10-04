@@ -8,14 +8,13 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig, TeamConfig
-from mindroom.config.auth import AgentReplyPermission, AuthorizationConfig
+from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.credentials import (
     get_runtime_credentials_manager,
-    save_scoped_credentials,
-    scoped_credentials_path,
 )
 from mindroom.custom_tools.oauth_connections import OAuthConnectionTools
 from mindroom.message_target import MessageTarget
@@ -36,7 +35,9 @@ from mindroom.tool_system.runtime_context import (
     tool_runtime_context,
 )
 from mindroom.tool_system.worker_routing import build_agent_toolkit_worker_target
+from tests.authorization_helpers import isolated_membership_index
 from tests.conftest import make_conversation_reader_mock, make_relation_lookup, write_config_yaml
+from tests.oauth_test_utils import corrupt_oauth_credential_payload, publish_oauth_credentials
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
 def _tool_and_context(
     tmp_path: Path,
     *,
-    worker_scope: WorkerScope,
+    worker_scope: WorkerScope | None,
     context_agent_name: str = "research",
     requester_id: str = "@alice:example.org",
     aliases: dict[str, list[str]] | None = None,
@@ -60,6 +61,7 @@ def _tool_and_context(
                 role="Research",
                 tools=["oauth_connections", "google_drive"],
                 worker_scope=worker_scope,
+                credential_managers=["@alice:example.org"],
             ),
         },
         teams={
@@ -69,11 +71,8 @@ def _tool_and_context(
                 agents=["research"],
             ),
         },
-        authorization=AuthorizationConfig(
-            aliases=aliases or {},
-            agent_reply_permissions={"research": ["@alice:example.org"]},
-        ),
-        models={"default": {"provider": "openai", "id": "gpt-5.6"}},
+        authorization=AuthorizationConfig(aliases=aliases or {}),
+        models={"default": {"provider": "openai", "id": "gpt-6-astra"}},
     )
     config_path = tmp_path / "config.yaml"
     write_config_yaml(config, config_path)
@@ -91,6 +90,7 @@ def _tool_and_context(
         runtime_paths=runtime_paths,
         relations=make_relation_lookup(),
         conversation_reader=make_conversation_reader_mock(),
+        agent_reply_memberships=isolated_membership_index(),
     )
     worker_target = build_agent_toolkit_worker_target(
         config.resolve_entity("research").execution_scope,
@@ -124,8 +124,8 @@ def _save_credentials(
     refresh_token: str,
 ) -> dict[str, str]:
     credentials = {"refresh_token": refresh_token}
-    save_scoped_credentials(
-        provider.credential_service,
+    publish_oauth_credentials(
+        provider,
         credentials,
         credentials_manager=get_runtime_credentials_manager(context.runtime_paths),
         worker_target=worker_target,
@@ -178,24 +178,25 @@ async def test_reset_oauth_connection_issues_browser_confirmation_for_unreadable
     tool, context, worker_target = _tool_and_context(tmp_path, worker_scope="user_agent")
     provider = google_drive_oauth_provider()
     credentials_manager = get_runtime_credentials_manager(context.runtime_paths)
-    credentials_path = scoped_credentials_path(
-        provider.credential_service,
-        credentials_manager=credentials_manager,
-        worker_target=worker_target,
-    )
-    corrupt_payload = b"not-a-readable-credential"
-    credentials_path.write_bytes(corrupt_payload)
-
-    with tool_runtime_context(context):
-        result = await tool.reset_oauth_connection(provider.id)
-
-    intent = _reset_intent(result, provider=provider, context=context)
     lifecycle_context = OAuthCredentialContext(
         provider=provider,
         runtime_paths=context.runtime_paths,
         credentials_manager=credentials_manager,
         worker_target=worker_target,
     )
+    publish_oauth_credentials(
+        provider,
+        {"refresh_token": "unreadable"},
+        credentials_manager=credentials_manager,
+        worker_target=worker_target,
+    )
+    corrupt_payload = b"not-a-readable-credential"
+    corrupt_oauth_credential_payload(_oauth_credential_database_path(lifecycle_context), corrupt_payload)
+
+    with tool_runtime_context(context):
+        result = await tool.reset_oauth_connection(provider.id)
+
+    intent = _reset_intent(result, provider=provider, context=context)
     assert intent.connection_generation == await load_oauth_reset_connection_generation(lifecycle_context)
     with pytest.raises(OAuthProviderError, match="could not be loaded"):
         await load_oauth_credentials_snapshot(lifecycle_context)
@@ -233,8 +234,9 @@ async def test_reset_oauth_connection_canonicalizes_bridge_alias_scope(tmp_path:
     provider = google_drive_oauth_provider()
     canonical_target = oauth_credentials_worker_target(
         provider,
+        context.runtime_paths,
         worker_target,
-        authorization=context.config.authorization,
+        config=context.config,
     )
     assert canonical_target is not None
 
@@ -246,29 +248,91 @@ async def test_reset_oauth_connection_canonicalizes_bridge_alias_scope(tmp_path:
     assert intent.binding.worker_key == canonical_target.worker_key
 
 
+def test_oauth_target_does_not_canonicalize_configured_bot_alias(tmp_path: Path) -> None:
+    """A configured bot alias must retain its own OAuth requester scope."""
+    bot_alias = "@bridgebot:example.org"
+    _tool, context, worker_target = _tool_and_context(
+        tmp_path,
+        worker_scope="user_agent",
+        requester_id=bot_alias,
+        aliases={"@alice:example.org": [bot_alias]},
+    )
+    context.config.bot_accounts = [bot_alias]
+
+    resolved_target = oauth_credentials_worker_target(
+        google_drive_oauth_provider(),
+        context.runtime_paths,
+        worker_target,
+        config=context.config,
+    )
+
+    assert resolved_target is not None
+    assert resolved_target.execution_identity is not None
+    assert resolved_target.execution_identity.requester_id == bot_alias
+
+
 @pytest.mark.asyncio
-async def test_reset_oauth_connection_refuses_shared_scope(tmp_path: Path) -> None:
-    """The agent-facing action must not target credentials shared by requesters."""
+async def test_reset_oauth_connection_issues_browser_confirmation_for_shared_scope(tmp_path: Path) -> None:
+    """A credential manager may issue a browser-confirmed reset for the agent's shared credential."""
     tool, context, _worker_target = _tool_and_context(tmp_path, worker_scope="shared")
+    provider = google_drive_oauth_provider()
 
     with tool_runtime_context(context):
-        result = await tool.reset_oauth_connection("google_drive")
+        result = await tool.reset_oauth_connection(provider.id)
 
-    assert "requester-isolated" in result
+    intent = _reset_intent(result, provider=provider, context=context)
+    assert intent.binding.requested_agent_name == "research"
+    assert intent.requester_id == "@alice:example.org"
+    assert intent.binding.worker_scope == "shared"
+    assert "Keep this link private" in result
 
 
 @pytest.mark.asyncio
-async def test_reset_oauth_connection_denies_unauthorized_requester(tmp_path: Path) -> None:
+@pytest.mark.usefixtures("enforce_turn_authorization")
+@pytest.mark.parametrize("worker_scope", ["shared", "user_agent"])
+async def test_reset_oauth_connection_denies_unauthorized_requester(
+    tmp_path: Path,
+    worker_scope: WorkerScope,
+) -> None:
     """Current authorization should be checked before issuing the browser action."""
-    tool, context, _worker_target = _tool_and_context(tmp_path, worker_scope="user_agent")
-    context.config.authorization.agent_reply_permissions = {
-        "research": AgentReplyPermission(users=["@bob:example.org"]),
-    }
+    tool, context, _worker_target = _tool_and_context(tmp_path, worker_scope=worker_scope)
+    context.config.agents["research"].credential_managers = ["@bob:example.org"]
 
     with tool_runtime_context(context):
         result = await tool.reset_oauth_connection("google_drive")
 
     assert "not authorized" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+@pytest.mark.parametrize(("worker_scope", "issued"), [("user_agent", True), ("shared", False)])
+async def test_reset_oauth_connection_lets_agent_users_reset_only_their_own_account(
+    tmp_path: Path,
+    worker_scope: WorkerScope,
+    issued: bool,
+) -> None:
+    """Agent access suffices for a requester-owned account; a shared account still needs a credential manager."""
+    tool, context, _worker_target = _tool_and_context(tmp_path, worker_scope=worker_scope)
+    context.config.agents["research"].credential_managers = []
+    context.config.agents["research"].access = ResponderAccessConfig(users=["@alice:example.org"])
+
+    with tool_runtime_context(context):
+        result = await tool.reset_oauth_connection("google_drive")
+
+    assert ("reset_url" in result) is issued
+    assert ("not authorized" in result) is not issued
+
+
+@pytest.mark.asyncio
+async def test_reset_oauth_connection_refuses_unscoped_credentials(tmp_path: Path) -> None:
+    """Credential managers must use the dashboard for installation-level credentials."""
+    tool, context, _worker_target = _tool_and_context(tmp_path, worker_scope=None)
+
+    with tool_runtime_context(context):
+        result = await tool.reset_oauth_connection("google_drive")
+
+    assert "refuses unscoped installation-level credentials" in result
 
 
 @pytest.mark.asyncio

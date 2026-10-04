@@ -5,13 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from mindroom.authorization import is_authorized_sender
+from mindroom.authorization import is_sender_allowed_for_responder
 from mindroom.matrix.event_info import EventInfo
 from mindroom.matrix.visible_body import strip_matrix_rich_reply_fallback
+from mindroom.requester_identity import resolve_human_requester_alias
 from mindroom.tool_approval import (
     MatrixApprovalAction,
     handle_matrix_approval_action,
 )
+from mindroom.tool_approval_grants import approval_binding, valid_auto_approve_seconds
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
     import nio
     import structlog
 
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.runtime_protocols import OrchestratorRuntime
@@ -38,6 +41,9 @@ class ApprovalResponsePayload:
     card_event_id: str | None
     status: Literal["approved", "denied"] | None
     reason: str | None
+    auto_approve_seconds: int | None = None
+    action: Literal["revoke_auto_approval"] | None = None
+    grant_id: str | None = None
 
 
 def parse_approval_response_event(event: nio.UnknownEvent) -> ApprovalResponsePayload:
@@ -50,9 +56,26 @@ def parse_approval_response_event(event: nio.UnknownEvent) -> ApprovalResponsePa
 
     raw_status = content.get("status")
     status: Literal["approved", "denied"] | None = None
-    if raw_status in {"approved", "denied"}:
+    if raw_status in ("approved", "denied"):
         status = raw_status
 
+    raw_action = content.get("action")
+    raw_seconds = content.get("auto_approve_seconds")
+    grant_id = content.get("grant_id")
+    if "action" in content:
+        if (
+            raw_action == "revoke_auto_approval"
+            and isinstance(grant_id, str)
+            and grant_id
+            and "status" not in content
+            and "auto_approve_seconds" not in content
+        ):
+            return ApprovalResponsePayload(card_event_id, None, None, action="revoke_auto_approval", grant_id=grant_id)
+        return ApprovalResponsePayload(card_event_id, None, None)
+    if "grant_id" in content or (
+        "auto_approve_seconds" in content and (status != "approved" or not valid_auto_approve_seconds(raw_seconds))
+    ):
+        return ApprovalResponsePayload(card_event_id, None, None)
     raw_reason = content.get("reason")
     if not isinstance(raw_reason, str) or not raw_reason.strip():
         raw_reason = content.get("denial_reason")
@@ -61,6 +84,7 @@ def parse_approval_response_event(event: nio.UnknownEvent) -> ApprovalResponsePa
         card_event_id=card_event_id,
         status=status,
         reason=reason,
+        auto_approve_seconds=raw_seconds if isinstance(raw_seconds, int) else None,
     )
 
 
@@ -73,30 +97,54 @@ async def handle_tool_approval_action(
     orchestrator: OrchestratorRuntime | None,
     logger: structlog.stdlib.BoundLogger,
     approval_event_id: str | None,
-    status: Literal["approved", "denied"],
+    status: Literal["approved", "denied"] | None,
     reason: str | None,
     before_consume: Callable[[], Awaitable[None]] | None = None,
-    authorization_prevalidated: bool = False,
+    membership_index: AgentReplyMembershipIndex,
+    auto_approve_seconds: int | None = None,
+    action: Literal["revoke_auto_approval"] | None = None,
+    grant_id: str | None = None,
 ) -> bool:
     """Resolve one approval action only when the sender still has access."""
     if approval_event_id is None:
         return False
-    if not authorization_prevalidated and not is_authorized_sender(
-        sender_id,
-        config,
-        room.room_id,
-        runtime_paths,
-    ):
-        logger.debug("ignoring_tool_approval_action_from_unauthorized_sender", user_id=sender_id)
-        return False
-    action = MatrixApprovalAction(
+    requester_id = resolve_human_requester_alias(sender_id, config, runtime_paths)
+
+    def authorize_responder(entity_name: str) -> bool:
+        allowed = is_sender_allowed_for_responder(
+            requester_id,
+            entity_name,
+            room.room_id,
+            config,
+            runtime_paths,
+            membership_index,
+            require_resolved_membership=True,
+        )
+        if not allowed:
+            logger.debug(
+                "ignoring_tool_approval_action_from_unauthorized_sender",
+                user_id=requester_id,
+                transport_sender_id=sender_id,
+                entity_name=entity_name,
+            )
+        return allowed
+
+    matrix_action = MatrixApprovalAction(
         room_id=room.room_id,
-        sender_id=sender_id,
+        sender_id=requester_id,
         card_event_id=approval_event_id,
         status=status,
         reason=reason,
+        auto_approve_seconds=auto_approve_seconds,
+        action=action,
+        grant_id=grant_id,
+        current_binding=approval_binding(config) if auto_approve_seconds is not None else None,
     )
-    result = await handle_matrix_approval_action(action, before_consume=before_consume)
+    result = await handle_matrix_approval_action(
+        matrix_action,
+        before_consume=before_consume,
+        authorize_responder=authorize_responder,
+    )
     notice_event_id = approval_event_id
     if notice_event_id is not None and result.error_reason is not None and orchestrator is not None:
         await orchestrator.send_approval_notice(
@@ -117,7 +165,7 @@ async def maybe_handle_tool_approval_reply(
     orchestrator: OrchestratorRuntime | None,
     logger: structlog.stdlib.BoundLogger,
     before_consume: Callable[[], Awaitable[None]] | None = None,
-    authorization_prevalidated: bool = False,
+    membership_index: AgentReplyMembershipIndex,
 ) -> bool:
     """Deny live approvals or expire detached approval cards targeted by replies."""
     event_info = EventInfo.from_event(event.source)
@@ -139,5 +187,5 @@ async def maybe_handle_tool_approval_reply(
         status="denied",
         reason=strip_matrix_rich_reply_fallback(event.body),
         before_consume=before_consume,
-        authorization_prevalidated=authorization_prevalidated,
+        membership_index=membership_index,
     )

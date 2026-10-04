@@ -30,6 +30,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from mindroom.interactive_models import INTERACTIVE_PROMPT_KEY
+from mindroom.legacy_delivery_payloads import decode_delivery_result
 
 from .identity import decode_thread_id, delivery_transaction_id, encode_thread_id
 from .membership_state import claim_membership_epoch
@@ -44,7 +45,6 @@ _OUTBOX_COLUMNS = """
     attempted, retired, permanent_failure_reason, sending_device_id
 """
 _DELIVERY_STAGE_VALUES = frozenset(item.value for item in DeliveryStage)
-_LEGACY_FINAL_OUTCOME_KEY = "io.mindroom.final_delivery"
 
 
 def matrix_delivery_payload(
@@ -69,7 +69,7 @@ def matrix_delivery_payload(
     return frozen
 
 
-def delivery_payload_json(
+def _delivery_payload_json(
     principal_id: str,
     delivery_id: str,
     stage: DeliveryStage,
@@ -89,23 +89,6 @@ def _delivery_result_json(result: Mapping[str, object] | None) -> str | None:
     if result is None:
         return None
     return json.dumps(dict(result), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-
-
-def _legacy_delivery_result(payload: Mapping[str, object]) -> dict[str, object] | None:
-    """Read the local result older writers placed inside Matrix content."""
-    replacement = payload.get("m.new_content")
-    legacy_result = (
-        cast("Mapping[str, object]", replacement).get(_LEGACY_FINAL_OUTCOME_KEY)
-        if isinstance(replacement, dict)
-        else payload.get(_LEGACY_FINAL_OUTCOME_KEY)
-    )
-    return dict(cast("Mapping[str, object]", legacy_result)) if isinstance(legacy_result, dict) else None
-
-
-def _is_local_result_compatibility_marker(result: Mapping[str, object]) -> bool:
-    """Return whether a version-only mapping is the bounded old-reader signal."""
-    version = result.get("version")
-    return set(result) == {"version"} and isinstance(version, int) and not isinstance(version, bool)
 
 
 def _delivery_identity(content: Mapping[str, object] | None) -> tuple[str, str, DeliveryStage] | None:
@@ -224,7 +207,7 @@ def enqueue(
             membership_epoch,
             encode_thread_id(thread_id),
             transaction_id,
-            delivery_payload_json(principal_id, delivery_id, stage, payload),
+            _delivery_payload_json(principal_id, delivery_id, stage, payload),
             _delivery_result_json(result),
             edits_event_id,
             int(edit_target_pending),
@@ -590,6 +573,147 @@ def claim_active_delivery_ownership(
     return ownership if membership_is_current and locked_ownership == ownership else None
 
 
+def owns_response(transaction: Transaction, principal_id: str, *, room_id: str, event_id: str) -> bool:
+    """Require a current attempted delivery before startup cleanup may repair a response."""
+    return response_delivery_id(transaction, principal_id, room_id=room_id, event_id=event_id) is not None
+
+
+def initial_response_delivery_id(transaction: Transaction, principal_id: str, event_id: str) -> str | None:
+    """Resolve an exact INITIAL ACK, retaining identity after deleted-response retirement."""
+    row = transaction.fetchone(
+        """SELECT delivery_id FROM matrix_delivery_outbox
+        WHERE principal_id = ? AND stage = 'initial' AND acknowledged_event_id = ?""",
+        (principal_id, event_id),
+    )
+    return None if row is None else str(row["delivery_id"])
+
+
+def response_delivery_id(transaction: Transaction, principal_id: str, *, room_id: str, event_id: str) -> str | None:
+    """Resolve exact current transport ownership without granting semantic continuation."""
+    row = transaction.fetchone(
+        """
+        SELECT delivery.delivery_id FROM matrix_delivery_outbox AS delivery
+        JOIN room_membership AS membership
+          ON membership.principal_id = delivery.principal_id
+         AND membership.room_id = delivery.room_id
+         AND membership.membership_epoch = delivery.membership_epoch
+        WHERE delivery.principal_id = ? AND delivery.room_id = ?
+          AND delivery.attempted = 1 AND delivery.retired = 0
+          AND membership.departure_fenced = 0
+          AND (delivery.acknowledged_event_id = ? OR delivery.edits_event_id = ?)
+        LIMIT 1
+        """,
+        (principal_id, room_id, event_id, event_id),
+    )
+    return None if row is None else str(row["delivery_id"])
+
+
+def approval_owns_delivery(transaction: Transaction, principal_id: str, delivery_id: str) -> bool:
+    """Read approval ownership without loading its persisted run payload."""
+    return (
+        transaction.fetchone(
+            "SELECT 1 FROM approval_continuation_sources WHERE principal_id = ? AND event_id = ?",
+            (principal_id, delivery_id),
+        )
+        is not None
+    )
+
+
+def deleted_initials(
+    transaction: Transaction,
+    principal_id: str,
+    *,
+    agent_name: str,
+    after: tuple[int, str] | None = None,
+) -> tuple[MatrixDelivery | UnreadableMatrixDelivery, ...]:
+    """Keep deleted-source cleanup discoverable after its journal callback settles."""
+    cursor_clause = "" if after is None else " AND (created_at_ns, delivery_id/*bytes*/) > (?, ?)"
+    rows = transaction.fetchall(
+        f"""
+        SELECT {_OUTBOX_COLUMNS} FROM matrix_delivery_outbox AS delivery
+        WHERE principal_id = ? AND event_type = 'm.room.message' AND stage = 'initial' AND retired = 0
+          AND EXISTS (
+            SELECT 1 FROM redaction_tombstones AS tombstone
+            WHERE tombstone.principal_id = delivery.principal_id AND tombstone.room_id = delivery.room_id
+              AND (tombstone.redacted_event_id = delivery.delivery_id OR EXISTS (
+                SELECT 1 FROM turn_records AS record WHERE record.agent_name = ?
+                  AND record.index_event_id = tombstone.redacted_event_id
+                  AND record.anchor_event_id = delivery.delivery_id
+              ))
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM matrix_delivery_outbox AS final
+            WHERE final.principal_id = delivery.principal_id AND final.delivery_id = delivery.delivery_id
+              AND final.stage = 'final' AND (final.acknowledged_event_id IS NOT NULL
+                OR (final.retired = 0 AND final.permanent_failure_reason IS NULL))
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM approval_continuation_sources AS source
+            WHERE source.principal_id = delivery.principal_id AND source.event_id = delivery.delivery_id
+          ){cursor_clause}
+        ORDER BY created_at_ns, delivery_id/*bytes*/ LIMIT 100
+        """,  # noqa: S608 - fixed column list and cursor clause
+        (principal_id, agent_name, *(after or ())),
+    )
+    return tuple(_recovery_delivery(row) for row in rows)
+
+
+def recovery_initials(
+    transaction: Transaction,
+    principal_id: str,
+    *,
+    after: tuple[int, str] | None = None,
+) -> tuple[MatrixDelivery | UnreadableMatrixDelivery, ...]:
+    """Enumerate recoverable INITIALs without resurrecting redacted responses."""
+    cursor_clause = "" if after is None else " AND (created_at_ns, delivery_id/*bytes*/) > (?, ?)"
+    rows = transaction.fetchall(
+        f"""
+        SELECT {_OUTBOX_COLUMNS} FROM matrix_delivery_outbox AS delivery
+        WHERE principal_id = ? AND event_type = 'm.room.message' AND stage = 'initial'
+          AND attempted = 1 AND acknowledged_event_id IS NOT NULL AND retired = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM redaction_tombstones AS tombstone
+            WHERE tombstone.principal_id = delivery.principal_id
+              AND tombstone.room_id = delivery.room_id
+              AND tombstone.redacted_event_id = delivery.acknowledged_event_id
+          )
+          AND EXISTS (
+            SELECT 1 FROM room_membership AS membership
+            WHERE membership.principal_id = delivery.principal_id AND membership.room_id = delivery.room_id
+              AND membership.membership_epoch = delivery.membership_epoch AND membership.departure_fenced = 0
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM matrix_delivery_outbox AS final
+            WHERE final.principal_id = delivery.principal_id AND final.delivery_id = delivery.delivery_id
+              AND final.stage = 'final' AND (final.acknowledged_event_id IS NOT NULL
+                OR (final.retired = 0 AND final.permanent_failure_reason IS NULL))
+          ){cursor_clause}
+        ORDER BY created_at_ns, delivery_id/*bytes*/ LIMIT 100
+        """,  # noqa: S608 - fixed columns and cursor clause
+        (principal_id, *(after or ())),
+    )
+    return tuple(_recovery_delivery(row) for row in rows)
+
+
+def retire_deleted_initial(transaction: Transaction, principal_id: str, delivery_id: str) -> None:
+    """Retain exact ACK identity while fencing sends after proven disappearance."""
+    _lock_delivery_stages(transaction, principal_id, delivery_id)
+    if approval_owns_delivery(transaction, principal_id, delivery_id):
+        msg = "An approval continuation still owns this INITIAL"
+        raise RuntimeError(msg)
+    final = load(transaction, principal_id, delivery_id=delivery_id, stage=DeliveryStage.FINAL)
+    if final is not None and (
+        final.acknowledged_event_id is not None or not (final.retired or final.permanently_failed)
+    ):
+        msg = "FINAL acquired deleted INITIAL during cleanup"
+        raise RuntimeError(msg)
+    transaction.execute(
+        """UPDATE matrix_delivery_outbox SET retired = 1
+        WHERE principal_id = ? AND delivery_id = ? AND stage = 'initial'""",
+        (principal_id, delivery_id),
+    )
+
+
 def event_belongs_to_membership(
     transaction: Transaction,
     principal_id: str,
@@ -768,16 +892,11 @@ def _delivery(row: Row) -> MatrixDelivery:
     if not isinstance(payload, dict):
         msg = f"Outbox payload for delivery {row['delivery_id']!r} is not an object"
         raise TypeError(msg)
-    legacy_result = _legacy_delivery_result(payload)
-    raw_result = row["result_json"]
-    if (legacy_result is not None and not _is_local_result_compatibility_marker(legacy_result)) or raw_result is None:
-        result = legacy_result
-    else:
-        decoded_result = json.loads(raw_result)
-        if not isinstance(decoded_result, dict):
-            msg = f"Outbox result for delivery {row['delivery_id']!r} is not an object"
-            raise TypeError(msg)
-        result = decoded_result
+    result = decode_delivery_result(
+        payload,
+        cast("str | None", row["result_json"]),
+        delivery_id=str(row["delivery_id"]),
+    )
     return MatrixDelivery(
         delivery_id=row["delivery_id"],
         stage=DeliveryStage(row["stage"]),

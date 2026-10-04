@@ -11,13 +11,14 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import nio
 import pytest
+from agno.run.agent import RunOutput
 
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig, RouterConfig
 from mindroom.constants import ORIGINAL_SENDER_KEY
 from mindroom.entity_resolution import entity_identity_registry
-from mindroom.matrix.client import DeliveredMatrixEvent
+from mindroom.matrix.client_delivery import DeliveredMatrixEvent, MatrixDeliveryFailure, MatrixDeliveryFailureKind
 from mindroom.matrix.identity import MatrixID
 from mindroom.message_target import MessageTarget
 from mindroom.scheduling import (
@@ -42,6 +43,7 @@ from tests.conftest import (
     test_runtime_paths,
 )
 from tests.identity_helpers import persist_entity_accounts
+from tests.scheduling_helpers import serve_task_state_events
 
 
 def _mid(name: str) -> MatrixID:
@@ -264,7 +266,7 @@ class TestParseWorkflowSchedule:
         """Test parsing research + email workflow."""
         # Setup mock agent response
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             cron_schedule=CronSchedule(minute="0", hour="9", weekday="1"),
@@ -298,7 +300,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """Test parsing simple reminder without agents."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -324,7 +326,7 @@ class TestParseWorkflowSchedule:
     async def test_parse_daily_task(self, mock_agent_class: Mock, mock_get_model: Mock, mock_config: MagicMock) -> None:  # noqa: ARG002
         """Test parsing daily recurring task."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             cron_schedule=CronSchedule(minute="0", hour="9"),
@@ -357,7 +359,7 @@ class TestParseWorkflowSchedule:
         """The parse prompt must carry the user's timezone and local wall-clock time."""
         mock_config.timezone = "America/Los_Angeles"
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime(2026, 7, 4, 6, 45, tzinfo=UTC),
@@ -390,7 +392,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """The parse prompt must teach the model when to set the per-schedule history limit."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             cron_schedule=CronSchedule(minute="*/25"),
@@ -427,7 +429,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """A one-time parse without execute_at must fail instead of silently defaulting."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             message="Check deployment",
@@ -456,7 +458,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """A recurring parse without cron_schedule must fail instead of silently defaulting."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             message="Market analysis",
@@ -527,7 +529,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """Available-agent prompt rendering should never produce @@ mentions."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -564,7 +566,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """Conditional schedules should accept numeric five-field crons because they recur."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             is_conditional=True,
@@ -620,7 +622,7 @@ class TestExecuteScheduledWorkflow:
 
         conversation_reader = _conversation_reader(latest_thread_event_id="$latest456")
         with patch(
-            "mindroom.scheduling_executor.send_matrix_message",
+            "mindroom.matrix.client_delivery.send_message_outcome",
             new=AsyncMock(
                 return_value=DeliveredMatrixEvent(
                     event_id="$event123",
@@ -681,7 +683,7 @@ class TestExecuteScheduledWorkflow:
         )
 
         with patch(
-            "mindroom.scheduling_executor.send_matrix_message",
+            "mindroom.matrix.client_delivery.send_message_outcome",
             new=AsyncMock(
                 return_value=DeliveredMatrixEvent(
                     event_id="$event456",
@@ -723,7 +725,7 @@ class TestExecuteScheduledWorkflow:
         conversation_reader = _conversation_reader(latest_thread_event_id="$latest456")
 
         with patch(
-            "mindroom.scheduling_executor.send_matrix_message",
+            "mindroom.matrix.client_delivery.send_message_outcome",
             new=AsyncMock(
                 return_value=DeliveredMatrixEvent(
                     event_id="$notice123",
@@ -762,7 +764,7 @@ class TestExecuteScheduledWorkflow:
         )
 
         with patch(
-            "mindroom.scheduling_executor.send_matrix_message",
+            "mindroom.matrix.client_delivery.send_message_outcome",
             new=AsyncMock(
                 return_value=DeliveredMatrixEvent(
                     event_id="$event789",
@@ -807,7 +809,7 @@ class TestExecuteScheduledWorkflow:
             ],
         )
 
-        with patch("mindroom.scheduling_executor.send_matrix_message", new=mock_send):
+        with patch("mindroom.matrix.client_delivery.send_message_outcome", new=mock_send):
             # Should not raise, but log error
             await execute_scheduled_workflow(
                 client,
@@ -825,8 +827,8 @@ class TestExecuteScheduledWorkflow:
             error_content = error_call[0][2]
             assert "failed" in error_content["body"].lower()
 
-    async def test_execute_workflow_send_message_returning_none_is_failure(self) -> None:
-        """send_message returning None should trigger failure handling instead of success logging."""
+    async def test_execute_workflow_typed_send_failure_is_reported(self) -> None:
+        """A typed send failure should trigger failure handling instead of success logging."""
         client = AsyncMock()
         config = _runtime_bound_config(Config())
         workflow = ScheduledWorkflow(
@@ -840,10 +842,10 @@ class TestExecuteScheduledWorkflow:
 
         with (
             patch(
-                "mindroom.scheduling_executor.send_matrix_message",
+                "mindroom.matrix.client_delivery.send_message_outcome",
                 new=AsyncMock(
                     side_effect=[
-                        None,
+                        MatrixDeliveryFailure(MatrixDeliveryFailureKind.SEND_EXCEPTION, "Send failed"),
                         DeliveredMatrixEvent(
                             event_id="$error456",
                             content_sent={"body": "error"},
@@ -879,7 +881,7 @@ class TestExecuteScheduledWorkflow:
             room_id=None,  # No room ID
         )
 
-        with patch("mindroom.scheduling_executor.send_matrix_message", new=AsyncMock()) as mock_send:
+        with patch("mindroom.matrix.client_delivery.send_message_outcome", new=AsyncMock()) as mock_send:
             await execute_scheduled_workflow(
                 client,
                 workflow,
@@ -1040,7 +1042,7 @@ class TestIntegrationWithScheduling:
         client.room_put_state = AsyncMock(return_value=nio.RoomPutStateResponse("$scheduled-state", "!room:server"))
 
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime.now(UTC) + timedelta(hours=6),
@@ -1093,6 +1095,22 @@ class TestIntegrationWithScheduling:
             ),
         )
 
+        assert existing_task.created_at is not None
+        client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
+            content={
+                "status": "pending",
+                "workflow": existing_task.workflow.model_dump_json(),
+                "created_at": existing_task.created_at.isoformat(),
+            },
+            event_type="com.mindroom.scheduled.task",
+            state_key="task123",
+            room_id="!room:server",
+        )
+        serve_task_state_events(
+            client,
+            sender=entity_identity_registry(config, runtime_paths_for(config)).current_id("router").full_id,
+        )
+
         task_id, message = await schedule_task(
             runtime=make_test_scheduling_runtime(
                 client=client,
@@ -1134,7 +1152,7 @@ class TestIntegrationWithScheduling:
         client.room_put_state = AsyncMock(return_value=nio.RoomPutStateResponse("$scheduled-state", "!room:server"))
 
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime.now(UTC) + timedelta(hours=6),
@@ -1186,6 +1204,22 @@ class TestIntegrationWithScheduling:
                 thread_id="$thread123",
                 created_by="@user:server",
             ),
+        )
+
+        assert existing_task.created_at is not None
+        client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
+            content={
+                "status": "pending",
+                "workflow": existing_task.workflow.model_dump_json(),
+                "created_at": existing_task.created_at.isoformat(),
+            },
+            event_type="com.mindroom.scheduled.task",
+            state_key="task123",
+            room_id="!room:server",
+        )
+        serve_task_state_events(
+            client,
+            sender=entity_identity_registry(config, runtime_paths_for(config)).current_id("router").full_id,
         )
 
         task_id, message = await schedule_task(

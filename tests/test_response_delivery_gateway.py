@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -17,9 +18,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import nio
 import pytest
 
+from mindroom.bot import AgentBot
+from mindroom.cancellation import current_task_is_process_shutdown, request_task_cancel
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
+from mindroom.config.models import DefaultsConfig, _LargeMessageStrategy
 from mindroom.constants import (
+    ACTING_REQUESTER_KEY,
     DURABLE_FINAL_OUTCOME_KEY,
     SILENT_SCHEDULE_NO_REPLY_TOKEN,
     STREAM_STATUS_ERROR,
@@ -34,19 +39,25 @@ from mindroom.delivery_gateway import (
     ResponseIdentity,
     SendTextRequest,
     StreamingDeliveryRequest,
+    _segment_transaction_id,
 )
 from mindroom.dispatch_source import MESSAGE_SOURCE_KIND, SILENT_SCHEDULE_SOURCE_KIND
-from mindroom.event_journal import DepartureSource
+from mindroom.entity_resolution import entity_identity_registry
+from mindroom.event_journal import DepartureSource, EventClass, EventKind, InboundEvent
+from mindroom.event_journal.sqlite_backend import SqliteBackend
 from mindroom.handled_turns import TurnRecord, _reset_handled_turn_ledger_runtime
 from mindroom.hooks.context import ResponseDraft
 from mindroom.matrix.client_delivery import DeliveredMatrixEvent, MatrixDeliveryFailure, MatrixDeliveryFailureKind
 from mindroom.matrix.large_messages import (
     _MATRIX_EVENT_HARD_LIMIT,
     _calculate_delivery_event_size,
-    _calculate_event_size,
+    calculate_event_size,
 )
-from mindroom.matrix_delivery import MatrixDeliveryWorker, PermanentDeliveryError, RecoveryOutcome
+from mindroom.matrix_delivery import MatrixDeliveryWorker, PermanentDeliveryError, RecoveryOutcome, TurnHandoff
 from mindroom.message_target import MessageTarget
+from mindroom.response_runner import ResponseRunner
+from mindroom.response_sources import ResponseAttempt, ResponseSources
+from mindroom.runtime_shutdown import ORDERLY_SHUTDOWN
 from mindroom.streaming import PROGRESS_PLACEHOLDER
 from mindroom.tool_system.events import ToolTraceEntry
 from tests.conftest import (
@@ -59,6 +70,8 @@ from tests.conftest import (
     runtime_paths_for,
     test_runtime_paths,
 )
+from tests.journal_helpers import admit_room_event
+from tests.journal_membership_helpers import admit_room_membership
 from tests.test_turn_store import _store
 
 if TYPE_CHECKING:
@@ -74,6 +87,9 @@ if TYPE_CHECKING:
         ProjectedEvent,
         TerminalTurnWrite,
     )
+    from mindroom.event_journal.backend import Transaction
+    from mindroom.final_delivery import FinalDeliveryOutcome
+    from mindroom.turn_store import TurnStore
 
 
 async def _empty_stream() -> AsyncIterator[str]:
@@ -86,6 +102,7 @@ pytestmark = pytest.mark.asyncio
 
 _ROOM_ID = "!room:localhost"
 _AGENT_USER_ID = "@agent:localhost"
+_SEGMENT_PAYLOADS_RESULT_KEY = "io.mindroom.matrix_segment_payloads"
 
 
 def _failed_delivery() -> MatrixDeliveryFailure:
@@ -109,6 +126,26 @@ def _identity(
             source_kind=source_kind,
         ),
         correlation_id="c1",
+        sources=ResponseSources(
+            (
+                request_envelope(
+                    room_id=_ROOM_ID,
+                    reply_to_event_id=source_event_id,
+                    prompt="Test response request",
+                    agent_name="agent",
+                    source_kind=source_kind,
+                ).source_event_id,
+            ),
+            (
+                request_envelope(
+                    room_id=_ROOM_ID,
+                    reply_to_event_id=source_event_id,
+                    prompt="Test response request",
+                    agent_name="agent",
+                    source_kind=source_kind,
+                ).source_event_id,
+            ),
+        ),
     )
 
 
@@ -148,11 +185,16 @@ def _gateway(
     *,
     sending_device_id: str | None = "CURRENT-DEVICE",
     terminal_turn_for: Callable[[str, str], TurnRecord | None] | None = None,
-    terminal_turn_committed: Callable[[str, str], Awaitable[None]] | None = None,
+    terminal_turn_committed: Callable[[str, str, TurnRecord | None], Awaitable[None]] | None = None,
+    turn_handoff: TurnHandoff = ignore_final_delivery_handoff,
+    large_message_strategy: _LargeMessageStrategy = "sidecar",
 ) -> DeliveryGateway:
     """Return a delivery gateway whose only real collaborator is the outbox."""
     config = bind_runtime_paths(
-        Config(agents={"agent": AgentConfig(display_name="Agent")}),
+        Config(
+            agents={"agent": AgentConfig(display_name="Agent")},
+            defaults=DefaultsConfig(large_message_strategy=large_message_strategy),
+        ),
         test_runtime_paths(tmp_path),
     )
     client = AsyncMock()
@@ -184,12 +226,102 @@ def _gateway(
             ),
             response_hooks=MagicMock(_apply_before_response=AsyncMock(), emit_after_response=AsyncMock()),
             outbox=outbox if outbox is not None else make_outbox_mock(),
-            turn_handoff=ignore_final_delivery_handoff,
+            turn_handoff=turn_handoff,
             sending_device_id=lambda: sending_device_id,
             terminal_turn_for=terminal_turn_for,
             terminal_turn_committed=terminal_turn_committed,
         ),
     )
+
+
+def _response_recovery_bot(journal_store: EventJournalStore, turn_store: TurnStore) -> AgentBot:
+    """Return the minimal real proof owner used by delivery integration tests."""
+    bot = object.__new__(AgentBot)
+    bot._journal_store = journal_store
+    bot._journal_principal_id = "agent@alice"
+    bot._turn_store = turn_store
+    bot._response_recovery_diagnostic_classes = set()
+    bot.logger = MagicMock()
+    return bot
+
+
+@pytest.mark.parametrize("kind", ["participation_decline", "mid_turn_defer"])
+async def test_judgment_reaction_reuses_transaction_across_gateway_restarts(tmp_path: Path, kind: str) -> None:
+    """Replaying an acknowledgement must use the same transaction, even if its configured emoji changes."""
+    sent: list[dict[str, object]] = []
+
+    async def send(**kwargs: object) -> nio.RoomSendResponse:
+        sent.append(kwargs)
+        return nio.RoomSendResponse.from_dict({"event_id": "$reaction"}, _ROOM_ID)
+
+    for emoji in ("👍", "👀"):
+        gateway = _gateway(tmp_path)
+        gateway.deps.runtime.client.room_send = send
+        await gateway.send_judgment_reaction(
+            kind=kind,
+            identity=_identity(),
+            room_id=_ROOM_ID,
+            event_id="$latest",
+            key=emoji,
+        )
+    assert len(sent) == 2
+    assert sent[0]["tx_id"] == sent[1]["tx_id"]
+    assert sent[0]["message_type"] == "m.reaction"
+    assert sent[0]["content"] == {
+        "m.relates_to": {"rel_type": "m.annotation", "event_id": "$latest", "key": "👍"},
+    }
+    await gateway.send_judgment_reaction(
+        kind=kind,
+        identity=_identity(),
+        room_id=_ROOM_ID,
+        event_id="$another",
+        key="👍",
+    )
+    assert sent[2]["tx_id"] != sent[0]["tx_id"]
+    await gateway.send_judgment_reaction(
+        kind="mid_turn_defer" if kind == "participation_decline" else "participation_decline",
+        identity=_identity(),
+        room_id=_ROOM_ID,
+        event_id="$latest",
+        key="👍",
+    )
+    assert sent[3]["tx_id"] != sent[0]["tx_id"]
+
+
+@pytest.mark.parametrize("kind", ["participation_decline", "mid_turn_defer"])
+async def test_judgment_reaction_respects_retired_membership(tmp_path: Path, kind: str) -> None:
+    """An agent that lost this turn's room membership must not leave an acknowledgement."""
+    outbox = FakeOutbox()
+    outbox.ended_membership_turn_ids.add("$cause")
+    gateway = _gateway(tmp_path, outbox=outbox)
+    await gateway.send_judgment_reaction(kind=kind, identity=_identity(), room_id=_ROOM_ID, event_id="$cause", key="👍")
+    gateway.deps.runtime.client.room_send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("offline"), nio.RoomSendError("denied", "M_FORBIDDEN")])
+@pytest.mark.parametrize("kind", ["participation_decline", "mid_turn_defer"])
+async def test_judgment_reaction_delivery_failure_is_best_effort(tmp_path: Path, failure: object, kind: str) -> None:
+    """Transport errors are logged without reopening a declined response."""
+    gateway = _gateway(tmp_path)
+    gateway.deps.runtime.client.room_send.side_effect = failure if isinstance(failure, Exception) else None
+    gateway.deps.runtime.client.room_send.return_value = failure
+    await gateway.send_judgment_reaction(kind=kind, identity=_identity(), room_id=_ROOM_ID, event_id="$cause", key="👍")
+    gateway.deps.logger.warning.assert_called_once()
+
+
+@pytest.mark.parametrize("kind", ["participation_decline", "mid_turn_defer"])
+async def test_judgment_reaction_preserves_cancellation(tmp_path: Path, kind: str) -> None:
+    """Stopping a reaction send must still cancel its owning response turn."""
+    gateway = _gateway(tmp_path)
+    gateway.deps.runtime.client.room_send.side_effect = asyncio.CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        await gateway.send_judgment_reaction(
+            kind=kind,
+            identity=_identity(),
+            room_id=_ROOM_ID,
+            event_id="$cause",
+            key="👍",
+        )
 
 
 class TestTurnDeliveryGoesThroughTheOutbox:
@@ -272,6 +404,26 @@ class TestTurnDeliveryGoesThroughTheOutbox:
                     source_kind=SILENT_SCHEDULE_SOURCE_KIND,
                 ),
                 correlation_id="c1",
+                sources=ResponseSources(
+                    (
+                        request_envelope(
+                            room_id=_ROOM_ID,
+                            reply_to_event_id="$cause",
+                            prompt="Check the inbox",
+                            agent_name="agent",
+                            source_kind=SILENT_SCHEDULE_SOURCE_KIND,
+                        ).source_event_id,
+                    ),
+                    (
+                        request_envelope(
+                            room_id=_ROOM_ID,
+                            reply_to_event_id="$cause",
+                            prompt="Check the inbox",
+                            agent_name="agent",
+                            source_kind=SILENT_SCHEDULE_SOURCE_KIND,
+                        ).source_event_id,
+                    ),
+                ),
             ),
         )
 
@@ -392,7 +544,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         outside.mkdir()
         (workspace / ".mindroom").symlink_to(outside, target_is_directory=True)
 
-        with pytest.raises(ValueError, match="workspace root"):
+        with pytest.raises(OSError, match=r"Too many levels|Not a directory"):
             await gateway.deliver_final(
                 self._final_request(SILENT_SCHEDULE_NO_REPLY_TOKEN, source_kind=SILENT_SCHEDULE_SOURCE_KIND),
             )
@@ -514,6 +666,54 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         assert outcome.terminal_status == "completed"
         assert outcome.event_id == "$sent"
         assert send.await_args.args[2]["body"] == "Finding from hook"
+
+    async def test_final_reply_names_its_human_requester(self, tmp_path: Path) -> None:
+        """Entities the reply mentions act for the human the reply was written for."""
+        gateway = _gateway(tmp_path, FakeOutbox())
+        gateway.deps.response_hooks._apply_before_response = self._hooks()._apply_before_response
+        send = AsyncMock(return_value=DeliveredMatrixEvent("$sent", {"body": "answer"}))
+
+        with patch("mindroom.delivery_gateway.send_message_outcome", send):
+            await gateway.deliver_final(self._final_request("answer"))
+
+        assert send.await_args.args[2][ACTING_REQUESTER_KEY] == "@user:localhost"
+
+    async def test_final_reply_names_its_bot_account_requester(self, tmp_path: Path) -> None:
+        """Entities the reply mentions apply their access to a configured bot account, as they would to a human."""
+        gateway = _gateway(tmp_path, FakeOutbox())
+        gateway.deps.runtime.config.bot_accounts = ["@user:localhost"]
+        gateway.deps.response_hooks._apply_before_response = self._hooks()._apply_before_response
+        send = AsyncMock(return_value=DeliveredMatrixEvent("$sent", {"body": "answer"}))
+
+        with patch("mindroom.delivery_gateway.send_message_outcome", send):
+            await gateway.deliver_final(self._final_request("answer"))
+
+        assert send.await_args.args[2][ACTING_REQUESTER_KEY] == "@user:localhost"
+
+    async def test_final_reply_for_an_entity_requester_names_no_requester(self, tmp_path: Path) -> None:
+        """A reply to an agent or system requester leaves mentioned entities acting as today."""
+        gateway = _gateway(tmp_path, FakeOutbox())
+        gateway.deps.response_hooks._apply_before_response = self._hooks()._apply_before_response
+        agent_id = entity_identity_registry(gateway.deps.runtime.config, gateway.deps.runtime_paths).current_id("agent")
+        request = self._final_request("answer")
+        request = replace(
+            request,
+            identity=replace(
+                request.identity,
+                response_envelope=request_envelope(
+                    room_id=_ROOM_ID,
+                    reply_to_event_id="$cause",
+                    agent_name="agent",
+                    user_id=agent_id.full_id,
+                ),
+            ),
+        )
+        send = AsyncMock(return_value=DeliveredMatrixEvent("$sent", {"body": "answer"}))
+
+        with patch("mindroom.delivery_gateway.send_message_outcome", send):
+            await gateway.deliver_final(request)
+
+        assert ACTING_REQUESTER_KEY not in send.await_args.args[2]
 
     async def test_silent_schedule_hook_can_replace_a_finding_with_no_reply(self, tmp_path: Path) -> None:
         """The no-report acknowledgment is interpreted after before-response hooks."""
@@ -1118,7 +1318,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
     ) -> None:
         """A recoverable final edit must not leave an impossible outbox retry."""
         outbox = FakeOutbox()
-        gateway = _gateway(tmp_path, outbox)
+        gateway = _gateway(tmp_path, outbox, large_message_strategy="split")
         gateway.deps.response_hooks._apply_before_response = self._hooks()._apply_before_response
         client = AsyncMock(spec=nio.AsyncClient)
         client.user_id = _AGENT_USER_ID
@@ -1147,10 +1347,121 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         assert outcome.terminal_status == "completed"
         delivery = outbox.rows["$cause", "final"]
         frozen = delivery.payload
-        assert _calculate_event_size(frozen) <= _MATRIX_EVENT_HARD_LIMIT
+        assert calculate_event_size(frozen) <= _MATRIX_EVENT_HARD_LIMIT
         assert frozen["m.new_content"][DURABLE_FINAL_OUTCOME_KEY] == {"version": 2}
-        assert delivery.result == {"body": answer, "interactive": None}
-        assert client.room_send.await_args.kwargs["content"] == frozen
+        assert delivery.result is not None
+        assert delivery.result["body"] == answer
+        assert delivery.result["interactive"] is None
+        continuations = delivery.result[_SEGMENT_PAYLOADS_RESULT_KEY]
+        assert isinstance(continuations, list)
+        assert continuations
+        parts = [frozen["m.new_content"], *continuations]
+        assert "".join(part["body"] for part in parts) == answer
+        assert all(part["format"] == "org.matrix.custom.html" for part in parts)
+        assert all("formatted_body" in part for part in parts)
+        assert all("file" not in part and "url" not in part for part in parts)
+        sent_contents = [call.kwargs["content"] for call in client.room_send.await_args_list]
+        assert sent_contents == [frozen, *continuations]
+
+    async def test_sidecar_strategy_keeps_oversized_final_on_the_attachment_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The default strategy uploads one sidecar instead of segmenting the answer."""
+        outbox = FakeOutbox()
+        gateway = _gateway(tmp_path, outbox)
+        gateway.deps.response_hooks._apply_before_response = self._hooks()._apply_before_response
+        client = AsyncMock(spec=nio.AsyncClient)
+        client.user_id = _AGENT_USER_ID
+        client.device_id = "DEVICE"
+        client.room_get_event = AsyncMock(side_effect=_delivered_event_response)
+        room = MagicMock()
+        room.encrypted = False
+        client.rooms = {_ROOM_ID: room}
+        client.olm = None
+        client.upload.return_value = (
+            nio.UploadResponse.from_dict({"content_uri": "mxc://localhost/sidecar-strategy"}),
+            None,
+        )
+        client.room_send.return_value = nio.RoomSendResponse(event_id="$sent", room_id=_ROOM_ID)
+        gateway.deps.runtime.client = client
+
+        outcome = await gateway.deliver_final(
+            replace(self._final_request("x" * 100_000), defer_source_handoff=True),
+        )
+
+        assert outcome.terminal_status == "completed"
+        delivery = outbox.rows["$cause", "final"]
+        frozen = delivery.payload
+        assert frozen["msgtype"] == "m.file"
+        assert calculate_event_size(frozen) <= _MATRIX_EVENT_HARD_LIMIT
+        assert client.upload.await_count == 1
+        assert client.room_send.await_count == 1
+        assert delivery.result is not None
+        assert _SEGMENT_PAYLOADS_RESULT_KEY not in delivery.result
+
+    async def test_recovery_from_a_new_device_sends_only_the_missing_continuations(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Adopting the primary event must not strand or duplicate continuations.
+
+        The earlier device crashed between the primary send and the
+        continuations, and one continuation did land. Transaction IDs are
+        scoped to the dead device, so the replacement device cannot resend
+        blindly: each segment is matched by its exact frozen content and only
+        the missing one goes out, under its stable derived transaction ID.
+        """
+        outbox = FakeOutbox()
+        gateway = _gateway(tmp_path, outbox, large_message_strategy="split")
+        gateway.deps.response_hooks._apply_before_response = self._hooks()._apply_before_response
+        answer = "\n\n".join(f"## Part {index}\n\n" + "x" * 500 for index in range(200))
+
+        with patch("mindroom.delivery_gateway.send_message_outcome", AsyncMock(return_value=_failed_delivery())):
+            await gateway.deliver_final(replace(self._final_request(answer), defer_source_handoff=True))
+        row = outbox.rows["$cause", "final"]
+        assert row.acknowledged_event_id is None
+        assert row.result is not None
+        continuations = row.result[_SEGMENT_PAYLOADS_RESULT_KEY]
+        assert isinstance(continuations, list)
+        assert len(continuations) >= 2
+
+        async def found_events(
+            _client: object,
+            _room_id: str,
+            *,
+            delivery_content: Mapping[str, object],
+            **_kwargs: object,
+        ) -> str | None:
+            if delivery_content == row.payload:
+                return "$primary"
+            return None
+
+        missing_indices = [index for index in range(len(continuations)) if index != 1]
+        recovered_gateway = _gateway(tmp_path, outbox, sending_device_id="NEW-DEVICE", large_message_strategy="split")
+        delivered = DeliveredMatrixEvent("$continuation", {})
+        with (
+            patch(
+                "mindroom.delivery_gateway.find_outbox_delivery_event_id_via_room_messages",
+                AsyncMock(side_effect=found_events),
+            ),
+            patch(
+                "mindroom.delivery_gateway.missing_outbox_delivery_copy_indices_via_room_messages",
+                AsyncMock(return_value=missing_indices),
+            ),
+            patch(
+                "mindroom.delivery_gateway.send_message_outcome",
+                AsyncMock(return_value=delivered),
+            ) as send,
+        ):
+            recovered = await recovered_gateway.recover_deliveries()
+
+        assert recovered.recovered == 1
+        assert [call.args[2] for call in send.await_args_list] == [continuations[i] for i in missing_indices]
+        assert [call.kwargs["transaction_id"] for call in send.await_args_list] == [
+            _segment_transaction_id(row.transaction_id, index + 1) for index in missing_indices
+        ]
+        assert outbox.rows["$cause", "final"].acknowledged_event_id == "$primary"
 
     async def test_delivery_identity_is_included_in_the_validated_event_size(
         self,
@@ -1185,7 +1496,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
 
         assert outcome.terminal_status == "completed"
         frozen = outbox.rows["$cause", "final"].payload
-        assert _calculate_event_size(frozen) <= _MATRIX_EVENT_HARD_LIMIT
+        assert calculate_event_size(frozen) <= _MATRIX_EVENT_HARD_LIMIT
         assert client.room_send.await_args.kwargs["content"] == frozen
 
     async def test_uncached_encrypted_room_is_fitted_before_durable_enqueue(
@@ -1194,7 +1505,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
     ) -> None:
         """Remote encryption state must shape the payload before the outbox freezes it."""
         outbox = FakeOutbox()
-        gateway = _gateway(tmp_path, outbox)
+        gateway = _gateway(tmp_path, outbox, large_message_strategy="split")
         gateway.deps.response_hooks._apply_before_response = self._hooks()._apply_before_response
         client = AsyncMock(spec=nio.AsyncClient)
         client.rooms = {}
@@ -1212,17 +1523,24 @@ class TestTurnDeliveryGoesThroughTheOutbox:
             outcome = await gateway.deliver_final(self._final_request("x" * 50_000))
 
         assert outcome.event_id == "$sent"
-        frozen = outbox.rows["$cause", "final"].payload
-        assert frozen["msgtype"] == "m.file"
-        assert (
+        delivery = outbox.rows["$cause", "final"]
+        frozen = delivery.payload
+        assert frozen["msgtype"] == "m.text"
+        assert delivery.result is not None
+        continuations = delivery.result[_SEGMENT_PAYLOADS_RESULT_KEY]
+        assert isinstance(continuations, list)
+        assert continuations
+        assert all(
             _calculate_delivery_event_size(
-                frozen,
+                candidate,
                 room_id=_ROOM_ID,
                 room_encrypted=True,
                 device_id="DEVICE",
             )
             <= _MATRIX_EVENT_HARD_LIMIT
+            for candidate in [frozen, *continuations]
         )
+        client.upload.assert_not_awaited()
         client.room_get_state_event.assert_awaited_once_with(_ROOM_ID, "m.room.encryption")
 
     async def test_plaintext_durable_payload_is_fitted_for_a_later_encrypted_send(
@@ -1231,7 +1549,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
     ) -> None:
         """Persistence must freeze bytes that remain valid if encryption is enabled."""
         outbox = FakeOutbox()
-        gateway = _gateway(tmp_path, outbox)
+        gateway = _gateway(tmp_path, outbox, large_message_strategy="split")
         gateway.deps.response_hooks._apply_before_response = self._hooks()._apply_before_response
         client = AsyncMock(spec=nio.AsyncClient)
         client.user_id = _AGENT_USER_ID
@@ -1256,18 +1574,26 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         )
 
         assert outcome.terminal_status == "completed"
-        frozen = outbox.rows["$cause", "final"].payload
-        assert frozen["file"]["url"] == "mxc://localhost/transition-sidecar"
+        delivery = outbox.rows["$cause", "final"]
+        frozen = delivery.payload
+        assert frozen["msgtype"] == "m.text"
+        assert "file" not in frozen
         assert "url" not in frozen
-        assert (
+        assert delivery.result is not None
+        continuations = delivery.result[_SEGMENT_PAYLOADS_RESULT_KEY]
+        assert isinstance(continuations, list)
+        assert continuations
+        assert all(
             _calculate_delivery_event_size(
-                frozen,
+                candidate,
                 room_id=_ROOM_ID,
                 room_encrypted=True,
                 device_id="DEVICE",
             )
             <= _MATRIX_EVENT_HARD_LIMIT
+            for candidate in [frozen, *continuations]
         )
+        client.upload.assert_not_awaited()
 
     async def test_unknown_uncached_room_encryption_fails_before_durable_enqueue(
         self,
@@ -1431,6 +1757,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         terminal = gateway._durable_terminal_edit(
             "$cause",
             MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
         )
         assert terminal is not None
 
@@ -1472,6 +1799,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         terminal = gateway._durable_terminal_edit(
             "$cause",
             MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
         )
         assert terminal is not None
 
@@ -1511,6 +1839,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         terminal = gateway._durable_terminal_edit(
             "$cause",
             MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
         )
         assert terminal is not None
         answer = "x" * 125_000
@@ -1573,6 +1902,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         terminal = gateway._durable_terminal_edit(
             "$cause",
             MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
         )
         assert terminal is not None
         answer = "x" * 125_000
@@ -1624,6 +1954,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         terminal = gateway._durable_terminal_edit(
             "$cause",
             MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
         )
         assert terminal is not None
         answer = "x" * 125_000
@@ -1666,6 +1997,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         terminal = gateway._durable_terminal_edit(
             "$cause",
             MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
         )
         assert terminal is not None
 
@@ -1700,6 +2032,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         terminal = gateway._durable_terminal_send(
             "$cause",
             MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
         )
         assert terminal is not None
 
@@ -1734,6 +2067,27 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         assert stream.await_args.kwargs["terminal_edit"] is not None
         assert stream.await_args.kwargs["terminal_send"] is not None
 
+    async def test_streamed_reply_names_its_human_requester(self, tmp_path: Path) -> None:
+        """A streamed reply carries its human requester like a sent one, without freezing the caller's metadata."""
+        gateway = _gateway(tmp_path, FakeOutbox())
+        run_metadata: dict[str, object] = {}
+        request = StreamingDeliveryRequest(
+            target=MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+            response_stream=_empty_stream(),
+            identity=_identity(),
+            extra_content=run_metadata,
+        )
+
+        with patch("mindroom.delivery_gateway.send_streaming_response", AsyncMock()) as stream:
+            await gateway.deliver_stream(request)
+        run_metadata["io.mindroom.ai_run"] = {"model": "late"}
+
+        assert dict(stream.await_args.kwargs["extra_content"]) == {
+            "io.mindroom.ai_run": {"model": "late"},
+            ACTING_REQUESTER_KEY: "@user:localhost",
+        }
+        assert ACTING_REQUESTER_KEY not in run_metadata
+
     async def test_a_stream_that_only_ever_said_thinking_does_not_settle_the_turn(
         self,
         tmp_path: Path,
@@ -1751,6 +2105,7 @@ class TestTurnDeliveryGoesThroughTheOutbox:
         terminal = gateway._durable_terminal_send(
             "$cause",
             MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
         )
         assert terminal is not None
 
@@ -1880,7 +2235,72 @@ class TestTurnDeliveryGoesThroughTheOutbox:
 
         assert outbox.rows["$cause", "initial"].acknowledged_event_id == "$placeholder"
         assert outbox.rows["$cause", "final"].acknowledged_event_id == "$answer"
-        terminal_committed.assert_awaited_once_with("$cause", "$answer")
+        terminal_committed.assert_awaited_once_with("$cause", "$answer", None)
+
+    async def test_process_shutdown_finishes_started_initial_without_starting_final(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Shutdown acknowledges an in-flight placeholder and leaves FINAL for recovery."""
+        outbox = FakeOutbox()
+        terminal_committed = AsyncMock()
+        gateway = _gateway(
+            tmp_path,
+            outbox,
+            terminal_turn_committed=terminal_committed,
+        )
+        gateway.deps.response_hooks._apply_before_response = self._hooks()._apply_before_response
+        placeholder = DeliveredMatrixEvent(event_id="$placeholder", content_sent={"body": PROGRESS_PLACEHOLDER})
+        answer = DeliveredMatrixEvent(event_id="$answer", content_sent={"body": "the answer"})
+        initial_retry_started = asyncio.Event()
+        release_initial_retry = asyncio.Event()
+        sent_bodies: list[object] = []
+
+        with patch("mindroom.delivery_gateway.send_message_outcome", AsyncMock(return_value=_failed_delivery())):
+            await gateway.send_text(
+                SendTextRequest(
+                    target=MessageTarget.resolve(_ROOM_ID, None, None, room_mode=True),
+                    response_text=PROGRESS_PLACEHOLDER,
+                    delivery_turn_id="$cause",
+                    delivery_stage=DeliveryStage.INITIAL,
+                ),
+            )
+
+        async def send(
+            _client: object,
+            _room_id: str,
+            content: dict[str, object],
+            **_kwargs: object,
+        ) -> DeliveredMatrixEvent:
+            sent_bodies.append(content.get("body"))
+            if content.get("body") == PROGRESS_PLACEHOLDER:
+                initial_retry_started.set()
+                await release_initial_retry.wait()
+                return placeholder
+            return answer
+
+        with patch("mindroom.delivery_gateway.send_message_outcome", side_effect=send):
+            delivery = asyncio.create_task(gateway.deliver_final(self._final_request("the answer")))
+            await asyncio.wait_for(initial_retry_started.wait(), timeout=5)
+            request_task_cancel(delivery, process_shutdown=True)
+            release_initial_retry.set()
+            with pytest.raises(asyncio.CancelledError):
+                await delivery
+
+        assert outbox.rows["$cause", "initial"].acknowledged_event_id == "$placeholder"
+        assert outbox.rows["$cause", "final"].acknowledged_event_id is None
+        assert sent_bodies == [PROGRESS_PLACEHOLDER]
+        terminal_committed.assert_not_awaited()
+
+        async def recover_send(_delivery: MatrixDelivery) -> str:
+            return "$answer"
+
+        recovery = gateway._response_delivery(
+            recover_send,
+            handoff=None,
+        )
+        assert await recovery.recover() == RecoveryOutcome(recovered=1, failed=0)
+        terminal_committed.assert_awaited_once_with("$cause", "$answer", None)
 
     async def test_live_final_ignores_its_inline_initial_result_when_another_process_wins(
         self,
@@ -2054,7 +2474,11 @@ class TestAnEndedMembershipStopsTheAnswer:
         outbox = FakeOutbox()
         outbox.ended_membership_turn_ids.add("$cause")
         gateway = _gateway(tmp_path, outbox)
-        terminal = gateway._durable_terminal_edit("$cause", self._target())
+        terminal = gateway._durable_terminal_edit(
+            "$cause",
+            self._target(),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
+        )
         assert terminal is not None
 
         with patch("mindroom.delivery_gateway.edit_message_outcome", AsyncMock()) as edit:
@@ -2124,6 +2548,99 @@ class TestAnEndedMembershipStopsTheAnswer:
         edit.assert_awaited()
         assert outcome.delivery_kind == "edited"
 
+    async def test_process_shutdown_does_not_send_cancellation_note(self, tmp_path: Path) -> None:
+        """Orderly teardown leaves visible cleanup to replay instead of using the client."""
+        gateway = _gateway(tmp_path, FakeOutbox())
+        runner = ResponseRunner(deps=MagicMock())
+        started = asyncio.Event()
+        outcomes: list[FinalDeliveryOutcome] = []
+
+        async def cancel_visible_note() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                outcomes.append(
+                    await gateway.deliver_cancelled_visible_note(
+                        CancelledVisibleNoteRequest(
+                            target=self._target(),
+                            event_id="$visible",
+                            existing_event_is_placeholder=True,
+                            cancel_source="interrupted",
+                            identity=TestTurnDeliveryGoesThroughTheOutbox._final_request("x").identity,
+                        ),
+                    ),
+                )
+                raise
+
+        task = runner.track_inbox_response(
+            cancel_visible_note(),
+            name="test_process_shutdown_cancel_note",
+            recovery_proof_ready=lambda: False,
+            room_id=_ROOM_ID,
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        with patch("mindroom.delivery_gateway.edit_message_result", AsyncMock()) as edit:
+            assert (
+                await runner.drain_inbox_responses(
+                    cancel_after_seconds=0.1,
+                    shutdown_intent=ORDERLY_SHUTDOWN,
+                )
+                is False
+            )
+
+        assert task.cancelled()
+        assert outcomes[0].terminal_status == "cancelled"
+        assert outcomes[0].event_id == "$visible"
+        assert outcomes[0].mark_handled is False
+        edit.assert_not_awaited()
+
+    async def test_process_shutdown_does_not_redact_nonstreaming_placeholder(self, tmp_path: Path) -> None:
+        """Cancellation during final hooks cannot start placeholder redaction at shutdown."""
+        gateway = _gateway(tmp_path, FakeOutbox())
+        hook_started = asyncio.Event()
+
+        async def blocked_hook(**_kwargs: object) -> ResponseDraft:
+            hook_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError
+
+        gateway.deps.response_hooks._apply_before_response = AsyncMock(side_effect=blocked_hook)
+        runner = ResponseRunner(deps=MagicMock())
+        request = replace(
+            TestTurnDeliveryGoesThroughTheOutbox._final_request("answer"),
+            existing_event_id="$placeholder",
+            existing_event_is_placeholder=True,
+        )
+        cancelled = asyncio.Event()
+
+        async def deliver_final() -> None:
+            try:
+                await gateway.deliver_final(request)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = runner.track_inbox_response(
+            deliver_final(),
+            name="test_process_shutdown_final_hook",
+            recovery_proof_ready=lambda: False,
+            room_id=_ROOM_ID,
+        )
+        await asyncio.wait_for(hook_started.wait(), timeout=1.0)
+
+        assert (
+            await runner.drain_inbox_responses(
+                cancel_after_seconds=0.1,
+                shutdown_intent=ORDERLY_SHUTDOWN,
+            )
+            is False
+        )
+        assert cancelled.is_set()
+        assert task.cancelled()
+        gateway.deps.redact_message_event.assert_not_awaited()
+
     async def test_suppression_cleanup_stops_once_the_membership_ended(self, tmp_path: Path) -> None:
         """The fence already dropped everything derived from that membership."""
         outbox = FakeOutbox()
@@ -2184,7 +2701,11 @@ class TestTheFrozenEditSpeaksOneAnswer:
         """
         outbox = FakeOutbox()
         gateway = _gateway(tmp_path, outbox)
-        terminal = gateway._durable_terminal_edit("$cause", self._target())
+        terminal = gateway._durable_terminal_edit(
+            "$cause",
+            self._target(),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
+        )
         assert terminal is not None
         answer = "the whole answer"
         delivered = DeliveredMatrixEvent("$sent", {})
@@ -2212,7 +2733,11 @@ class TestTheFrozenEditSpeaksOneAnswer:
         """
         outbox = FakeOutbox()
         gateway = _gateway(tmp_path, outbox)
-        terminal = gateway._durable_terminal_edit("$cause", self._target())
+        terminal = gateway._durable_terminal_edit(
+            "$cause",
+            self._target(),
+            ResponseAttempt("agent", ResponseSources(("$cause",), ("$cause",))),
+        )
         assert terminal is not None
         delivered = DeliveredMatrixEvent("$sent", {})
 
@@ -2532,10 +3057,10 @@ class TestARacedAcknowledgementSpeaksForTheRow:
         losing_publishes: list[tuple[str, str]] = []
         winning_publishes: list[tuple[str, str]] = []
 
-        async def losing_publish(turn_id: str, event_id: str) -> None:
+        async def losing_publish(turn_id: str, event_id: str, _committed: TerminalTurnWrite | None) -> None:
             losing_publishes.append((turn_id, event_id))
 
-        async def winning_publish(turn_id: str, event_id: str) -> None:
+        async def winning_publish(turn_id: str, event_id: str, _committed: TerminalTurnWrite | None) -> None:
             winning_publishes.append((turn_id, event_id))
 
         losing = MatrixDeliveryWorker(
@@ -2561,6 +3086,63 @@ class TestARacedAcknowledgementSpeaksForTheRow:
 
         assert winning_publishes == [("turn-1", "$deduplicated")]
         assert losing_publishes == [], "a caller that bound nothing published a record anyway"
+
+
+async def test_process_shutdown_recovery_bypasses_saturated_ordinary_journal_reads(
+    journal_store: EventJournalStore,
+    alice: PrincipalStore,
+) -> None:
+    """A saturated ordinary read lane cannot starve an exact shutdown handoff proof."""
+    source_event_id = "$shutdown-owned:localhost"
+    turn = TurnRecord.create([source_event_id])
+    await alice.admit(
+        InboundEvent(
+            event_id=source_event_id,
+            room_id=_ROOM_ID,
+            thread_id=source_event_id,
+            kind=EventKind.MESSAGE,
+            event_class=EventClass.ACTIONABLE,
+            sender="@user:localhost",
+            origin_server_ts=1_000,
+            source={
+                "event_id": source_event_id,
+                "content": {"msgtype": "m.text", "body": "question"},
+            },
+        ),
+    )
+    bot = _response_recovery_bot(journal_store, await _store(journal_store))
+
+    backend = journal_store.backend
+    ordinary_capacity = (
+        backend._offload._executor._max_workers if isinstance(backend, SqliteBackend) else len(backend._pool)
+    )
+    ordinary_started = threading.Event()
+    release_ordinary = threading.Event()
+    started_count = 0
+    started_lock = threading.Lock()
+
+    def block_ordinary_read(transaction: Transaction) -> None:
+        nonlocal started_count
+        transaction.fetchone("SELECT 1 AS one")
+        with started_lock:
+            started_count += 1
+            if started_count == ordinary_capacity:
+                ordinary_started.set()
+        release_ordinary.wait()
+
+    ordinary_reads = tuple(asyncio.create_task(backend.read(block_ordinary_read)) for _ in range(ordinary_capacity))
+    proof: asyncio.Task[bool] | None = None
+    try:
+        assert await asyncio.to_thread(ordinary_started.wait, 10), "ordinary journal reads did not saturate"
+        proof = asyncio.create_task(bot._response_recovery_ready(turn))
+        ready = await asyncio.wait_for(asyncio.shield(proof), timeout=1)
+    finally:
+        release_ordinary.set()
+        await asyncio.gather(*ordinary_reads)
+        if proof is not None and not proof.done():
+            await proof
+
+    assert ready is True
 
 
 class TestGenericDeliveryDeviceChangePolicy:
@@ -2791,8 +3373,8 @@ class TestGenericDeliveryDeviceChangePolicy:
             stage=DeliveryStage.FINAL,
             sending_device_id="OLD-DEVICE",
         )
-        await alice.fence_departure(_ROOM_ID, source=DepartureSource.LOCAL)
-        await alice.note_membership_restarted(_ROOM_ID)
+        await admit_room_membership(alice, _ROOM_ID, "leave", source=DepartureSource.LOCAL)
+        await admit_room_membership(alice, _ROOM_ID, "join")
         send = AsyncMock(return_value="$duplicate-edit")
         resolve = AsyncMock(return_value="$original-edit")
         worker = MatrixDeliveryWorker(
@@ -2837,8 +3419,8 @@ class TestGenericDeliveryDeviceChangePolicy:
             )
             is not None
         )
-        await alice.fence_departure(_ROOM_ID, source=DepartureSource.LOCAL)
-        await alice.note_membership_restarted(_ROOM_ID)
+        await admit_room_membership(alice, _ROOM_ID, "leave", source=DepartureSource.LOCAL)
+        await admit_room_membership(alice, _ROOM_ID, "join")
         send = AsyncMock(return_value="$stale-answer")
         resolve = AsyncMock(return_value=None)
         worker = MatrixDeliveryWorker(
@@ -2887,8 +3469,8 @@ class TestGenericDeliveryDeviceChangePolicy:
         )
         sending = asyncio.create_task(live.flush(delivery_id="turn-1", stage=DeliveryStage.FINAL))
         await send_started.wait()
-        await alice.fence_departure(_ROOM_ID, source=DepartureSource.LOCAL)
-        await alice.note_membership_restarted(_ROOM_ID)
+        await admit_room_membership(alice, _ROOM_ID, "leave", source=DepartureSource.LOCAL)
+        await admit_room_membership(alice, _ROOM_ID, "join")
 
         recovery = MatrixDeliveryWorker(
             store=alice,
@@ -3026,6 +3608,89 @@ class TestGenericDeliveryDeviceChangePolicy:
         assert stored is not None
         assert stored.acknowledged_event_id == "$prior"
         gateway.deps.runtime.client.room_messages.assert_awaited_once()
+
+    async def test_identical_continuations_reconcile_by_copy_count(
+        self,
+        tmp_path: Path,
+        alice: PrincipalStore,
+    ) -> None:
+        """One delivered copy must not satisfy two byte-identical continuations.
+
+        Long homogeneous responses can repeat a continuation payload exactly.
+        Existence-based reconciliation would see the first copy in the room and
+        acknowledge the row with the second copy never sent; counting copies
+        leaves exactly the missing positions to resend.
+        """
+        duplicate = {
+            "msgtype": "m.text",
+            "body": "z" * 1_000,
+            "format": "org.matrix.custom.html",
+            "formatted_body": "<p>zzz</p>\n",
+        }
+        tail = {**duplicate, "body": "the end", "formatted_body": "<p>the end</p>\n"}
+        await alice.enqueue_matrix_delivery(
+            delivery_id="segmented-turn",
+            stage=DeliveryStage.FINAL,
+            room_id=_ROOM_ID,
+            thread_id=None,
+            payload={"msgtype": "m.text", "body": "the start"},
+            result={_SEGMENT_PAYLOADS_RESULT_KEY: [duplicate, duplicate, tail]},
+        )
+        claimed = await alice.claim_matrix_delivery(
+            delivery_id="segmented-turn",
+            stage=DeliveryStage.FINAL,
+            sending_device_id="OLD-DEVICE",
+        )
+        assert claimed is not None
+        assert claimed.result is not None
+        continuations = claimed.result[_SEGMENT_PAYLOADS_RESULT_KEY]
+
+        def room_event(event_id: str, content: Mapping[str, object]) -> nio.Event:
+            event = nio.Event.parse_event(
+                {
+                    "event_id": event_id,
+                    "room_id": _ROOM_ID,
+                    "sender": _AGENT_USER_ID,
+                    "origin_server_ts": 1_000,
+                    "type": "m.room.message",
+                    "content": dict(content),
+                },
+            )
+            assert isinstance(event, nio.Event)
+            return event
+
+        # The earlier device delivered the primary and one copy of the
+        # duplicated continuation before crashing.
+        prior_primary = room_event("$prior-primary", dict(claimed.payload))
+        prior_continuation = room_event("$prior-continuation", dict(continuations[0]))
+        gateway = _gateway(tmp_path, alice, sending_device_id="NEW-DEVICE")
+        gateway.deps.runtime.client.room_messages = AsyncMock(
+            return_value=nio.RoomMessagesResponse(
+                room_id=_ROOM_ID,
+                chunk=[prior_continuation, prior_primary],
+                start="start",
+                end=None,
+            ),
+        )
+        sent = AsyncMock(return_value=DeliveredMatrixEvent("$resent", {}))
+
+        async def never_sends(_claimed: MatrixDelivery) -> str:
+            msg = "an adopted primary is never resent"
+            raise AssertionError(msg)
+
+        with patch("mindroom.delivery_gateway.send_message_outcome", sent):
+            outcome = await gateway._response_delivery(never_sends, handoff=None).recover()
+
+        stored = await alice.load_matrix_delivery(delivery_id="segmented-turn", stage=DeliveryStage.FINAL)
+        assert outcome == RecoveryOutcome(recovered=1, failed=0)
+        assert stored is not None
+        assert stored.acknowledged_event_id == "$prior-primary"
+        # The second duplicate and the tail were missing: exactly those go out.
+        assert [call.args[2] for call in sent.await_args_list] == [continuations[1], continuations[2]]
+        assert [call.kwargs["transaction_id"] for call in sent.await_args_list] == [
+            _segment_transaction_id(claimed.transaction_id, 2),
+            _segment_transaction_id(claimed.transaction_id, 3),
+        ]
 
     async def test_final_marker_does_not_adopt_the_initial_placeholder(
         self,
@@ -3241,7 +3906,7 @@ class TestTurnDeliverySerialization:
             await accept_final.wait()
             return "$final"
 
-        async def publish(turn_id: str, event_id: str) -> None:
+        async def publish(turn_id: str, event_id: str, _committed: TurnRecord | None) -> None:
             published.append((turn_id, event_id))
 
         gateway = _gateway(tmp_path, alice, terminal_turn_committed=publish)
@@ -3258,6 +3923,283 @@ class TestTurnDeliverySerialization:
         assert stored is not None
         assert stored.acknowledged_event_id == "$final"
         assert published == [("turn-1", "$final")]
+
+    async def test_process_shutdown_accepts_exact_completed_final(
+        self,
+        tmp_path: Path,
+        journal_store: EventJournalStore,
+        alice: PrincipalStore,
+    ) -> None:
+        """A cancelled task is safe when FINAL and its exact terminal turn committed."""
+        source_event_id = "$source"
+        response_event_id = "$answer"
+        turn = TurnRecord.create([source_event_id], completed=False)
+        turn_store = await _store(journal_store, agent_name="agent")
+        await turn_store.record_pending_turn(turn)
+        await alice.admit(
+            InboundEvent(
+                event_id=source_event_id,
+                room_id=_ROOM_ID,
+                thread_id=source_event_id,
+                kind=EventKind.MESSAGE,
+                event_class=EventClass.ACTIONABLE,
+                sender="@user:localhost",
+                origin_server_ts=1_000,
+                source={
+                    "event_id": source_event_id,
+                    "content": {"msgtype": "m.text", "body": "question"},
+                },
+            ),
+        )
+        handoff = TurnHandoff(
+            sources_for_turn=lambda turn_id: turn.source_event_ids if turn_id == source_event_id else (),
+            released=lambda _source_event_ids: None,
+        )
+        gateway = _gateway(
+            tmp_path,
+            alice,
+            terminal_turn_for=turn_store.terminal_turn_record,
+            terminal_turn_committed=turn_store.publish_committed_response,
+            turn_handoff=handoff,
+        )
+        bot = _response_recovery_bot(journal_store, turn_store)
+        send_started = asyncio.Event()
+        finish_send = asyncio.Event()
+
+        async def send(_delivery: MatrixDelivery) -> str:
+            send_started.set()
+            await finish_send.wait()
+            return response_event_id
+
+        delivery = gateway._response_delivery(send, handoff=handoff)
+        runner = ResponseRunner(deps=MagicMock())
+        response_task = runner.track_inbox_response(
+            delivery.deliver(
+                delivery_id=source_event_id,
+                stage=DeliveryStage.FINAL,
+                room_id=_ROOM_ID,
+                thread_id=source_event_id,
+                payload={"msgtype": "m.text", "body": "answer"},
+            ),
+            name="test_process_shutdown_completed_final",
+            recovery_proof_ready=lambda: bot._response_recovery_ready(turn),
+            room_id=_ROOM_ID,
+        )
+        await send_started.wait()
+        runner.begin_process_shutdown()
+        finish_send.set()
+
+        assert (
+            await runner.drain_inbox_responses(
+                cancel_after_seconds=0.1,
+                shutdown_intent=ORDERLY_SHUTDOWN,
+            )
+            is True
+        )
+        assert response_task.cancelled()
+        stored = await alice.load_matrix_delivery(delivery_id=source_event_id, stage=DeliveryStage.FINAL)
+        assert stored is not None
+        assert stored.acknowledged_event_id == response_event_id
+        completed_turn = turn_store.get_turn_record(source_event_id)
+        assert completed_turn is not None
+        assert completed_turn.completed
+        assert completed_turn.response_event_id == response_event_id
+
+    async def test_process_shutdown_finishes_terminal_publication_across_second_cancel(
+        self,
+        tmp_path: Path,
+        journal_store: EventJournalStore,
+        alice: PrincipalStore,
+    ) -> None:
+        """A repeated shutdown cancel cannot strand memory behind the atomic ack."""
+        source_event_id = "$source"
+        response_event_id = "$answer"
+        turn = TurnRecord.create([source_event_id], completed=False)
+        turn_store = await _store(journal_store, agent_name="agent")
+        await turn_store.record_pending_turn(turn)
+        await alice.admit(
+            InboundEvent(
+                event_id=source_event_id,
+                room_id=_ROOM_ID,
+                thread_id=source_event_id,
+                kind=EventKind.MESSAGE,
+                event_class=EventClass.ACTIONABLE,
+                sender="@user:localhost",
+                origin_server_ts=1_000,
+                source={
+                    "event_id": source_event_id,
+                    "content": {"msgtype": "m.text", "body": "question"},
+                },
+            ),
+        )
+        handoff = TurnHandoff(
+            sources_for_turn=lambda turn_id: turn.source_event_ids if turn_id == source_event_id else (),
+            released=lambda _source_event_ids: None,
+        )
+        publication_started = asyncio.Event()
+        allow_publication = asyncio.Event()
+
+        async def publish_committed_response(turn_id: str, event_id: str, committed: TurnRecord | None) -> None:
+            publication_started.set()
+            await allow_publication.wait()
+            await turn_store.publish_committed_response(turn_id, event_id, committed)
+
+        gateway = _gateway(
+            tmp_path,
+            alice,
+            terminal_turn_for=turn_store.terminal_turn_record,
+            terminal_turn_committed=publish_committed_response,
+            turn_handoff=handoff,
+        )
+        bot = _response_recovery_bot(journal_store, turn_store)
+        send_started = asyncio.Event()
+        finish_send = asyncio.Event()
+
+        async def send(_delivery: MatrixDelivery) -> str:
+            send_started.set()
+            await finish_send.wait()
+            return response_event_id
+
+        delivery = gateway._response_delivery(send, handoff=handoff)
+        runner = ResponseRunner(deps=MagicMock())
+        response_task = runner.track_inbox_response(
+            delivery.deliver(
+                delivery_id=source_event_id,
+                stage=DeliveryStage.FINAL,
+                room_id=_ROOM_ID,
+                thread_id=source_event_id,
+                payload={"msgtype": "m.text", "body": "answer"},
+            ),
+            name="test_process_shutdown_repeated_cancel_after_final_ack",
+            recovery_proof_ready=lambda: bot._response_recovery_ready(turn),
+            room_id=_ROOM_ID,
+        )
+        await send_started.wait()
+        original_request_task_cancel = request_task_cancel
+        cancellation_count = 0
+
+        def cancel_and_release_publication(task: asyncio.Task[None], **kwargs: object) -> None:
+            nonlocal cancellation_count
+            cancellation_count += 1
+            original_request_task_cancel(task, **kwargs)  # type: ignore[arg-type]
+            if cancellation_count == 2:
+                allow_publication.set()
+
+        with patch(
+            "mindroom.response_runner.request_task_cancel",
+            side_effect=cancel_and_release_publication,
+        ):
+            runner.begin_process_shutdown()
+            finish_send.set()
+            await publication_started.wait()
+            assert (
+                await runner.drain_inbox_responses(
+                    # Exercise repeated cancellation without imposing a 50 ms database deadline.
+                    cancel_after_seconds=0.5,
+                    shutdown_intent=ORDERLY_SHUTDOWN,
+                )
+                is True
+            )
+
+        assert cancellation_count >= 2
+        assert response_task.cancelled()
+        stored = await alice.load_matrix_delivery(delivery_id=source_event_id, stage=DeliveryStage.FINAL)
+        assert stored is not None
+        assert stored.acknowledged_event_id == response_event_id
+        completed_turn = turn_store.get_turn_record(source_event_id)
+        assert completed_turn is not None
+        assert completed_turn.completed
+        assert completed_turn.response_event_id == response_event_id
+
+    async def test_process_shutdown_accepts_final_edit_of_persisted_placeholder(
+        self,
+        tmp_path: Path,
+        journal_store: EventJournalStore,
+        alice: PrincipalStore,
+    ) -> None:
+        """A FINAL edit transfers ownership without rebinding its visible message."""
+        source_event_id = "$source"
+        placeholder_event_id = "$placeholder"
+        final_edit_event_id = "$final-edit"
+        turn = TurnRecord.create(
+            [source_event_id],
+            completed=False,
+            response_event_id=placeholder_event_id,
+            response_owner="agent",
+        )
+        turn_store = await _store(journal_store, agent_name="agent")
+        await turn_store.record_pending_turn(turn)
+        await alice.admit(
+            InboundEvent(
+                event_id=source_event_id,
+                room_id=_ROOM_ID,
+                thread_id=source_event_id,
+                kind=EventKind.MESSAGE,
+                event_class=EventClass.ACTIONABLE,
+                sender="@user:localhost",
+                origin_server_ts=1_000,
+                source={
+                    "event_id": source_event_id,
+                    "content": {"msgtype": "m.text", "body": "question"},
+                },
+            ),
+        )
+        handoff = TurnHandoff(
+            sources_for_turn=lambda turn_id: turn.source_event_ids if turn_id == source_event_id else (),
+            released=lambda _source_event_ids: None,
+        )
+        gateway = _gateway(
+            tmp_path,
+            alice,
+            terminal_turn_for=turn_store.terminal_turn_record,
+            terminal_turn_committed=turn_store.publish_committed_response,
+            turn_handoff=handoff,
+        )
+        bot = _response_recovery_bot(journal_store, turn_store)
+        send_started = asyncio.Event()
+        finish_send = asyncio.Event()
+
+        async def send(_delivery: MatrixDelivery) -> str:
+            send_started.set()
+            await finish_send.wait()
+            return final_edit_event_id
+
+        delivery = gateway._response_delivery(send, handoff=handoff)
+        runner = ResponseRunner(deps=MagicMock())
+        response_task = runner.track_inbox_response(
+            delivery.deliver(
+                delivery_id=source_event_id,
+                stage=DeliveryStage.FINAL,
+                room_id=_ROOM_ID,
+                thread_id=source_event_id,
+                payload={"msgtype": "m.text", "body": "answer"},
+                edits_event_id=placeholder_event_id,
+            ),
+            name="test_process_shutdown_completed_final_edit",
+            recovery_proof_ready=lambda: bot._response_recovery_ready(turn),
+            room_id=_ROOM_ID,
+        )
+        await send_started.wait()
+        runner.begin_process_shutdown()
+        finish_send.set()
+
+        assert (
+            await runner.drain_inbox_responses(
+                cancel_after_seconds=0.1,
+                shutdown_intent=ORDERLY_SHUTDOWN,
+            )
+            is True
+        )
+        assert response_task.cancelled()
+        stored = await alice.load_matrix_delivery(delivery_id=source_event_id, stage=DeliveryStage.FINAL)
+        assert stored is not None
+        assert stored.acknowledged_event_id == final_edit_event_id
+        assert stored.edits_event_id == placeholder_event_id
+        completed_turn = turn_store.get_turn_record(source_event_id)
+        assert completed_turn is not None
+        assert completed_turn.completed
+        assert completed_turn.response_event_id == placeholder_event_id
+        assert turn_store.is_handled(source_event_id)
 
     async def test_cancelled_final_finishes_after_its_enqueue_commits(
         self,
@@ -3278,6 +4220,7 @@ class TestTurnDeliverySerialization:
             thread_id: str | None,
             payload: Mapping[str, object],
             result: Mapping[str, object] | None = None,
+            response_attempt: ResponseAttempt | None = None,
             edits_event_id: str | None = None,
             settle_source_event_ids: tuple[str, ...] = (),
             permanent_failure_reason: str | None = None,
@@ -3290,6 +4233,7 @@ class TestTurnDeliverySerialization:
                 thread_id=thread_id,
                 payload=payload,
                 result=result,
+                response_attempt=response_attempt,
                 edits_event_id=edits_event_id,
                 settle_source_event_ids=settle_source_event_ids,
                 permanent_failure_reason=permanent_failure_reason,
@@ -3319,6 +4263,189 @@ class TestTurnDeliverySerialization:
 
             with pytest.raises(asyncio.CancelledError):
                 await final
+
+        stored = await outbox.load_matrix_delivery(delivery_id="turn-1", stage=DeliveryStage.FINAL)
+        assert stored is not None
+        assert stored.acknowledged_event_id == "$final"
+        assert sent == [DeliveryStage.FINAL]
+        assert await delivery.recover() == RecoveryOutcome(recovered=0, failed=0)
+
+    async def test_process_shutdown_after_user_cancel_leaves_enqueued_send_for_recovery(
+        self,
+    ) -> None:
+        """Process stop supersedes an earlier user cancel before a committed send."""
+        outbox = FakeOutbox()
+        enqueue_committed = asyncio.Event()
+        return_from_enqueue = asyncio.Event()
+        first_cancellation_observed = asyncio.Event()
+        original_enqueue = outbox.enqueue_matrix_delivery
+        sent: list[DeliveryStage] = []
+
+        def process_shutdown_requested() -> bool:
+            first_cancellation_observed.set()
+            return current_task_is_process_shutdown()
+
+        async def enqueue_then_wait(
+            *,
+            delivery_id: str,
+            stage: DeliveryStage,
+            event_type: str = "m.room.message",
+            room_id: str,
+            thread_id: str | None,
+            payload: Mapping[str, object],
+            result: Mapping[str, object] | None = None,
+            response_attempt: ResponseAttempt | None = None,
+            edits_event_id: str | None = None,
+            settle_source_event_ids: tuple[str, ...] = (),
+            permanent_failure_reason: str | None = None,
+        ) -> str | None:
+            transaction_id = await original_enqueue(
+                delivery_id=delivery_id,
+                stage=stage,
+                event_type=event_type,
+                room_id=room_id,
+                thread_id=thread_id,
+                payload=payload,
+                result=result,
+                response_attempt=response_attempt,
+                edits_event_id=edits_event_id,
+                settle_source_event_ids=settle_source_event_ids,
+                permanent_failure_reason=permanent_failure_reason,
+            )
+            enqueue_committed.set()
+            await return_from_enqueue.wait()
+            return transaction_id
+
+        async def send(delivery: MatrixDelivery) -> str:
+            sent.append(delivery.stage)
+            return "$final"
+
+        delivery = MatrixDeliveryWorker(
+            store=outbox,
+            send=send,
+            observe_delivered=ignore_delivered_projection,
+            process_shutdown_requested=process_shutdown_requested,
+        )
+        with patch.object(outbox, "enqueue_matrix_delivery", side_effect=enqueue_then_wait):
+            final = asyncio.create_task(
+                delivery.deliver(
+                    delivery_id="turn-1",
+                    stage=DeliveryStage.FINAL,
+                    room_id=_ROOM_ID,
+                    thread_id=None,
+                    payload={"msgtype": "m.text", "body": "final"},
+                ),
+            )
+            await enqueue_committed.wait()
+            request_task_cancel(final, cancel_source="user_stop")
+            await asyncio.wait_for(first_cancellation_observed.wait(), timeout=5)
+            request_task_cancel(final, process_shutdown=True)
+            return_from_enqueue.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await final
+
+        stored = await outbox.load_matrix_delivery(delivery_id="turn-1", stage=DeliveryStage.FINAL)
+        assert stored is not None
+        assert stored.acknowledged_event_id is None
+        assert sent == []
+        assert await delivery.recover() == RecoveryOutcome(recovered=1, failed=0)
+        assert sent == [DeliveryStage.FINAL]
+
+    async def test_process_shutdown_during_recovery_marker_write_defers_matrix_send(
+        self,
+    ) -> None:
+        """Recovery completes its device marker but starts no new Matrix request."""
+        outbox = FakeOutbox()
+        await outbox.enqueue_matrix_delivery(
+            delivery_id="turn-1",
+            stage=DeliveryStage.FINAL,
+            room_id=_ROOM_ID,
+            thread_id=None,
+            payload={"msgtype": "m.text", "body": "final"},
+        )
+        device_write_started = asyncio.Event()
+        finish_device_write = asyncio.Event()
+        original_record_sending_device = outbox.record_matrix_delivery_device
+        sent: list[DeliveryStage] = []
+
+        async def record_device_then_wait(
+            *,
+            delivery_id: str,
+            stage: DeliveryStage,
+            device_id: str | None,
+        ) -> None:
+            device_write_started.set()
+            await finish_device_write.wait()
+            await original_record_sending_device(
+                delivery_id=delivery_id,
+                stage=stage,
+                device_id=device_id,
+            )
+
+        async def send(delivery: MatrixDelivery) -> str:
+            sent.append(delivery.stage)
+            return "$final"
+
+        delivery = MatrixDeliveryWorker(
+            store=outbox,
+            send=send,
+            observe_delivered=ignore_delivered_projection,
+            sending_device_id="DEVICE1",
+            process_shutdown_requested=current_task_is_process_shutdown,
+        )
+        with patch.object(outbox, "record_matrix_delivery_device", side_effect=record_device_then_wait):
+            recovery = asyncio.create_task(delivery.recover())
+            await device_write_started.wait()
+            request_task_cancel(recovery, process_shutdown=True)
+            finish_device_write.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await recovery
+
+        stored = await outbox.load_matrix_delivery(delivery_id="turn-1", stage=DeliveryStage.FINAL)
+        assert stored is not None
+        assert stored.sending_device_id == "DEVICE1"
+        assert stored.acknowledged_event_id is None
+        assert sent == []
+        assert await delivery.recover() == RecoveryOutcome(recovered=1, failed=0)
+        assert sent == [DeliveryStage.FINAL]
+
+    async def test_process_shutdown_after_recovery_send_starts_finishes_acknowledgement(
+        self,
+    ) -> None:
+        """A Matrix request that already started remains indivisible from its ack."""
+        outbox = FakeOutbox()
+        await outbox.enqueue_matrix_delivery(
+            delivery_id="turn-1",
+            stage=DeliveryStage.FINAL,
+            room_id=_ROOM_ID,
+            thread_id=None,
+            payload={"msgtype": "m.text", "body": "final"},
+        )
+        send_started = asyncio.Event()
+        finish_send = asyncio.Event()
+        sent: list[DeliveryStage] = []
+
+        async def send(delivery: MatrixDelivery) -> str:
+            send_started.set()
+            await finish_send.wait()
+            sent.append(delivery.stage)
+            return "$final"
+
+        delivery = MatrixDeliveryWorker(
+            store=outbox,
+            send=send,
+            observe_delivered=ignore_delivered_projection,
+            process_shutdown_requested=current_task_is_process_shutdown,
+        )
+        recovery = asyncio.create_task(delivery.recover())
+        await send_started.wait()
+        request_task_cancel(recovery, process_shutdown=True)
+        finish_send.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await recovery
 
         stored = await outbox.load_matrix_delivery(delivery_id="turn-1", stage=DeliveryStage.FINAL)
         assert stored is not None
@@ -3378,6 +4505,124 @@ class TestTurnDeliverySerialization:
         assert sent == [DeliveryStage.FINAL]
         assert await delivery.recover() == RecoveryOutcome(recovered=0, failed=0)
 
+    async def test_process_shutdown_after_claim_starts_leaves_send_for_recovery(
+        self,
+    ) -> None:
+        """A process stop after claim must leave the unsent row for startup recovery."""
+        outbox = FakeOutbox()
+        claim_started = asyncio.Event()
+        finish_claim = asyncio.Event()
+        original_claim = outbox.claim_matrix_delivery
+        sent: list[DeliveryStage] = []
+
+        async def claim_then_wait(
+            *,
+            delivery_id: str,
+            stage: DeliveryStage,
+            sending_device_id: str | None = None,
+        ) -> MatrixDelivery | None:
+            claim_started.set()
+            await finish_claim.wait()
+            return await original_claim(
+                delivery_id=delivery_id,
+                stage=stage,
+                sending_device_id=sending_device_id,
+            )
+
+        async def send(delivery: MatrixDelivery) -> str:
+            sent.append(delivery.stage)
+            return "$final"
+
+        delivery = MatrixDeliveryWorker(
+            store=outbox,
+            send=send,
+            observe_delivered=ignore_delivered_projection,
+            process_shutdown_requested=current_task_is_process_shutdown,
+        )
+        with patch.object(outbox, "claim_matrix_delivery", side_effect=claim_then_wait):
+            final = asyncio.create_task(
+                delivery.deliver(
+                    delivery_id="turn-1",
+                    stage=DeliveryStage.FINAL,
+                    room_id=_ROOM_ID,
+                    thread_id=None,
+                    payload={"msgtype": "m.text", "body": "final"},
+                ),
+            )
+            await claim_started.wait()
+            request_task_cancel(final, process_shutdown=True)
+            finish_claim.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await final
+
+        stored = await outbox.load_matrix_delivery(delivery_id="turn-1", stage=DeliveryStage.FINAL)
+        assert stored is not None
+        assert stored.acknowledged_event_id is None
+        assert sent == []
+        assert await delivery.recover() == RecoveryOutcome(recovered=1, failed=0)
+        assert sent == [DeliveryStage.FINAL]
+
+    async def test_process_shutdown_before_matrix_send_leaves_marked_row_for_recovery(
+        self,
+    ) -> None:
+        """A committed device marker is recoverable when shutdown precedes the send."""
+        outbox = FakeOutbox()
+        device_write_started = asyncio.Event()
+        finish_device_write = asyncio.Event()
+        original_record_sending_device = outbox.record_matrix_delivery_device
+        sent: list[DeliveryStage] = []
+
+        async def record_device_then_wait(
+            *,
+            delivery_id: str,
+            stage: DeliveryStage,
+            device_id: str | None,
+        ) -> None:
+            device_write_started.set()
+            await finish_device_write.wait()
+            await original_record_sending_device(
+                delivery_id=delivery_id,
+                stage=stage,
+                device_id=device_id,
+            )
+
+        async def send(delivery: MatrixDelivery) -> str:
+            sent.append(delivery.stage)
+            return "$final"
+
+        delivery = MatrixDeliveryWorker(
+            store=outbox,
+            send=send,
+            observe_delivered=ignore_delivered_projection,
+            sending_device_id="DEVICE1",
+            process_shutdown_requested=current_task_is_process_shutdown,
+        )
+        with patch.object(outbox, "record_matrix_delivery_device", side_effect=record_device_then_wait):
+            final = asyncio.create_task(
+                delivery.deliver(
+                    delivery_id="turn-1",
+                    stage=DeliveryStage.FINAL,
+                    room_id=_ROOM_ID,
+                    thread_id=None,
+                    payload={"msgtype": "m.text", "body": "final"},
+                ),
+            )
+            await device_write_started.wait()
+            request_task_cancel(final, process_shutdown=True)
+            finish_device_write.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await final
+
+        stored = await outbox.load_matrix_delivery(delivery_id="turn-1", stage=DeliveryStage.FINAL)
+        assert stored is not None
+        assert stored.acknowledged_event_id is None
+        assert stored.sending_device_id == "DEVICE1"
+        assert sent == []
+        assert await delivery.recover() == RecoveryOutcome(recovered=1, failed=0)
+        assert sent == [DeliveryStage.FINAL]
+
     async def test_terminal_callback_can_reenter_the_same_turn(
         self,
         tmp_path: Path,
@@ -3388,7 +4633,7 @@ class TestTurnDeliverySerialization:
         reentered: list[str | None] = []
         reentrant_delivery: MatrixDeliveryWorker | None = None
 
-        async def publish_committed(_turn_id: str, _event_id: str) -> None:
+        async def publish_committed(_turn_id: str, _event_id: str, _committed: TurnRecord | None) -> None:
             assert reentrant_delivery is not None
             reentered.append(await reentrant_delivery.flush(delivery_id="turn-1", stage=DeliveryStage.FINAL))
 
@@ -3464,6 +4709,7 @@ class TestTheAcknowledgedRecordOutlivesAConcurrentMutation:
         """
         turn_store = await _store(journal_store, agent_name="agent")
         await turn_store.record_pending_turn(TurnRecord.create(["$source"], completed=False))
+        await admit_room_event(alice, _ROOM_ID, "$source")
         gateway = _gateway(
             tmp_path,
             alice,
@@ -3491,7 +4737,7 @@ class TestTheAcknowledgedRecordOutlivesAConcurrentMutation:
             await send_started.wait()
             # Started while the answer is on the wire, so it derives its record
             # from a memory the acknowledgement has not published into yet.
-            redaction = asyncio.create_task(turn_store.mark_source_redacted("$source"))
+            redaction = asyncio.create_task(turn_store.mark_source_redacted("$source", room_id=_ROOM_ID))
             finish_send.set()
             outcome = await recovery
             await redaction

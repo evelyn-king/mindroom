@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
+import ipaddress
 import os
 import signal
+import ssl
 import sys
+import threading
 from collections.abc import Awaitable, Callable
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Self, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -16,17 +22,26 @@ import httpx
 import nio
 import pytest
 import uvicorn
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from structlog.testing import capture_logs
 
+import mindroom.orchestrator as orchestrator_module
 import mindroom.tool_system.plugin_imports as plugin_module
 import mindroom.workers.runtime as workers_runtime_module
+from mindroom.agent_cli.session import CliAuthenticationError, CliOperationOwner
+from mindroom.agent_reply_membership import AgentReplyMembershipIndex
+from mindroom.api import config_lifecycle as api_config_lifecycle
+from mindroom.api import main as api_main
 from mindroom.approval_manager import (
     _ApprovalStartupSweep,
     get_approval_store,
     initialize_approval_store,
 )
-from mindroom.authorization import is_authorized_sender as is_authorized_sender_for_test
 from mindroom.background_tasks import wait_for_background_tasks
+from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.matrix import EventJournalConfig
@@ -37,10 +52,14 @@ from mindroom.constants import (
     resolve_runtime_paths,
 )
 from mindroom.event_journal_open import record_opened_event_journal
+from mindroom.heap_probe import start_heap_type_probe
 from mindroom.hooks import (
+    ConfigReloadedContext,
     HookRegistry,
 )
+from mindroom.matrix import client_session
 from mindroom.matrix.client import PermanentMatrixStartupError
+from mindroom.matrix.invited_rooms_store import invited_rooms_path
 from mindroom.matrix.state import MatrixState
 from mindroom.matrix.users import INTERNAL_USER_ACCOUNT_KEY, AgentMatrixUser
 from mindroom.orchestration import config_lifecycle as config_lifecycle_module
@@ -55,6 +74,7 @@ from mindroom.orchestration.runtime import (
 )
 from mindroom.orchestrator import (
     _EmbeddedApiServerContext,
+    _finish_runtime_shutdown,
     _MultiAgentOrchestrator,
     _run_api_server,
     _run_auxiliary_task_forever,
@@ -74,7 +94,6 @@ from mindroom.startup_errors import PermanentStartupError
 from mindroom.tool_approval import shutdown_approval_runtime
 from mindroom.tool_system.metadata import TOOL_METADATA
 from mindroom.tool_system.skills import _get_plugin_skill_roots, set_plugin_skill_roots
-from mindroom.tool_system.worker_routing import agent_state_root_path
 from tests.bot_helpers import (
     AgentBotTestBase,
     _configured_team_test_config,
@@ -100,10 +119,12 @@ async def test_reply_membership_refresh_revokes_before_scheduling_positive_call_
     orchestrator.config = config
     router_bot = MagicMock()
     router_bot.client = AsyncMock(spec=nio.AsyncClient)
+    router_bot.reconcile_pending_invites = AsyncMock()
     router_bot.revoke_reply_authorized_calls = AsyncMock()
     router_bot.reconcile_reply_authorized_calls = AsyncMock(side_effect=AssertionError("must be scheduled"))
     worker_bot = MagicMock()
     worker_bot.client = AsyncMock(spec=nio.AsyncClient)
+    worker_bot.reconcile_pending_invites = AsyncMock()
     worker_bot.revoke_reply_authorized_calls = AsyncMock()
     worker_bot.reconcile_reply_authorized_calls = AsyncMock(side_effect=AssertionError("must be scheduled"))
     orchestrator.agent_bots = {
@@ -111,7 +132,10 @@ async def test_reply_membership_refresh_revokes_before_scheduling_positive_call_
         "worker": worker_bot,
     }
 
-    with patch.object(orchestrator.agent_reply_memberships, "refresh", new=AsyncMock()) as refresh:
+    with (
+        patch.object(orchestrator.agent_reply_memberships, "refresh", new=AsyncMock()) as refresh,
+        patch.object(orchestrator.agent_reply_memberships, "needs_refresh", return_value=False),
+    ):
         await orchestrator.refresh_agent_reply_memberships()
 
     refresh.assert_awaited_once_with(config, orchestrator.runtime_paths, router_bot.client)
@@ -123,9 +147,101 @@ async def test_reply_membership_refresh_revokes_before_scheduling_positive_call_
     worker_bot.reconcile_reply_authorized_calls.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_successful_reply_membership_refresh_opens_new_revocation_gap(
+    tmp_path: Path,
+) -> None:
+    """A later invalidation must revoke calls again after an authoritative refresh."""
+    config = _runtime_bound_config(Config(), tmp_path)
+    config.router.access = ResponderAccessConfig(current_room_members=False, members_of_rooms=[])
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
+    orchestrator.config = config
+    router_bot = MagicMock()
+    router_bot.client = AsyncMock(spec=nio.AsyncClient)
+    router_bot.reconcile_pending_invites = AsyncMock()
+    router_bot.revoke_reply_authorized_calls = AsyncMock()
+    orchestrator.agent_bots = {ROUTER_AGENT_NAME: router_bot}
+
+    orchestrator.invalidate_agent_reply_memberships(reason="uncertain_sync_response")
+    await orchestrator.refresh_agent_reply_memberships()
+    router_bot.schedule_reply_authorized_call_revocation.reset_mock()
+
+    orchestrator.invalidate_agent_reply_memberships(reason="uncertain_sync_response")
+
+    router_bot.schedule_reply_authorized_call_revocation.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_invalidation_during_post_refresh_effects_skips_positive_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """A new gap after refresh publication must revoke again and suppress positive starts."""
+    room_id = "!grant:localhost"
+    config = _runtime_bound_config(Config(), tmp_path)
+    config.router.access = ResponderAccessConfig(current_room_members=False, members_of_rooms=["grant"])
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
+    orchestrator.config = config
+    state = MatrixState.load(runtime_paths=orchestrator.runtime_paths)
+    state.add_room("grant", room_id, "#grant:localhost", "Grant")
+    state.save(runtime_paths=orchestrator.runtime_paths)
+    client = make_matrix_client_mock(user_id="@mindroom_router:localhost")
+    client.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=[room_id])
+    client.joined_members.return_value = nio.JoinedMembersResponse(
+        members=[nio.RoomMember("@mindroom_router:localhost", None, None)],
+        room_id=room_id,
+    )
+    effects_started = asyncio.Event()
+    release_effects = asyncio.Event()
+
+    async def block_post_refresh_effects() -> None:
+        effects_started.set()
+        await release_effects.wait()
+
+    router_bot = MagicMock()
+    router_bot.client = client
+    router_bot.reconcile_pending_invites = AsyncMock()
+    router_bot.revoke_reply_authorized_calls = AsyncMock(side_effect=block_post_refresh_effects)
+    orchestrator.agent_bots = {ROUTER_AGENT_NAME: router_bot}
+    orchestrator.invalidate_agent_reply_memberships(reason="initial_gap")
+    router_bot.schedule_reply_authorized_call_revocation.reset_mock()
+
+    refresh_task = asyncio.create_task(orchestrator.refresh_agent_reply_memberships())
+    await asyncio.wait_for(effects_started.wait(), timeout=1.0)
+    try:
+        orchestrator.invalidate_agent_reply_memberships(reason="uncertain_sync_response")
+    finally:
+        release_effects.set()
+        await refresh_task
+
+    router_bot.schedule_reply_authorized_call_revocation.assert_called_once_with()
+    router_bot.schedule_reply_authorized_call_reconciliation.assert_not_called()
+    router_bot.schedule_pending_invite_reconciliation.assert_called_once_with()
+
+
+def test_repeated_reply_membership_invalidation_schedules_one_revocation_wave(
+    tmp_path: Path,
+) -> None:
+    """Uncertain sync batches must not start overlapping positive call reconciliation."""
+    config = _runtime_bound_config(Config(), tmp_path)
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
+    orchestrator.config = config
+    router_bot = MagicMock()
+    worker_bot = MagicMock()
+    orchestrator.agent_bots = {
+        ROUTER_AGENT_NAME: router_bot,
+        "worker": worker_bot,
+    }
+    orchestrator.invalidate_agent_reply_memberships(reason="uncertain_sync_response")
+    orchestrator.invalidate_agent_reply_memberships(reason="uncertain_sync_response")
+
+    router_bot.schedule_reply_authorized_call_revocation.assert_called_once_with()
+    worker_bot.schedule_reply_authorized_call_revocation.assert_called_once_with()
+    router_bot.schedule_reply_authorized_call_reconciliation.assert_not_called()
+    worker_bot.schedule_reply_authorized_call_reconciliation.assert_not_called()
+
+
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
-    from pathlib import Path
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
 
 @pytest.fixture(autouse=True)
@@ -148,11 +264,21 @@ def _retry_tasks() -> list[asyncio.Task[Any]]:
     return [task for task in asyncio.all_tasks() if task.get_name() == "approval_startup_cleanup_retry"]
 
 
+def _mock_runtime_orchestrator() -> MagicMock:
+    """Create a lifecycle test double with the runtime readiness contract."""
+    orchestrator = MagicMock()
+    orchestrator._runtime_ready_event = asyncio.Event()
+    return orchestrator
+
+
 @contextmanager
-def _mock_approval_recovery(**kwargs: object) -> Iterator[AsyncMock]:
+def _mock_approval_recovery(orchestrator: _MultiAgentOrchestrator, **kwargs: object) -> Iterator[AsyncMock]:
     recovery = AsyncMock(**kwargs)
     manager = MagicMock(recover_cards_on_startup=recovery)
-    with patch("mindroom.approval_transport.approval_manager.get_approval_store", return_value=manager):
+    with (
+        patch.object(orchestrator._approval_recovery, "manager", manager),
+        patch("mindroom.orchestrator.initialize_approval_store", return_value=manager),
+    ):
         yield recovery
 
 
@@ -191,7 +317,7 @@ async def test_unavailable_final_recovery_restores_offline_owner_account(tmp_pat
     """Startup cleanup must recover FINAL debt under a removed owner's persisted Matrix principal."""
     config = Config.model_validate(
         {
-            "models": {"default": {"provider": "openai", "id": "gpt-5.4"}},
+            "models": {"default": {"provider": "openai", "id": "gpt-6-astra"}},
             "router": {"model": "default"},
         },
     )
@@ -233,18 +359,74 @@ async def test_entity_removal_recovers_original_final_before_bot_cleanup(tmp_pat
     runtime_paths = resolve_runtime_paths(config_path=config_path, storage_path=tmp_path / "data", process_env={})
     orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths)
     order: list[str] = []
+
+    async def receive() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("cancel_sync")
+
+    sync = asyncio.create_task(receive())
+    await asyncio.sleep(0)
+    orchestrator._sync_tasks["removed"] = sync
+
+    async def cleanup() -> None:
+        assert not sync.done(), "membership cleanup still needs the ingestion pump"
+        order.append("cleanup")
+
     bot = MagicMock()
     bot.prepare_for_sync_shutdown = AsyncMock(side_effect=lambda **_kwargs: order.append("quiesce"))
-    bot.cleanup = AsyncMock(side_effect=lambda: order.append("cleanup"))
+    bot.leave_rooms = AsyncMock(side_effect=cleanup)
+    bot.stop = AsyncMock(side_effect=lambda **_kwargs: order.append("stop"))
     orchestrator.agent_bots["removed"] = bot
-    orchestrator._approval_transport.reconcile_unavailable_entities = AsyncMock(
+    orchestrator._approval_recovery.reconcile_unavailable_entities = AsyncMock(
         side_effect=lambda _names: order.append("recover"),
     )
 
-    await orchestrator._remove_deleted_entities({"removed"})
+    try:
+        await orchestrator._remove_deleted_entities({"removed"})
+    finally:
+        sync.cancel()
+        await asyncio.gather(sync, return_exceptions=True)
 
-    assert order == ["quiesce", "recover", "cleanup"]
+    assert order == ["quiesce", "recover", "cleanup", "cancel_sync", "stop"]
     assert "removed" not in orchestrator.agent_bots
+
+
+@pytest.mark.asyncio
+async def test_entity_removal_keeps_bot_registered_until_cleanup_succeeds(
+    tmp_path: Path,
+) -> None:
+    """Failed cleanup cannot detach a bot whose hook contexts are still live."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("router:\n  model: default\n", encoding="utf-8")
+    runtime_paths = resolve_runtime_paths(
+        config_path=config_path,
+        storage_path=tmp_path / "data",
+        process_env={},
+    )
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths)
+    bot = MagicMock()
+    bot.prepare_for_sync_shutdown = AsyncMock()
+    bot.leave_rooms = AsyncMock()
+    bot.stop = AsyncMock(side_effect=RuntimeError("cleanup failed"))
+    orchestrator.agent_bots["removed"] = bot
+    orchestrator._approval_recovery.reconcile_unavailable_entities = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        await orchestrator._remove_deleted_entities({"removed"})
+
+    assert orchestrator.agent_bots["removed"] is bot
+
+
+def _bind_orderly_shutdown(bot: MagicMock) -> None:
+    """Give a lightweight bot double the async shutdown protocol."""
+    bot.pending_response_owner_count = 0
+    bot.pending_response_phase_counts = {}
+    bot.deferred_stop_phase = None
+    bot.deferred_stop_required = False
+    bot._quiesce_matrix_ingestion = AsyncMock()
+    bot.stop = AsyncMock()
 
 
 class TestAgentBot(AgentBotTestBase):
@@ -255,7 +437,7 @@ class TestAgentBot(AgentBotTestBase):
         """Permanent startup errors should stop the process and surface the failure."""
         reset_runtime_state()
         blocking_event = asyncio.Event()
-        mock_orchestrator = MagicMock()
+        mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.start = AsyncMock(side_effect=PermanentMatrixStartupError("boom"))
         mock_orchestrator.stop = AsyncMock()
         mock_orchestrator.running = False
@@ -393,8 +575,50 @@ class TestAgentBot(AgentBotTestBase):
         assert get_api_server_address() is None
 
     @pytest.mark.asyncio
+    async def test_run_api_server_binds_live_memberships_and_clears_on_shutdown(self, tmp_path: Path) -> None:
+        """Roomless API authorization follows the orchestrator's live membership index."""
+        memberships = AgentReplyMembershipIndex()
+        reload_status = MagicMock()
+
+        class ReturningServer:
+            should_exit = True
+            force_exit = False
+
+            def __init__(
+                self,
+                _config: object,
+                _shutdown_requested: asyncio.Event | None,
+                *,
+                on_started: Callable[[str, int], Awaitable[None]] | None = None,
+            ) -> None:
+                del on_started
+
+            async def serve(self) -> None:
+                assert api_config_lifecycle.app_state(api_main.app).agent_reply_memberships is memberships
+                assert api_config_lifecycle.app_state(api_main.app).config_reload_status is reload_status
+
+        shutdown_requested = asyncio.Event()
+        shutdown_requested.set()
+        with (
+            patch("mindroom.orchestrator.uvicorn.Config", return_value=object()),
+            patch("mindroom.orchestrator._SignalAwareUvicornServer", ReturningServer),
+        ):
+            await _run_api_server(
+                "127.0.0.1",
+                8765,
+                "INFO",
+                self._runtime_paths(tmp_path),
+                agent_reply_memberships=memberships,
+                config_reload_status=reload_status,
+                shutdown_requested=shutdown_requested,
+            )
+
+        assert api_config_lifecycle.app_state(api_main.app).agent_reply_memberships is not memberships
+        assert api_config_lifecycle.app_state(api_main.app).config_reload_status is None
+
+    @pytest.mark.asyncio
     async def test_run_api_server_binds_process_local_script_runtime(self, tmp_path: Path) -> None:
-        """The API gateway must receive the lifecycle-owned broker without replacing it."""
+        """The API gateway and its dedicated listener must receive the lifecycle-owned broker without replacing it."""
 
         class ReturningServer:
             should_exit = True
@@ -421,7 +645,9 @@ class TestAgentBot(AgentBotTestBase):
             bind_api=MagicMock(),
             unbind_api=AsyncMock(),
             touch_live_workers=MagicMock(),
+            active_runs=AsyncMock(return_value=[]),
         )
+        runtime_paths = self._runtime_paths(tmp_path)
 
         with (
             patch("mindroom.orchestrator.uvicorn.Config", return_value=object()),
@@ -429,12 +655,13 @@ class TestAgentBot(AgentBotTestBase):
             patch("mindroom.api.main.initialize_api_app"),
             patch("mindroom.api.main.bind_script_runtime") as bind_script_runtime,
             patch("mindroom.api.main.unbind_script_runtime") as unbind_script_runtime,
+            patch("mindroom.api.script_gateway.serve_script_gateway_listener", return_value=nullcontext()) as listener,
         ):
             await _run_api_server(
                 "127.0.0.1",
                 8765,
                 "INFO",
-                self._runtime_paths(tmp_path),
+                runtime_paths,
                 script_runtime=script_runtime,
                 shutdown_requested=shutdown_requested,
             )
@@ -447,6 +674,12 @@ class TestAgentBot(AgentBotTestBase):
         script_runtime.bind_api.assert_called_once_with("http://127.0.0.1:43210/api/script-gateway")
         script_runtime.unbind_api.assert_awaited_once_with()
         unbind_script_runtime.assert_called_once_with(ANY)
+        listener.assert_called_once_with(
+            runtime_paths,
+            host="127.0.0.1",
+            broker=script_runtime.broker,
+            log_level="INFO",
+        )
 
     @pytest.mark.asyncio
     async def test_run_api_server_starts_without_optional_worker_script_gateway(self, tmp_path: Path) -> None:
@@ -488,6 +721,7 @@ class TestAgentBot(AgentBotTestBase):
             bind_api=MagicMock(),
             unbind_api=AsyncMock(),
             touch_live_workers=MagicMock(),
+            active_runs=AsyncMock(return_value=[]),
         )
 
         with (
@@ -550,6 +784,7 @@ class TestAgentBot(AgentBotTestBase):
             bind_api=MagicMock(),
             unbind_api=AsyncMock(),
             touch_live_workers=MagicMock(),
+            active_runs=AsyncMock(return_value=[]),
         )
 
         with (
@@ -624,6 +859,7 @@ class TestAgentBot(AgentBotTestBase):
                     bind_api=MagicMock(),
                     unbind_api=AsyncMock(),
                     touch_live_workers=MagicMock(),
+                    active_runs=AsyncMock(return_value=[]),
                 ),
                 shutdown_requested=asyncio.Event(),
             )
@@ -812,7 +1048,7 @@ class TestAgentBot(AgentBotTestBase):
         events: list[str] = []
         orchestrator_cancelled = asyncio.Event()
         api_cancelled = asyncio.Event()
-        mock_orchestrator = MagicMock()
+        mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.knowledge_refresh_scheduler = None
         mock_orchestrator.stop = AsyncMock()
 
@@ -831,7 +1067,22 @@ class TestAgentBot(AgentBotTestBase):
             _knowledge_refresh_scheduler: object,
             _script_runtime: object,
             shutdown_requested: asyncio.Event | None,
+            *,
+            thread_export_runner: object,
+            leave_matrix_room: object,
+            response_admission_gate: object,
+            active_calls: object,
+            agent_reply_memberships: AgentReplyMembershipIndex,
+            config_reload_status: Callable[[], object],
+            agent_cli_registry: object,
         ) -> None:
+            assert agent_cli_registry is mock_orchestrator.agent_cli_registry
+            assert thread_export_runner is mock_orchestrator._thread_export_runner
+            assert leave_matrix_room == mock_orchestrator.leave_matrix_room
+            assert response_admission_gate is mock_orchestrator._response_admission_gate
+            assert active_calls == mock_orchestrator.active_call_identities
+            assert agent_reply_memberships is mock_orchestrator.agent_reply_memberships
+            assert config_reload_status() is mock_orchestrator.config_reload.status
             assert shutdown_requested is not None
             shutdown_requested.set()
             try:
@@ -881,7 +1132,7 @@ class TestAgentBot(AgentBotTestBase):
         mock_orchestrator.stop.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_orchestrator_main_waits_for_api_server_graceful_shutdown_after_request(
+    async def test_orchestrator_main_waits_for_api_server_graceful_shutdown_after_request(  # noqa: PLR0915
         self,
         tmp_path: Path,
     ) -> None:
@@ -892,7 +1143,7 @@ class TestAgentBot(AgentBotTestBase):
         api_completed = asyncio.Event()
         api_cancelled = asyncio.Event()
         start_blocker = asyncio.Event()
-        mock_orchestrator = MagicMock()
+        mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.knowledge_refresh_scheduler = None
         mock_orchestrator.stop = AsyncMock()
 
@@ -907,7 +1158,22 @@ class TestAgentBot(AgentBotTestBase):
             _knowledge_refresh_scheduler: object,
             _script_runtime: object,
             shutdown_requested: asyncio.Event | None,
+            *,
+            thread_export_runner: object,
+            leave_matrix_room: object,
+            response_admission_gate: object,
+            active_calls: object,
+            agent_reply_memberships: AgentReplyMembershipIndex,
+            config_reload_status: Callable[[], object],
+            agent_cli_registry: object,
         ) -> None:
+            assert agent_cli_registry is mock_orchestrator.agent_cli_registry
+            assert thread_export_runner is mock_orchestrator._thread_export_runner
+            assert leave_matrix_room == mock_orchestrator.leave_matrix_room
+            assert response_admission_gate is mock_orchestrator._response_admission_gate
+            assert active_calls == mock_orchestrator.active_call_identities
+            assert agent_reply_memberships is mock_orchestrator.agent_reply_memberships
+            assert config_reload_status() is mock_orchestrator.config_reload.status
             assert shutdown_requested is not None
             shutdown_requested.set()
             api_shutdown_started.set()
@@ -956,7 +1222,7 @@ class TestAgentBot(AgentBotTestBase):
         """Regression coverage for API server signal shutdown not leaving the process half alive."""
         reset_runtime_state()
         start_released = asyncio.Event()
-        mock_orchestrator = MagicMock()
+        mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.knowledge_refresh_scheduler = None
 
         async def _start() -> None:
@@ -973,7 +1239,22 @@ class TestAgentBot(AgentBotTestBase):
             _knowledge_refresh_scheduler: object,
             _script_runtime: object,
             shutdown_requested: asyncio.Event | None,
+            *,
+            thread_export_runner: object,
+            leave_matrix_room: object,
+            response_admission_gate: object,
+            active_calls: object,
+            agent_reply_memberships: AgentReplyMembershipIndex,
+            config_reload_status: Callable[[], object],
+            agent_cli_registry: object,
         ) -> None:
+            assert agent_cli_registry is mock_orchestrator.agent_cli_registry
+            assert thread_export_runner is mock_orchestrator._thread_export_runner
+            assert leave_matrix_room == mock_orchestrator.leave_matrix_room
+            assert response_admission_gate is mock_orchestrator._response_admission_gate
+            assert active_calls == mock_orchestrator.active_call_identities
+            assert agent_reply_memberships is mock_orchestrator.agent_reply_memberships
+            assert config_reload_status() is mock_orchestrator.config_reload.status
             assert shutdown_requested is not None
             shutdown_requested.set()
 
@@ -1025,6 +1306,52 @@ class TestAgentBot(AgentBotTestBase):
         assert cleanup_task.done()
 
     @pytest.mark.asyncio
+    async def test_runtime_shutdown_stops_core_before_waiting_for_auxiliary_tasks(
+        self,
+    ) -> None:
+        """A stuck watcher cannot delay Matrix quiesce and owned cleanup."""
+        auxiliary_started = asyncio.Event()
+        auxiliary_cancelled = asyncio.Event()
+        core_stop_started = asyncio.Event()
+
+        async def stubborn_auxiliary() -> None:
+            auxiliary_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                auxiliary_cancelled.set()
+                await core_stop_started.wait()
+                raise
+
+        auxiliary_task = asyncio.create_task(stubborn_auxiliary())
+        await asyncio.wait_for(auxiliary_started.wait(), timeout=1)
+        orchestrator = MagicMock()
+
+        async def stop_core() -> None:
+            core_stop_started.set()
+
+        orchestrator.stop = AsyncMock(side_effect=stop_core)
+
+        finishing = asyncio.create_task(
+            _finish_runtime_shutdown(
+                shutdown_wait_task=None,
+                api_task=None,
+                orchestrator_task=None,
+                auxiliary_tasks=[auxiliary_task],
+                orchestrator=orchestrator,
+                stall_detector=None,
+            ),
+        )
+        try:
+            await asyncio.wait_for(core_stop_started.wait(), timeout=0.1)
+        finally:
+            core_stop_started.set()
+            await finishing
+
+        assert auxiliary_cancelled.is_set()
+        orchestrator.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_runtime_cleanup_preserves_unrequested_cancellation_after_cleanup_failure(
         self,
     ) -> None:
@@ -1059,7 +1386,7 @@ class TestAgentBot(AgentBotTestBase):
     async def test_orchestrator_main_fails_when_api_server_exits_unexpectedly(self, tmp_path: Path) -> None:
         """An unexpected API-server task failure should stop the top-level run non-silently."""
         reset_runtime_state()
-        mock_orchestrator = MagicMock()
+        mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.knowledge_refresh_scheduler = None
         mock_orchestrator.stop = AsyncMock()
         start_blocker = asyncio.Event()
@@ -1095,7 +1422,7 @@ class TestAgentBot(AgentBotTestBase):
         watched_paths: list[Path] = []
         config_watcher_ran = asyncio.Event()
         resolved_config_path = (tmp_path / "nested" / "config.yaml").resolve()
-        mock_orchestrator = MagicMock()
+        mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.config_path = resolved_config_path
         mock_orchestrator._require_config_path.return_value = resolved_config_path
         mock_orchestrator.stop = AsyncMock()
@@ -1135,6 +1462,161 @@ class TestAgentBot(AgentBotTestBase):
         assert watched_paths == [resolved_config_path]
 
     @pytest.mark.asyncio
+    async def test_orchestrator_main_starts_provisioning_heartbeat(self, tmp_path: Path) -> None:
+        """Startup runs the paired-install heartbeat as a background task and cancels it at shutdown."""
+        reset_runtime_state()
+        runtime_paths = self._runtime_paths(tmp_path)
+        heartbeat_paths: list[RuntimePaths] = []
+        heartbeat_started = asyncio.Event()
+        heartbeat_cancelled = asyncio.Event()
+        mock_orchestrator = _mock_runtime_orchestrator()
+        mock_orchestrator.stop = AsyncMock()
+
+        async def _heartbeat(paths: RuntimePaths) -> None:
+            heartbeat_paths.append(paths)
+            heartbeat_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                heartbeat_cancelled.set()
+                raise
+
+        async def _start() -> None:
+            await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
+            msg = "stop after heartbeat start"
+            raise RuntimeError(msg)
+
+        mock_orchestrator.start = AsyncMock(side_effect=_start)
+
+        with (
+            patch("mindroom.orchestrator.setup_logging"),
+            patch("mindroom.orchestrator.sync_env_to_credentials"),
+            patch("mindroom.orchestrator._MultiAgentOrchestrator", return_value=mock_orchestrator),
+            patch("mindroom.orchestrator._run_auxiliary_task_forever", new=AsyncMock()),
+            patch("mindroom.orchestrator.run_provisioning_heartbeat", side_effect=_heartbeat),
+            pytest.raises(RuntimeError, match="stop after heartbeat start"),
+        ):
+            await main(log_level="INFO", runtime_paths=runtime_paths, api=False)
+
+        assert heartbeat_paths == [runtime_paths]
+        assert heartbeat_cancelled.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interval", [None, "60"])
+    async def test_orchestrator_main_starts_opt_in_heap_probe_and_cancels_it_at_shutdown(
+        self,
+        tmp_path: Path,
+        interval: str | None,
+    ) -> None:
+        """Only an opted-in primary runs the heap probe, and runtime cleanup cancels it."""
+        reset_runtime_state()
+        process_env = {} if interval is None else {"MINDROOM_HEAP_PROBE_INTERVAL_SECONDS": interval}
+        runtime_paths = resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path,
+            process_env=process_env,
+        )
+        mock_orchestrator = _mock_runtime_orchestrator()
+        mock_orchestrator.start = AsyncMock(side_effect=RuntimeError("stop after auxiliary start"))
+        mock_orchestrator.stop = AsyncMock()
+        started_probes: list[asyncio.Task[None] | None] = []
+
+        def _start_probe(paths: RuntimePaths) -> asyncio.Task[None] | None:
+            probe = start_heap_type_probe(paths)
+            started_probes.append(probe)
+            return probe
+
+        with (
+            patch("mindroom.orchestrator.setup_logging"),
+            patch("mindroom.orchestrator.sync_env_to_credentials"),
+            patch("mindroom.orchestrator._MultiAgentOrchestrator", return_value=mock_orchestrator),
+            patch("mindroom.orchestrator._run_auxiliary_task_forever", new=AsyncMock()),
+            patch("mindroom.orchestrator.start_heap_type_probe", side_effect=_start_probe),
+            pytest.raises(RuntimeError, match="stop after auxiliary start"),
+        ):
+            await main(log_level="INFO", runtime_paths=runtime_paths, api=False)
+
+        [probe] = started_probes
+        if interval is None:
+            assert probe is None
+        else:
+            assert probe is not None
+            assert probe.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_main_rejects_invalid_heap_probe_before_starting_auxiliary_tasks(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An invalid probe interval fails startup before any watcher or heartbeat task exists to leak."""
+        reset_runtime_state()
+        runtime_paths = resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path,
+            process_env={"MINDROOM_HEAP_PROBE_INTERVAL_SECONDS": "30"},
+        )
+        mock_orchestrator = _mock_runtime_orchestrator()
+        mock_orchestrator.stop = AsyncMock()
+        run_auxiliary = AsyncMock()
+        heartbeat = AsyncMock()
+
+        with (
+            patch("mindroom.orchestrator.setup_logging"),
+            patch("mindroom.orchestrator.sync_env_to_credentials"),
+            patch("mindroom.orchestrator._MultiAgentOrchestrator", return_value=mock_orchestrator),
+            patch("mindroom.orchestrator._run_auxiliary_task_forever", new=run_auxiliary),
+            patch("mindroom.orchestrator.run_provisioning_heartbeat", new=heartbeat),
+            pytest.raises(ValueError, match="MINDROOM_HEAP_PROBE_INTERVAL_SECONDS"),
+        ):
+            await main(log_level="INFO", runtime_paths=runtime_paths, api=False)
+
+        run_auxiliary.assert_not_called()
+        heartbeat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_main_cleanup_survives_failed_heartbeat(self, tmp_path: Path) -> None:
+        """A failed heartbeat is logged when it dies, then neither skips cleanup nor replaces the runtime's error."""
+        reset_runtime_state()
+        mock_orchestrator = _mock_runtime_orchestrator()
+        mock_orchestrator.stop = AsyncMock()
+        shutdown_worker_manager = MagicMock()
+        background_logger = MagicMock()
+        failure_logged = asyncio.Event()
+        background_logger.exception.side_effect = lambda *_args, **_kwargs: failure_logged.set()
+
+        async def _heartbeat(_paths: RuntimePaths) -> None:
+            msg = "stale SSL_CERT_FILE"
+            raise FileNotFoundError(msg)
+
+        async def _start() -> None:
+            await asyncio.wait_for(failure_logged.wait(), timeout=1)
+            assert not shutdown_worker_manager.called
+            msg = "orchestrator failed"
+            raise RuntimeError(msg)
+
+        mock_orchestrator.start = AsyncMock(side_effect=_start)
+
+        with (
+            patch("mindroom.background_tasks.logger", new=background_logger),
+            patch("mindroom.orchestrator.setup_logging"),
+            patch("mindroom.orchestrator.sync_env_to_credentials"),
+            patch("mindroom.orchestrator._MultiAgentOrchestrator", return_value=mock_orchestrator),
+            patch("mindroom.orchestrator._run_auxiliary_task_forever", new=AsyncMock()),
+            patch("mindroom.orchestrator.run_provisioning_heartbeat", side_effect=_heartbeat),
+            patch("mindroom.orchestrator.shutdown_primary_worker_manager", new=shutdown_worker_manager),
+            pytest.raises(RuntimeError, match="orchestrator failed"),
+        ):
+            await main(log_level="INFO", runtime_paths=self._runtime_paths(tmp_path), api=False)
+
+        background_logger.exception.assert_called_once_with(
+            "Background task failed",
+            task_name="provisioning_heartbeat",
+            error="stale SSL_CERT_FILE",
+        )
+        mock_orchestrator.stop.assert_awaited_once()
+        shutdown_worker_manager.assert_called_once_with()
+
+    @pytest.mark.asyncio
     async def test_orchestrator_main_commits_runtime_storage_root_before_logging_and_credential_sync(
         self,
         tmp_path: Path,
@@ -1144,7 +1626,7 @@ class TestAgentBot(AgentBotTestBase):
         runtime_storage = tmp_path / "runtime-storage"
         observed_logging_root: Path | None = None
         observed_credentials_root: Path | None = None
-        mock_orchestrator = MagicMock()
+        mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.start = AsyncMock(side_effect=RuntimeError("stop after storage capture"))
         mock_orchestrator.stop = AsyncMock()
 
@@ -1169,10 +1651,106 @@ class TestAgentBot(AgentBotTestBase):
         assert observed_credentials_root == runtime_storage.resolve()
 
     @pytest.mark.asyncio
+    async def test_orchestrator_main_offloads_initial_credential_and_storage_setup(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Credential sync and initial storage creation must not block the event loop."""
+        runtime_paths = self._runtime_paths(tmp_path)
+        storage_path = runtime_paths.storage_root
+        event_loop_thread_id = threading.get_ident()
+        setup_thread_ids: list[int] = []
+        events: list[str] = []
+        mock_orchestrator = _mock_runtime_orchestrator()
+        mock_orchestrator.start = AsyncMock(side_effect=RuntimeError("stop after setup"))
+        mock_orchestrator.stop = AsyncMock()
+        stall_detector = MagicMock()
+        original_mkdir = Path.mkdir
+
+        def _record_storage_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+            if path == storage_path:
+                setup_thread_ids.append(threading.get_ident())
+                events.append("storage")
+            original_mkdir(path, *args, **kwargs)
+
+        def _sync_credentials(*, runtime_paths: RuntimePaths) -> None:
+            assert runtime_paths is not None
+            setup_thread_ids.append(threading.get_ident())
+            events.append("credentials")
+
+        def _construct_orchestrator(*_args: object, **_kwargs: object) -> MagicMock:
+            assert storage_path.is_dir()
+            events.append("orchestrator")
+            return mock_orchestrator
+
+        monkeypatch.setattr(Path, "mkdir", _record_storage_mkdir)
+        with (
+            patch("mindroom.orchestrator.setup_logging"),
+            patch("mindroom.orchestrator.reset_primary_worker_manager"),
+            patch(
+                "mindroom.orchestrator.start_event_loop_stall_detector",
+                return_value=stall_detector,
+            ) as start_detector,
+            patch("mindroom.orchestrator.sync_env_to_credentials", side_effect=_sync_credentials),
+            patch("mindroom.orchestrator._MultiAgentOrchestrator", side_effect=_construct_orchestrator),
+            pytest.raises(RuntimeError, match="stop after setup"),
+        ):
+            await main(log_level="INFO", runtime_paths=runtime_paths, api=False)
+
+        start_detector.assert_called_once_with(runtime_paths)
+        assert events == ["credentials", "storage", "orchestrator"]
+        assert len(setup_thread_ids) == 2
+        assert setup_thread_ids[0] == setup_thread_ids[1]
+        assert setup_thread_ids[0] != event_loop_thread_id
+        stall_detector.stop.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_main_drains_cancelled_initial_setup_before_cleanup(self, tmp_path: Path) -> None:
+        """Cancellation must not let teardown overtake the active setup worker."""
+        reset_runtime_state()
+        setup_started = threading.Event()
+        release_setup = threading.Event()
+        events: list[str] = []
+        runtime_paths = self._runtime_paths(tmp_path)
+
+        def _blocked_credential_sync(*, runtime_paths: RuntimePaths) -> None:
+            assert runtime_paths is not None
+            events.append("setup_started")
+            setup_started.set()
+            assert release_setup.wait(2.0)
+            events.append("setup_finished")
+
+        with (
+            patch("mindroom.orchestrator.setup_logging"),
+            patch("mindroom.orchestrator.reset_primary_worker_manager"),
+            patch("mindroom.orchestrator.start_event_loop_stall_detector", return_value=MagicMock()),
+            patch("mindroom.orchestrator.sync_env_to_credentials", side_effect=_blocked_credential_sync),
+            patch(
+                "mindroom.orchestrator.shutdown_primary_worker_manager",
+                side_effect=lambda: events.append("cleanup"),
+            ),
+        ):
+            main_task = asyncio.create_task(main(log_level="INFO", runtime_paths=runtime_paths, api=False))
+            try:
+                assert await asyncio.to_thread(setup_started.wait, 2.0)
+                main_task.cancel()
+                await asyncio.sleep(0)
+                assert not main_task.done()
+                assert events == ["setup_started"]
+            finally:
+                release_setup.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await main_task
+
+        assert events == ["setup_started", "setup_finished", "cleanup"]
+
+    @pytest.mark.asyncio
     async def test_orchestrator_main_shuts_down_primary_worker_manager(self, tmp_path: Path) -> None:
         """The orchestrator should clear stale workers before startup and shut them down on exit."""
         reset_runtime_state()
-        mock_orchestrator = MagicMock()
+        mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.start = AsyncMock(side_effect=asyncio.CancelledError())
         mock_orchestrator.stop = AsyncMock()
         mock_orchestrator.running = False
@@ -1234,7 +1812,7 @@ class TestAgentBot(AgentBotTestBase):
     async def test_orchestrator_main_shuts_down_primary_worker_manager_when_stop_fails(self, tmp_path: Path) -> None:
         """Shutdown failures should still attempt primary worker manager shutdown."""
         reset_runtime_state()
-        mock_orchestrator = MagicMock()
+        mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.start = AsyncMock(side_effect=asyncio.CancelledError())
         mock_orchestrator.stop = AsyncMock(side_effect=RuntimeError("stop boom"))
         mock_orchestrator.running = False
@@ -1263,6 +1841,52 @@ class TestAgentBot(AgentBotTestBase):
         mock_orchestrator.stop.assert_awaited_once()
 
 
+@asynccontextmanager
+async def _self_signed_matrix_server(tmp_path: Path) -> AsyncIterator[tuple[str, Path]]:
+    """Serve a minimal Matrix `/versions` response over TLS with a self-signed certificate for 127.0.0.1."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    certificate_path = tmp_path / "cert.pem"
+    key_path = tmp_path / "key.pem"
+    certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ),
+    )
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(certificate_path, key_path)
+    body = b'{"versions": ["v1.11"]}'
+
+    async def _answer_versions(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body,
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(_answer_versions, "127.0.0.1", 0, ssl=server_context)
+    async with server:
+        yield f"https://127.0.0.1:{server.sockets[0].getsockname()[1]}", certificate_path
+
+
 class TestMultiAgentOrchestrator:
     """Test cases for MultiAgentOrchestrator class."""
 
@@ -1275,23 +1899,27 @@ class TestMultiAgentOrchestrator:
 
     @pytest.mark.asyncio
     async def test_ensure_room_invitations_invites_authorized_users(self, tmp_path: Path) -> None:
-        """Global users and room-permitted users should be invited to managed rooms."""
+        """Default and room-specific invite users should be invited to managed rooms."""
         config = _runtime_bound_config(
             Config(
+                room_defaults={"invite_users": ["@alice:localhost"]},
+                rooms={
+                    "room1": {"invite_users": ["@alice:localhost", "@bob:localhost"]},
+                    "room2": {},
+                },
                 agents={
                     "general": AgentConfig(
                         display_name="GeneralAgent",
-                        rooms=["!room1:localhost", "!room2:localhost"],
+                        rooms=["room1", "room2"],
                     ),
-                },
-                authorization={
-                    "global_users": ["@alice:localhost"],
-                    "room_permissions": {"!room1:localhost": ["@bob:localhost"]},
-                    "default_room_access": False,
                 },
             ),
             tmp_path,
         )
+        state = MatrixState.load(runtime_paths=runtime_paths_for(config))
+        state.add_room("room1", "!room1:localhost", "#room1:localhost", "Room 1")
+        state.add_room("room2", "!room2:localhost", "#room2:localhost", "Room 2")
+        state.save(runtime_paths=runtime_paths_for(config))
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
         orchestrator.config = config
 
@@ -1311,7 +1939,6 @@ class TestMultiAgentOrchestrator:
 
         with (
             patch("mindroom.constants.runtime_matrix_homeserver", return_value="http://localhost:8008"),
-            patch("mindroom.orchestrator.is_authorized_sender", side_effect=is_authorized_sender_for_test),
             patch("mindroom.orchestrator.get_joined_rooms", new=AsyncMock(return_value=list(room_members))),
             patch("mindroom.orchestrator.get_room_members", side_effect=mock_get_room_members),
             patch("mindroom.orchestrator.invite_to_room", mock_invite),
@@ -1326,19 +1953,160 @@ class TestMultiAgentOrchestrator:
         }
 
     @pytest.mark.asyncio
+    async def test_membership_schema_invites_only_effective_room_invite_users(self, tmp_path: Path) -> None:
+        """Unrelated membership authorities must never become room invitation candidates."""
+        config = _runtime_bound_config(
+            Config.model_validate(
+                {
+                    "administrators": ["@platform-admin:localhost"],
+                    "room_defaults": {"invite_users": ["@default:localhost"]},
+                    "rooms": {
+                        "one": {
+                            "invite_users": ["@one:localhost"],
+                            "admins": ["@room-admin:localhost"],
+                        },
+                        "two": {"invite_users": []},
+                    },
+                    "agents": {
+                        "general": {
+                            "display_name": "GeneralAgent",
+                            "rooms": ["one", "two"],
+                            "access": {"users": ["@responder-user:localhost"]},
+                            "credential_managers": ["@credential-manager:localhost"],
+                        },
+                    },
+                },
+            ),
+            tmp_path,
+        )
+        state = MatrixState.load(runtime_paths=runtime_paths_for(config))
+        state.add_room("one", "!room1:localhost", "#one:localhost", "One")
+        state.add_room("two", "!room2:localhost", "#two:localhost", "Two")
+        state.save(runtime_paths=runtime_paths_for(config))
+        orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
+        orchestrator.config = config
+        router_bot = MagicMock()
+        router_bot.client = AsyncMock()
+        orchestrator.agent_bots = {"router": router_bot}
+        room_members = {
+            "!room1:localhost": {"@mindroom_router:localhost"},
+            "!room2:localhost": {"@mindroom_router:localhost"},
+        }
+
+        async def mock_get_room_members(_client: AsyncMock, room_id: str) -> set[str]:
+            return room_members[room_id]
+
+        mock_invite = AsyncMock(return_value=True)
+        with (
+            patch("mindroom.constants.runtime_matrix_homeserver", return_value="http://localhost:8008"),
+            patch("mindroom.orchestrator.get_joined_rooms", new=AsyncMock(return_value=list(room_members))),
+            patch("mindroom.orchestrator.get_room_members", side_effect=mock_get_room_members),
+            patch("mindroom.orchestrator.invite_to_room", mock_invite),
+        ):
+            await orchestrator._ensure_room_invitations()
+
+        invited_users_by_room = {(call.args[1], call.args[2]) for call in mock_invite.await_args_list}
+        assert invited_users_by_room == {
+            ("!room1:localhost", "@one:localhost"),
+            ("!room1:localhost", "@mindroom_general:localhost"),
+            ("!room2:localhost", "@mindroom_general:localhost"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_membership_space_invitees_do_not_receive_admin_power(self, tmp_path: Path) -> None:
+        """Invitation intent must remain separate from root Space Matrix power."""
+        config = _runtime_bound_config(
+            Config.model_validate(
+                {
+                    "rooms": {"one": {"invite_users": ["@member:localhost"]}},
+                },
+            ),
+            tmp_path,
+        )
+        orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
+        orchestrator.config = config
+        router_bot = MagicMock()
+        router_bot.client = AsyncMock()
+        orchestrator.agent_bots = {ROUTER_AGENT_NAME: router_bot}
+
+        with (
+            patch("mindroom.orchestrator.ensure_root_space", new=AsyncMock(return_value="!space:localhost")) as ensure,
+            patch("mindroom.orchestrator.get_room_members", new=AsyncMock(return_value=set())),
+            patch.object(orchestrator, "_invite_user_if_missing", new=AsyncMock()) as invite,
+        ):
+            await orchestrator._ensure_root_space({"one": "!one:localhost"})
+
+        assert ensure.await_args.kwargs["admin_user_ids"] == set()
+        invite.assert_awaited_once()
+        assert invite.await_args.args[1] == "@member:localhost"
+
+    @pytest.mark.asyncio
+    async def test_ensure_room_invitations_does_not_expand_responder_access_grants(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Responder access users must not become room invitation candidates."""
+        config = _runtime_bound_config(
+            Config(
+                room_defaults={"invite_users": ["@alice:localhost"]},
+                rooms={"room1": {}, "room2": {}},
+                agents={
+                    "general": AgentConfig(
+                        display_name="GeneralAgent",
+                        rooms=["room1", "room2"],
+                        access={"users": ["@bob:localhost"]},
+                    ),
+                },
+            ),
+            tmp_path,
+        )
+        state = MatrixState.load(runtime_paths=runtime_paths_for(config))
+        state.add_room("room1", "!room1:localhost", "#room1:localhost", "Room 1")
+        state.add_room("room2", "!room2:localhost", "#room2:localhost", "Room 2")
+        state.save(runtime_paths=runtime_paths_for(config))
+        orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
+        orchestrator.config = config
+
+        router_bot = MagicMock()
+        router_bot.client = AsyncMock()
+        orchestrator.agent_bots = {"router": router_bot}
+
+        room_members = {
+            "!room1:localhost": {"@mindroom_general:localhost", "@mindroom_router:localhost"},
+            "!room2:localhost": {"@mindroom_general:localhost", "@mindroom_router:localhost"},
+        }
+
+        async def mock_get_room_members(_client: AsyncMock, room_id: str) -> set[str]:
+            return room_members[room_id]
+
+        mock_invite = AsyncMock(return_value=True)
+
+        with (
+            patch("mindroom.constants.runtime_matrix_homeserver", return_value="http://localhost:8008"),
+            patch("mindroom.orchestrator.get_joined_rooms", new=AsyncMock(return_value=list(room_members))),
+            patch("mindroom.orchestrator.get_room_members", side_effect=mock_get_room_members),
+            patch("mindroom.orchestrator.invite_to_room", mock_invite),
+        ):
+            await orchestrator._ensure_room_invitations()
+
+        invited_users_by_room = {(call.args[1], call.args[2]) for call in mock_invite.await_args_list}
+        assert invited_users_by_room == {
+            ("!room1:localhost", "@alice:localhost"),
+            ("!room2:localhost", "@alice:localhost"),
+        }
+
+    @pytest.mark.asyncio
     async def test_ensure_room_invitations_skips_room_when_members_fetch_fails(self, tmp_path: Path) -> None:
         """A failed membership fetch must skip that room instead of inviting everyone into it."""
         config = _runtime_bound_config(
             Config(
+                room_defaults={"invite_users": ["@alice:localhost"]},
+                rooms={"room1": {}, "room2": {}},
                 agents={
                     "general": AgentConfig(
                         display_name="GeneralAgent",
-                        rooms=["!room1:localhost", "!room2:localhost"],
+                        rooms=["room1", "room2"],
                     ),
-                },
-                authorization={
-                    "global_users": ["@alice:localhost"],
-                    "default_room_access": False,
                 },
                 mindroom_user={"username": "mindroom_user", "display_name": "MindRoomUser"},
             ),
@@ -1353,6 +2121,8 @@ class TestMultiAgentOrchestrator:
 
         state = MatrixState.load(runtime_paths=orchestrator.runtime_paths)
         state.add_account(INTERNAL_USER_ACCOUNT_KEY, "mindroom_user", "internal-password")
+        state.add_room("room1", "!room1:localhost", "#room1:localhost", "Room 1")
+        state.add_room("room2", "!room2:localhost", "#room2:localhost", "Room 2")
         state.save(runtime_paths=orchestrator.runtime_paths)
 
         room_members: dict[str, set[str] | None] = {
@@ -1367,7 +2137,6 @@ class TestMultiAgentOrchestrator:
 
         with (
             patch("mindroom.constants.runtime_matrix_homeserver", return_value="http://localhost:8008"),
-            patch("mindroom.orchestrator.is_authorized_sender", side_effect=is_authorized_sender_for_test),
             patch("mindroom.orchestrator.get_joined_rooms", new=AsyncMock(return_value=list(room_members))),
             patch("mindroom.orchestrator.get_room_members", side_effect=mock_get_room_members),
             patch("mindroom.orchestrator.invite_to_room", mock_invite),
@@ -1389,10 +2158,7 @@ class TestMultiAgentOrchestrator:
         config = _runtime_bound_config(
             Config(
                 rooms={"lobby": {"display_name": "Lobby"}},
-                authorization={
-                    "global_users": ["@alice:localhost"],
-                    "default_room_access": False,
-                },
+                room_defaults={"invite_users": ["@alice:localhost"]},
             ),
             tmp_path,
         )
@@ -1413,7 +2179,6 @@ class TestMultiAgentOrchestrator:
 
         with (
             patch("mindroom.constants.runtime_matrix_homeserver", return_value="http://localhost:8008"),
-            patch("mindroom.orchestrator.is_authorized_sender", side_effect=is_authorized_sender_for_test),
             patch("mindroom.orchestrator.get_joined_rooms", new=AsyncMock(return_value=["!room1:localhost"])),
             patch("mindroom.orchestrator.get_room_members", side_effect=mock_get_room_members),
             patch("mindroom.orchestrator.invite_to_room", mock_invite),
@@ -1422,48 +2187,6 @@ class TestMultiAgentOrchestrator:
             await orchestrator._ensure_room_invitations()
 
         mock_invite.assert_awaited_once_with(router_bot.client, "!room1:localhost", "@alice:localhost")
-
-    @pytest.mark.asyncio
-    async def test_ensure_room_invitations_skips_non_matrix_authorization_entries(self, tmp_path: Path) -> None:
-        """Only concrete Matrix user IDs should be invited from authorization lists."""
-        config = _runtime_bound_config(
-            Config(
-                agents={
-                    "general": AgentConfig(
-                        display_name="GeneralAgent",
-                        rooms=["!room1:localhost"],
-                    ),
-                },
-                authorization={
-                    "global_users": ["@alice:localhost", "@admin:*", "alice"],
-                    "default_room_access": False,
-                },
-            ),
-            tmp_path,
-        )
-        orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
-        orchestrator.config = config
-
-        router_bot = MagicMock()
-        router_bot.client = AsyncMock()
-        orchestrator.agent_bots = {"router": router_bot}
-
-        async def mock_get_room_members(_client: AsyncMock, _room_id: str) -> set[str]:
-            return {"@mindroom_general:localhost", "@mindroom_router:localhost"}
-
-        mock_invite = AsyncMock(return_value=True)
-
-        with (
-            patch("mindroom.constants.runtime_matrix_homeserver", return_value="http://localhost:8008"),
-            patch("mindroom.orchestrator.is_authorized_sender", side_effect=is_authorized_sender_for_test),
-            patch("mindroom.orchestrator.get_joined_rooms", new=AsyncMock(return_value=["!room1:localhost"])),
-            patch("mindroom.orchestrator.get_room_members", side_effect=mock_get_room_members),
-            patch("mindroom.orchestrator.invite_to_room", mock_invite),
-        ):
-            await orchestrator._ensure_room_invitations()
-
-        invited_users = [call.args[2] for call in mock_invite.await_args_list]
-        assert invited_users == ["@alice:localhost"]
 
     @pytest.mark.asyncio
     async def test_ensure_room_invitations_skips_internal_user_when_unconfigured(self, tmp_path: Path) -> None:
@@ -1476,7 +2199,6 @@ class TestMultiAgentOrchestrator:
                         rooms=["!room1:localhost"],
                     ),
                 },
-                authorization={"default_room_access": False},
             ),
             tmp_path,
         )
@@ -1521,9 +2243,9 @@ class TestMultiAgentOrchestrator:
             tmp_path,
         )
         runtime_paths = runtime_paths_for(config)
-        invited_rooms_path = agent_state_root_path(runtime_paths.storage_root, "general") / "invited_rooms.json"
-        invited_rooms_path.parent.mkdir(parents=True, exist_ok=True)
-        invited_rooms_path.write_text('[\n  "!ad-hoc:localhost"\n]\n', encoding="utf-8")
+        ledger_path = invited_rooms_path(runtime_paths, "general")
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text('[\n  "!ad-hoc:localhost"\n]\n', encoding="utf-8")
 
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
         orchestrator.config = config
@@ -1582,12 +2304,12 @@ class TestMultiAgentOrchestrator:
 
         assert bot.rooms == ["!room1:localhost"]
         mock_ensure_user_in_rooms.assert_not_awaited()
-        assert bot.ensure_rooms.await_count == 2
+        assert bot.ensure_rooms.await_count == 1
         mock_refresh_agent_reply_memberships.assert_awaited_once_with()
 
     @pytest.mark.asyncio
-    async def test_setup_rooms_and_memberships_retries_invites_after_router_joins(self, tmp_path: Path) -> None:
-        """Invite-only existing rooms should get a second invitation/join pass after router joins."""
+    async def test_setup_rooms_and_memberships_invites_and_joins_once(self, tmp_path: Path) -> None:
+        """Order router membership first instead of replaying invitations and joins."""
         config = _runtime_bound_config(
             Config(
                 agents={
@@ -1626,16 +2348,16 @@ class TestMultiAgentOrchestrator:
         assert router_bot.rooms == ["!room1:localhost"]
         assert general_bot.rooms == ["!room1:localhost"]
         assert router_bot.ensure_rooms.await_count == 1
-        assert general_bot.ensure_rooms.await_count == 2
-        assert mock_invitations.await_count == 2
-        assert mock_ensure_user_in_rooms.await_count == 2
+        assert general_bot.ensure_rooms.await_count == 1
+        assert mock_invitations.await_count == 1
+        assert mock_ensure_user_in_rooms.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_setup_rooms_and_memberships_reruns_room_reconciliation_after_router_joins(
+    async def test_setup_rooms_and_memberships_reconciles_once_after_router_joins(
         self,
         tmp_path: Path,
     ) -> None:
-        """Startup should rerun room reconciliation after the router joins existing rooms."""
+        """Private rooms are reconciled once, after the router can administer them."""
         config = _runtime_bound_config(
             Config(
                 agents={
@@ -1653,8 +2375,9 @@ class TestMultiAgentOrchestrator:
         router_joined = False
         reconciliation_join_states: list[bool] = []
 
-        async def record_room_reconciliation() -> None:
+        async def record_room_reconciliation(_room_ids: dict[str, str]) -> dict:
             reconciliation_join_states.append(router_joined)
+            return {}
 
         async def router_join_rooms() -> None:
             nonlocal router_joined
@@ -1671,7 +2394,16 @@ class TestMultiAgentOrchestrator:
         general_bot.ensure_rooms = AsyncMock()
 
         with (
-            patch.object(orchestrator, "_ensure_rooms_exist", new=AsyncMock(side_effect=record_room_reconciliation)),
+            patch.object(
+                orchestrator,
+                "_ensure_rooms_exist",
+                new=AsyncMock(return_value={"lobby": "!room1:localhost"}),
+            ),
+            patch.object(
+                orchestrator,
+                "_reconcile_managed_rooms",
+                new=AsyncMock(side_effect=record_room_reconciliation),
+            ),
             patch.object(orchestrator, "_ensure_room_invitations", new=AsyncMock()),
             patch("mindroom.orchestrator.get_rooms_for_entity", return_value=["lobby"]),
             patch("mindroom.orchestrator.resolve_room_aliases", return_value=["!room1:localhost"]),
@@ -1680,9 +2412,9 @@ class TestMultiAgentOrchestrator:
         ):
             await orchestrator._setup_rooms_and_memberships([router_bot, general_bot])
 
-        assert reconciliation_join_states == [False, True]
+        assert reconciliation_join_states == [True]
         assert router_bot.ensure_rooms.await_count == 1
-        assert general_bot.ensure_rooms.await_count == 2
+        assert general_bot.ensure_rooms.await_count == 1
 
     @pytest.mark.asyncio
     async def test_reconcile_post_update_rooms_runs_for_room_metadata_changes(
@@ -1704,7 +2436,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
             room_metadata_changed=True,
@@ -1746,7 +2478,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
             entities_to_reconcile_rooms={ROUTER_AGENT_NAME, "general"},
@@ -1759,12 +2491,12 @@ class TestMultiAgentOrchestrator:
         assert set(setup_rooms.await_args.args[0]) == {router_bot, general_bot}
 
     @pytest.mark.asyncio
-    async def test_reconcile_post_update_rooms_preserves_router_grants_before_sliding_restart(
+    async def test_reconcile_post_update_rooms_preserves_classic_receive_loop(
         self,
         tmp_path: Path,
     ) -> None:
-        """Room-only edits must preserve refreshed router grants across subscription restart."""
-        config = _runtime_bound_config(Config(matrix_sync={"mode": "sliding"}), tmp_path)
+        """Room-only edits reconcile membership without restarting Classic sync."""
+        config = _runtime_bound_config(Config(), tmp_path)
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
         orchestrator.config = config
         router_bot = MagicMock(agent_name=ROUTER_AGENT_NAME, config=config, running=True)
@@ -1777,7 +2509,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
             entities_to_reconcile_rooms={ROUTER_AGENT_NAME},
@@ -1790,9 +2522,8 @@ class TestMultiAgentOrchestrator:
         ):
             await orchestrator._reconcile_post_update_rooms(plan, changed_entities=set())
 
-        cancel_sync.assert_awaited_once_with(ROUTER_AGENT_NAME, orchestrator._sync_tasks)
-        router_bot.preserve_reply_memberships_on_next_sync_start.assert_called_once_with()
-        start_sync.assert_called_once_with(ROUTER_AGENT_NAME, router_bot)
+        cancel_sync.assert_not_awaited()
+        start_sync.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.requires_matrix  # Requires real Matrix server for orchestrator initialization
@@ -1825,10 +2556,42 @@ class TestMultiAgentOrchestrator:
             assert "router" in orchestrator.agent_bots
 
     @pytest.mark.asyncio
-    async def test_orchestrator_initialize_uses_custom_config_path(self, tmp_path: Path) -> None:
-        """Initialize should load the exact config file owned by the orchestrator."""
+    @pytest.mark.parametrize(
+        ("calls_enabled", "dependencies_available", "import_error"),
+        [
+            (False, True, None),
+            (True, False, None),
+            (True, True, None),
+            (True, True, ImportError),
+            (True, True, RuntimeError),
+        ],
+    )
+    async def test_orchestrator_initialize_uses_custom_config_path(
+        self,
+        tmp_path: Path,
+        calls_enabled: bool,
+        dependencies_available: bool,
+        import_error: type[Exception] | None,
+    ) -> None:
+        """Load the owned config and prepare optional call SDKs before creating bots."""
         config_path = tmp_path / "custom-config.yaml"
         mock_config = _runtime_bound_config(Config(router=RouterConfig(model="default")), tmp_path)
+        mock_config.calls.enabled = calls_enabled
+        call_import_threads: list[threading.Thread] = []
+        original_import = builtins.__import__
+
+        def record_import(name: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            if name == "livekit.plugins":
+                call_import_threads.append(threading.current_thread())
+                if import_error is not None:
+                    msg = "Broken optional call plugin"
+                    raise import_error(msg)
+            return original_import(name, *args, **kwargs)
+
+        def create_bot(*_args: object) -> None:
+            assert call_import_threads == (
+                [threading.main_thread()] if calls_enabled and dependencies_available else []
+            )
 
         with (
             patch("mindroom.orchestrator.load_config", return_value=mock_config) as mock_load_config,
@@ -1848,7 +2611,13 @@ class TestMultiAgentOrchestrator:
                     },
                 ),
             ),
-            patch.object(_MultiAgentOrchestrator, "_create_managed_bot"),
+            patch.object(_MultiAgentOrchestrator, "_create_managed_bot", side_effect=create_bot) as create_managed_bot,
+            patch(
+                "mindroom.matrix_rtc.call_manager.matrix_calls_dependencies_available",
+                return_value=dependencies_available,
+            ),
+            patch("builtins.__import__", new=record_import),
+            capture_logs() as logs,
         ):
             orchestrator = _MultiAgentOrchestrator(
                 runtime_paths=resolve_runtime_paths(
@@ -1860,6 +2629,8 @@ class TestMultiAgentOrchestrator:
             await orchestrator.initialize()
 
         mock_load_config.assert_called_once()
+        create_managed_bot.assert_called_once()
+        assert any(log["event"] == "calls_dependency_preload_failed" for log in logs) is (import_error is not None)
         assert mock_load_config.call_args.args[0].config_path == config_path.resolve()
 
     @pytest.mark.asyncio
@@ -1945,13 +2716,13 @@ class TestMultiAgentOrchestrator:
     async def test_orchestrator_start_sets_up_rooms_before_auxiliary_workers(self, tmp_path: Path) -> None:
         """Room creation/invites should happen before auxiliary runtime workers."""
         orchestrator = _MultiAgentOrchestrator(runtime_paths=TestAgentBot._runtime_paths(tmp_path))
-        orchestrator.config = MagicMock()
+        orchestrator.config = MagicMock(source_fingerprint=None)
 
         bot = MagicMock()
         bot.agent_name = "router"
         bot.try_start = AsyncMock(return_value=True)
         bot.recover_pending_turn_journal_events = AsyncMock()
-        bot.stop = AsyncMock()
+        _bind_orderly_shutdown(bot)
         orchestrator.agent_bots = {"router": bot}
 
         call_order: list[str] = []
@@ -1984,14 +2755,14 @@ class TestMultiAgentOrchestrator:
     async def test_orchestrator_start_syncs_knowledge_watchers_after_runtime_starts(self, tmp_path: Path) -> None:
         """Normal startup should start watch-owned knowledge refresh after reply paths are live."""
         orchestrator = _MultiAgentOrchestrator(runtime_paths=TestAgentBot._runtime_paths(tmp_path))
-        config = MagicMock()
+        config = MagicMock(source_fingerprint=None)
         orchestrator.config = config
 
         bot = MagicMock()
         bot.agent_name = "router"
         bot.try_start = AsyncMock(return_value=True)
         bot.recover_pending_turn_journal_events = AsyncMock()
-        bot.stop = AsyncMock()
+        _bind_orderly_shutdown(bot)
         orchestrator.agent_bots = {"router": bot}
 
         async def _sync_runtime_support_services(*args: object, **kwargs: object) -> None:
@@ -2024,7 +2795,7 @@ class TestMultiAgentOrchestrator:
     ) -> None:
         """Router readiness should trigger Matrix-backed startup discard after room setup."""
         orchestrator = _MultiAgentOrchestrator(runtime_paths=TestAgentBot._runtime_paths(tmp_path))
-        orchestrator.config = MagicMock()
+        orchestrator.config = MagicMock(source_fingerprint=None)
         orchestrator.config.tool_approval.timeout_days = 7.0
         orchestrator.config.tool_approval.rules = [SimpleNamespace(timeout_days=10.0)]
 
@@ -2039,12 +2810,12 @@ class TestMultiAgentOrchestrator:
 
         bot.try_start = AsyncMock(side_effect=_start_bot)
         bot.recover_pending_turn_journal_events = AsyncMock()
+        _bind_orderly_shutdown(bot)
 
         async def _emit_bot_ready(_response: object) -> None:
             await orchestrator.handle_bot_ready(bot)
 
         bot._on_sync_response = AsyncMock(side_effect=_emit_bot_ready)
-        bot.stop = AsyncMock()
         orchestrator.agent_bots = {"router": bot}
 
         call_order: list[str] = []
@@ -2072,6 +2843,7 @@ class TestMultiAgentOrchestrator:
             patch.object(orchestrator, "_recover_stale_streams_after_restart", new=AsyncMock()),
             patch.object(orchestrator, "_setup_rooms_and_memberships", side_effect=_setup_rooms),
             _mock_approval_recovery(
+                orchestrator,
                 side_effect=_recover_approval_cards_on_startup,
             ) as recover_approval_cards_on_startup,
             patch.object(orchestrator, "_sync_runtime_support_services", side_effect=_sync_runtime_support_services),
@@ -2106,13 +2878,13 @@ class TestMultiAgentOrchestrator:
         bot.running = True
         bot.client = make_matrix_client_mock(user_id="@mindroom_code:localhost")
 
-        with _mock_approval_recovery() as recover_approval_cards_on_startup:
+        with _mock_approval_recovery(orchestrator) as recover_approval_cards_on_startup:
             await orchestrator.handle_bot_ready(bot)
 
         recover_approval_cards_on_startup.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_approval_transport_waits_for_runtime_support_before_startup_recovery(
+    async def test_approval_recovery_waits_for_runtime_support_before_startup_recovery(
         self,
         tmp_path: Path,
     ) -> None:
@@ -2129,18 +2901,19 @@ class TestMultiAgentOrchestrator:
         orchestrator.agent_bots = {"router": bot}
 
         with _mock_approval_recovery(
+            orchestrator,
             return_value=_ApprovalStartupSweep(discarded=1, failed=0),
         ) as recover_approval_cards_on_startup:
-            orchestrator._approval_transport.reset_startup_cleanup_gate()
+            orchestrator._approval_recovery.reset_startup_cleanup_gate()
             await orchestrator.handle_bot_ready(bot)
             recover_approval_cards_on_startup.assert_not_awaited()
 
-            await orchestrator._approval_transport.mark_startup_runtime_support_ready()
+            await orchestrator._approval_recovery.mark_startup_runtime_support_ready()
 
         recover_approval_cards_on_startup.assert_awaited_once_with()
 
     @pytest.mark.asyncio
-    async def test_approval_transport_waits_for_router_ready_before_startup_recovery(
+    async def test_approval_recovery_waits_for_router_ready_before_startup_recovery(
         self,
         tmp_path: Path,
     ) -> None:
@@ -2157,10 +2930,11 @@ class TestMultiAgentOrchestrator:
         orchestrator.agent_bots = {"router": bot}
 
         with _mock_approval_recovery(
+            orchestrator,
             return_value=_ApprovalStartupSweep(discarded=1, failed=0),
         ) as recover_approval_cards_on_startup:
-            orchestrator._approval_transport.reset_startup_cleanup_gate()
-            await orchestrator._approval_transport.mark_startup_runtime_support_ready()
+            orchestrator._approval_recovery.reset_startup_cleanup_gate()
+            await orchestrator._approval_recovery.mark_startup_runtime_support_ready()
             recover_approval_cards_on_startup.assert_not_awaited()
 
             await orchestrator.handle_bot_ready(bot)
@@ -2168,7 +2942,7 @@ class TestMultiAgentOrchestrator:
         recover_approval_cards_on_startup.assert_awaited_once_with()
 
     @pytest.mark.asyncio
-    async def test_approval_transport_concurrent_startup_gates_discard_once(
+    async def test_approval_recovery_concurrent_startup_gates_discard_once(
         self,
         tmp_path: Path,
     ) -> None:
@@ -2185,18 +2959,19 @@ class TestMultiAgentOrchestrator:
         orchestrator.agent_bots = {"router": bot}
 
         with _mock_approval_recovery(
+            orchestrator,
             return_value=_ApprovalStartupSweep(discarded=1, failed=0),
         ) as recover_approval_cards_on_startup:
-            orchestrator._approval_transport.reset_startup_cleanup_gate()
+            orchestrator._approval_recovery.reset_startup_cleanup_gate()
             await asyncio.gather(
                 orchestrator.handle_bot_ready(bot),
-                orchestrator._approval_transport.mark_startup_runtime_support_ready(),
+                orchestrator._approval_recovery.mark_startup_runtime_support_ready(),
             )
 
         recover_approval_cards_on_startup.assert_awaited_once_with()
 
     @pytest.mark.asyncio
-    async def test_approval_transport_reset_allows_fresh_startup_recovery(
+    async def test_approval_recovery_reset_allows_fresh_startup_recovery(
         self,
         tmp_path: Path,
     ) -> None:
@@ -2213,14 +2988,15 @@ class TestMultiAgentOrchestrator:
         orchestrator.agent_bots = {"router": bot}
 
         with _mock_approval_recovery(
+            orchestrator,
             return_value=_ApprovalStartupSweep(discarded=1, failed=0),
         ) as recover_approval_cards_on_startup:
-            orchestrator._approval_transport.reset_startup_cleanup_gate()
+            orchestrator._approval_recovery.reset_startup_cleanup_gate()
             await orchestrator.handle_bot_ready(bot)
-            await orchestrator._approval_transport.mark_startup_runtime_support_ready()
+            await orchestrator._approval_recovery.mark_startup_runtime_support_ready()
 
-            orchestrator._approval_transport.reset_startup_cleanup_gate()
-            await orchestrator._approval_transport.mark_startup_runtime_support_ready()
+            orchestrator._approval_recovery.reset_startup_cleanup_gate()
+            await orchestrator._approval_recovery.mark_startup_runtime_support_ready()
             await orchestrator.handle_bot_ready(bot)
 
         assert recover_approval_cards_on_startup.await_count == 2
@@ -2253,20 +3029,20 @@ class TestMultiAgentOrchestrator:
             _ApprovalStartupSweep(discarded=1, failed=0),
         ]
         with (
-            patch("mindroom.approval_transport._STARTUP_CLEANUP_INITIAL_RETRY_SECONDS", 0.0),
-            _mock_approval_recovery(side_effect=sweeps) as recover_approval_cards_on_startup,
+            patch("mindroom.approval_recovery._STARTUP_CLEANUP_INITIAL_RETRY_SECONDS", 0.0),
+            _mock_approval_recovery(orchestrator, side_effect=sweeps) as recover_approval_cards_on_startup,
         ):
-            orchestrator._approval_transport.reset_startup_cleanup_gate()
-            await orchestrator._approval_transport.mark_startup_runtime_support_ready()
+            orchestrator._approval_recovery.reset_startup_cleanup_gate()
+            await orchestrator._approval_recovery.mark_startup_runtime_support_ready()
             await orchestrator.handle_bot_ready(bot)
             assert recover_approval_cards_on_startup.await_count == 1
 
             await _await_until(lambda: recover_approval_cards_on_startup.await_count == 2)
 
             # The second pass settled everything, so nothing schedules a third.
-            await orchestrator._approval_transport.mark_startup_runtime_support_ready()
+            await orchestrator._approval_recovery.mark_startup_runtime_support_ready()
 
-        await orchestrator._approval_transport.close()
+        await orchestrator._approval_recovery.close()
         assert recover_approval_cards_on_startup.await_count == 2
 
     @pytest.mark.asyncio
@@ -2291,19 +3067,20 @@ class TestMultiAgentOrchestrator:
         orchestrator.agent_bots = {"router": bot}
 
         with (
-            patch("mindroom.approval_transport._STARTUP_CLEANUP_INITIAL_RETRY_SECONDS", 0.0),
-            patch("mindroom.approval_transport._STARTUP_CLEANUP_ATTEMPTS_BEFORE_ESCALATION", 3),
+            patch("mindroom.approval_recovery._STARTUP_CLEANUP_INITIAL_RETRY_SECONDS", 0.0),
+            patch("mindroom.approval_recovery._STARTUP_CLEANUP_ATTEMPTS_BEFORE_ESCALATION", 3),
             _mock_approval_recovery(
+                orchestrator,
                 return_value=_ApprovalStartupSweep(discarded=0, failed=1),
             ) as recover_approval_cards_on_startup,
             capture_logs() as logs,
         ):
-            orchestrator._approval_transport.reset_startup_cleanup_gate()
-            await orchestrator._approval_transport.mark_startup_runtime_support_ready()
+            orchestrator._approval_recovery.reset_startup_cleanup_gate()
+            await orchestrator._approval_recovery.mark_startup_runtime_support_ready()
             await orchestrator.handle_bot_ready(bot)
 
             await _await_until(lambda: recover_approval_cards_on_startup.await_count >= 4)
-            await orchestrator._approval_transport.close()
+            await orchestrator._approval_recovery.close()
 
         incomplete = [entry for entry in logs if entry["event"] == "tool_approval_startup_recovery_incomplete"]
         assert [entry["log_level"] for entry in incomplete[:4]] == ["warning", "warning", "error", "error"]
@@ -2352,22 +3129,22 @@ class TestMultiAgentOrchestrator:
         bot.client = make_matrix_client_mock(user_id="@mindroom_router:localhost")
         orchestrator.agent_bots = {"router": bot}
 
-        transport = orchestrator._approval_transport
+        recovery = orchestrator._approval_recovery
         # The wait each attempt was scheduled with, read as the sweep runs.
         # Reading the runtime's own countdown is what tells a backoff that
         # grows apart from one that is recomputed from the same start forever.
         waits: list[float] = []
 
         async def _never_finishes() -> _ApprovalStartupSweep:
-            waits.append(transport._startup_cleanup_retry_delay)
+            waits.append(recovery._startup_cleanup_retry_delay)
             return _ApprovalStartupSweep(discarded=0, failed=1)
 
         with (
-            patch("mindroom.approval_transport._STARTUP_CLEANUP_INITIAL_RETRY_SECONDS", 0.001),
-            _mock_approval_recovery(side_effect=_never_finishes) as recover_approval_cards_on_startup,
+            patch("mindroom.approval_recovery._STARTUP_CLEANUP_INITIAL_RETRY_SECONDS", 0.001),
+            _mock_approval_recovery(orchestrator, side_effect=_never_finishes) as recover_approval_cards_on_startup,
         ):
-            transport.reset_startup_cleanup_gate()
-            await transport.mark_startup_runtime_support_ready()
+            recovery.reset_startup_cleanup_gate()
+            await recovery.mark_startup_runtime_support_ready()
             await orchestrator.handle_bot_ready(bot)
 
             # The first pass came from the startup gates; everything after it
@@ -2377,9 +3154,9 @@ class TestMultiAgentOrchestrator:
             waiting = _retry_tasks()
             assert len(waiting) == 1
             if stop_retrying == "cancel":
-                await transport.close()
+                await recovery.close()
             else:
-                transport.reset_startup_cleanup_gate()
+                recovery.reset_startup_cleanup_gate()
             await _await_until(waiting[0].done)
             # Cancelled rather than left to expire, and nothing armed behind
             # it: a chain that re-arms itself must still be stoppable at one
@@ -2417,7 +3194,7 @@ class TestMultiAgentOrchestrator:
         bot.client = make_matrix_client_mock(user_id="@mindroom_router:localhost")
         orchestrator.agent_bots = {"router": bot}
 
-        transport = orchestrator._approval_transport
+        recovery = orchestrator._approval_recovery
         sweeps_started = 0
         retry_is_sweeping = asyncio.Event()
         never_finishes = asyncio.Event()
@@ -2433,11 +3210,11 @@ class TestMultiAgentOrchestrator:
             return _ApprovalStartupSweep(discarded=0, failed=1)
 
         with (
-            patch("mindroom.approval_transport._STARTUP_CLEANUP_INITIAL_RETRY_SECONDS", 0.001),
-            _mock_approval_recovery(side_effect=_sweep),
+            patch("mindroom.approval_recovery._STARTUP_CLEANUP_INITIAL_RETRY_SECONDS", 0.001),
+            _mock_approval_recovery(orchestrator, side_effect=_sweep),
         ):
-            transport.reset_startup_cleanup_gate()
-            await transport.mark_startup_runtime_support_ready()
+            recovery.reset_startup_cleanup_gate()
+            await recovery.mark_startup_runtime_support_ready()
             await orchestrator.handle_bot_ready(bot)
 
             # Wait until the retry has woken and is inside the sweep, not
@@ -2447,7 +3224,7 @@ class TestMultiAgentOrchestrator:
             await _await_until(retry_is_sweeping.is_set)
             assert sweeps_started == 2
 
-            await transport.close()
+            await recovery.close()
 
         assert waiting[0].cancelled()
         assert not _retry_tasks()
@@ -2476,21 +3253,21 @@ class TestMultiAgentOrchestrator:
         bot.client = make_matrix_client_mock(user_id="@mindroom_router:localhost")
         orchestrator.agent_bots = {"router": bot}
 
-        transport = orchestrator._approval_transport
+        recovery = orchestrator._approval_recovery
         sweeps = [
             _ApprovalStartupSweep(discarded=0, failed=1),
             _ApprovalStartupSweep(discarded=1, failed=0),
         ]
         # The default delay, deliberately: the retry has to still be waiting
         # when the second gate arrives, or it is not the case under test.
-        with _mock_approval_recovery(side_effect=sweeps) as recover_approval_cards_on_startup:
-            transport.reset_startup_cleanup_gate()
-            await transport.mark_startup_runtime_support_ready()
+        with _mock_approval_recovery(orchestrator, side_effect=sweeps) as recover_approval_cards_on_startup:
+            recovery.reset_startup_cleanup_gate()
+            await recovery.mark_startup_runtime_support_ready()
             await orchestrator.handle_bot_ready(bot)
             waiting = _retry_tasks()
             assert len(waiting) == 1
 
-            await transport.mark_startup_runtime_support_ready()
+            await recovery.mark_startup_runtime_support_ready()
             await _await_until(waiting[0].done)
             # Cancelled, not merely finished. A task left to wake on its own
             # ends the same way from the outside and is exactly the orphan
@@ -2510,12 +3287,12 @@ class TestMultiAgentOrchestrator:
 
         async def _initialize() -> None:
             call_order.append("initialize")
-            orchestrator.config = MagicMock()
+            orchestrator.config = MagicMock(source_fingerprint=None)
             bot = MagicMock()
             bot.agent_name = "router"
             bot.try_start = AsyncMock(return_value=True)
             bot.recover_pending_turn_journal_events = AsyncMock()
-            bot.stop = AsyncMock()
+            _bind_orderly_shutdown(bot)
             orchestrator.agent_bots = {"router": bot}
 
         with (
@@ -2669,6 +3446,61 @@ class TestMultiAgentOrchestrator:
         assert responses == []
 
     @pytest.mark.asyncio
+    async def test_wait_for_matrix_homeserver_fails_fast_on_certificate_verification_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A real TLS handshake with an untrusted certificate stops startup instead of waiting for the timeout."""
+        async with _self_signed_matrix_server(tmp_path) as (homeserver, _certificate_path):
+            runtime_paths = resolve_runtime_paths(
+                config_path=tmp_path / "config.yaml",
+                storage_path=tmp_path,
+                process_env={"MATRIX_HOMESERVER": homeserver},
+            )
+            with pytest.raises(PermanentStartupError) as raised:
+                await wait_for_matrix_homeserver(
+                    runtime_paths=runtime_paths,
+                    timeout_seconds=10.0,
+                    retry_interval_seconds=10.0,
+                )
+
+        message = str(raised.value)
+        assert homeserver in message
+        assert "certificate verify failed" in message
+        assert "SSL_CERT_FILE" in message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("trust", ["ssl_verify_disabled", "matrix_login_trust"])
+    async def test_wait_for_matrix_homeserver_accepts_certificates_matrix_logins_accept(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        trust: str,
+    ) -> None:
+        """The probe trusts exactly what Matrix logins trust, so fail-fast never rejects a usable homeserver."""
+        async with _self_signed_matrix_server(tmp_path) as (homeserver, certificate_path):
+            process_env = {"MATRIX_HOMESERVER": homeserver}
+            if trust == "ssl_verify_disabled":
+                process_env["MATRIX_SSL_VERIFY"] = "false"
+            else:
+                # Only the Matrix login trust accepts the certificate; httpx's default trust does not.
+                monkeypatch.setattr(
+                    client_session,
+                    "_verifying_ssl_context",
+                    lambda _runtime_paths: ssl.create_default_context(cafile=certificate_path),
+                )
+            runtime_paths = resolve_runtime_paths(
+                config_path=tmp_path / "config.yaml",
+                storage_path=tmp_path,
+                process_env=process_env,
+            )
+            await wait_for_matrix_homeserver(
+                runtime_paths=runtime_paths,
+                timeout_seconds=10.0,
+                retry_interval_seconds=10.0,
+            )
+
+    @pytest.mark.asyncio
     async def test_wait_for_matrix_homeserver_times_out_when_never_ready(
         self,
         tmp_path: Path,
@@ -2708,18 +3540,18 @@ class TestMultiAgentOrchestrator:
     async def test_orchestrator_start_schedules_retry_for_failed_agents(self, tmp_path: Path) -> None:
         """Startup should keep degraded agents around and retry them in the background."""
         orchestrator = _MultiAgentOrchestrator(runtime_paths=TestAgentBot._runtime_paths(tmp_path))
-        orchestrator.config = MagicMock()
+        orchestrator.config = MagicMock(source_fingerprint=None)
 
         router_bot = MagicMock()
         router_bot.agent_name = "router"
         router_bot.try_start = AsyncMock(return_value=True)
         router_bot.recover_pending_turn_journal_events = AsyncMock()
-        router_bot.stop = AsyncMock()
+        _bind_orderly_shutdown(router_bot)
 
         failing_bot = MagicMock()
         failing_bot.agent_name = "general"
         failing_bot.try_start = AsyncMock(return_value=False)
-        failing_bot.stop = AsyncMock()
+        _bind_orderly_shutdown(failing_bot)
 
         orchestrator.agent_bots = {"router": router_bot, "general": failing_bot}
 
@@ -2742,7 +3574,7 @@ class TestMultiAgentOrchestrator:
     ) -> None:
         """Initial startup must wait for router and responder generation first syncs."""
         orchestrator = _MultiAgentOrchestrator(runtime_paths=TestAgentBot._runtime_paths(tmp_path))
-        orchestrator.config = MagicMock()
+        orchestrator.config = MagicMock(source_fingerprint=None)
         responder_started = False
         runtime_support_bound = False
 
@@ -2751,7 +3583,7 @@ class TestMultiAgentOrchestrator:
         router_bot.running = True
         router_bot.first_sync_complete = False
         router_bot.try_start = AsyncMock(return_value=True)
-        router_bot.stop = AsyncMock()
+        _bind_orderly_shutdown(router_bot)
 
         async def recover_router_turns() -> None:
             assert responder_started
@@ -2771,7 +3603,7 @@ class TestMultiAgentOrchestrator:
             return True
 
         responder_bot.try_start = AsyncMock(side_effect=start_responder)
-        responder_bot.stop = AsyncMock()
+        _bind_orderly_shutdown(responder_bot)
         orchestrator.agent_bots = {ROUTER_AGENT_NAME: router_bot, "general": responder_bot}
 
         def bind_runtime_support(_bots: list[object]) -> None:
@@ -2808,6 +3640,7 @@ class TestMultiAgentOrchestrator:
         )
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
         orchestrator.config = config
+        orchestrator._runtime_ready_event.set()
 
         router_bot = MagicMock()
         router_bot.agent_name = ROUTER_AGENT_NAME
@@ -2830,7 +3663,7 @@ class TestMultiAgentOrchestrator:
         router_bot.recover_pending_turn_journal_events.assert_awaited_once_with()
 
         responder_bot.first_sync_complete = True
-        with patch.object(orchestrator._approval_transport, "handle_bot_ready", new=AsyncMock()):
+        with patch.object(orchestrator._approval_recovery, "mark_router_ready", new=AsyncMock()):
             await orchestrator.handle_bot_ready(responder_bot)
         assert await wait_for_background_tasks(
             timeout=1,
@@ -2852,6 +3685,7 @@ class TestMultiAgentOrchestrator:
         )
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
         orchestrator.config = config
+        orchestrator._runtime_ready_event.set()
 
         router_bot = MagicMock()
         router_bot.running = True
@@ -2970,6 +3804,7 @@ class TestMultiAgentOrchestrator:
         config = _runtime_bound_config(Config(), tmp_path)
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
         orchestrator.config = config
+        orchestrator._runtime_ready_event.set()
         recovery_started = asyncio.Event()
         release_recovery = asyncio.Event()
 
@@ -2983,7 +3818,7 @@ class TestMultiAgentOrchestrator:
         router_bot.recover_pending_turn_journal_events = AsyncMock(side_effect=recover_turns)
         orchestrator.agent_bots = {ROUTER_AGENT_NAME: router_bot}
 
-        with patch.object(orchestrator._approval_transport, "handle_bot_ready", new=AsyncMock()):
+        with patch.object(orchestrator._approval_recovery, "mark_router_ready", new=AsyncMock()):
             ready_task = asyncio.create_task(orchestrator.handle_bot_ready(router_bot))
             try:
                 await recovery_started.wait()
@@ -3019,7 +3854,7 @@ class TestMultiAgentOrchestrator:
         router_bot.running = True
         router_bot.try_start = AsyncMock(return_value=True)
         router_bot.recover_pending_turn_journal_events = AsyncMock()
-        router_bot.stop = AsyncMock()
+        _bind_orderly_shutdown(router_bot)
 
         team_bot = MagicMock()
         team_bot.agent_name = "support_team"
@@ -3037,7 +3872,7 @@ class TestMultiAgentOrchestrator:
 
         team_bot.try_start = AsyncMock(side_effect=start_team)
         team_bot.recover_pending_turn_journal_events = AsyncMock(side_effect=recover_team_turns)
-        team_bot.stop = AsyncMock()
+        _bind_orderly_shutdown(team_bot)
 
         member_bot = MagicMock()
         member_bot.agent_name = "general"
@@ -3052,7 +3887,7 @@ class TestMultiAgentOrchestrator:
             return True
 
         member_bot.try_start = AsyncMock(side_effect=start_member)
-        member_bot.stop = AsyncMock()
+        _bind_orderly_shutdown(member_bot)
         orchestrator.agent_bots = {
             ROUTER_AGENT_NAME: router_bot,
             "support_team": team_bot,
@@ -3090,6 +3925,7 @@ class TestMultiAgentOrchestrator:
         config = _configured_team_test_config(tmp_path)
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths_for(config))
         orchestrator.config = config
+        orchestrator._runtime_ready_event.set()
 
         router_bot = MagicMock()
         router_bot.agent_name = ROUTER_AGENT_NAME
@@ -3125,13 +3961,12 @@ class TestMultiAgentOrchestrator:
             patch.object(orchestrator, "_resolve_bot_room_aliases"),
             patch.object(orchestrator, "_start_sync_task"),
             patch.object(orchestrator, "_setup_rooms_and_memberships", new=AsyncMock()),
-            patch.object(orchestrator, "_recover_pending_replacement_rooms", new=AsyncMock()),
         ):
             await orchestrator._run_bot_start_retry("general")
 
         team_bot.recover_pending_turn_journal_events.assert_not_awaited()
         member_bot.first_sync_complete = True
-        with patch.object(orchestrator._approval_transport, "handle_bot_ready", new=AsyncMock()):
+        with patch.object(orchestrator._approval_recovery, "mark_router_ready", new=AsyncMock()):
             await orchestrator.handle_bot_ready(member_bot)
         assert await wait_for_background_tasks(
             timeout=1,
@@ -3175,7 +4010,6 @@ class TestMultiAgentOrchestrator:
                 side_effect=lambda *_args: order.append("sync_started"),
             ),
             patch.object(orchestrator, "_setup_rooms_and_memberships", new=AsyncMock()),
-            patch.object(orchestrator, "_recover_pending_replacement_rooms", new=AsyncMock()),
             patch.object(orchestrator._external_trigger_runtime, "bind_if_ready"),
         ):
             await orchestrator._run_bot_start_retry("general")
@@ -3187,18 +4021,18 @@ class TestMultiAgentOrchestrator:
     async def test_orchestrator_start_skips_retry_for_permanent_failures(self, tmp_path: Path) -> None:
         """Permanent startup failures should leave bots disabled without retry loops."""
         orchestrator = _MultiAgentOrchestrator(runtime_paths=TestAgentBot._runtime_paths(tmp_path))
-        orchestrator.config = MagicMock()
+        orchestrator.config = MagicMock(source_fingerprint=None)
 
         router_bot = MagicMock()
         router_bot.agent_name = "router"
         router_bot.try_start = AsyncMock(return_value=True)
         router_bot.recover_pending_turn_journal_events = AsyncMock()
-        router_bot.stop = AsyncMock()
+        _bind_orderly_shutdown(router_bot)
 
         failing_bot = MagicMock()
         failing_bot.agent_name = "general"
         failing_bot.try_start = AsyncMock(side_effect=PermanentMatrixStartupError("boom"))
-        failing_bot.stop = AsyncMock()
+        _bind_orderly_shutdown(failing_bot)
 
         orchestrator.agent_bots = {"router": router_bot, "general": failing_bot}
 
@@ -3249,9 +4083,6 @@ class TestMultiAgentOrchestrator:
         async def _shutdown_approvals() -> None:
             calls.append("approvals")
 
-        async def _close_approval_transport() -> None:
-            calls.append("transport")
-
         async def _stop_mcp_manager() -> None:
             calls.append("mcp")
             msg = "mcp shutdown failed"
@@ -3275,12 +4106,6 @@ class TestMultiAgentOrchestrator:
                 "mindroom.orchestrator.shutdown_approval_runtime",
                 new=AsyncMock(side_effect=_shutdown_approvals),
             ) as mock_shutdown_approvals,
-            patch.object(
-                orchestrator._approval_transport,
-                "close",
-                new=AsyncMock(side_effect=_close_approval_transport),
-                create=True,
-            ),
             patch.object(orchestrator.config_reload, "cancel", new=AsyncMock()),
             patch.object(orchestrator, "_stop_memory_auto_flush_worker", new=AsyncMock()),
             patch.object(orchestrator._knowledge_source_watcher, "shutdown", new=AsyncMock()),
@@ -3290,8 +4115,64 @@ class TestMultiAgentOrchestrator:
         ):
             await orchestrator.stop()
 
-        assert calls == ["scripts", "transport", "approvals", "mcp"]
+        with pytest.raises(CliAuthenticationError, match="closed"):
+            orchestrator.agent_cli_registry.register(MagicMock(spec=CliOperationOwner))
+        assert calls == ["scripts", "approvals", "mcp"]
         mock_shutdown_approvals.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_stop_invalidates_hook_registries_first(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Shutdown must retire orchestrator hooks before stopping subsystems."""
+        orchestrator = _MultiAgentOrchestrator(
+            runtime_paths=TestAgentBot._runtime_paths(tmp_path),
+        )
+        active_registry = HookRegistry.empty()
+        orchestrator.hook_registry = active_registry
+        context = ConfigReloadedContext(
+            event_name="config:reloaded",
+            plugin_name="test",
+            settings={},
+            config=MagicMock(spec=Config),
+            runtime_paths=orchestrator.runtime_paths,
+            logger=MagicMock(),
+            correlation_id="reload",
+            _hook_registry_state=orchestrator._hook_registry_state,
+            _hook_registry_snapshot=active_registry,
+            changed_entities=(),
+            added_entities=(),
+            removed_entities=(),
+            plugin_changes=(),
+        )
+        active_during_script_shutdown: list[bool] = []
+        scheduling_registries: list[HookRegistry] = []
+
+        async def record_hook_state() -> None:
+            active_during_script_shutdown.append(context.is_active())
+
+        assert context.is_active()
+        with (
+            patch.object(
+                type(orchestrator._script_runtime),
+                "shutdown",
+                new=AsyncMock(side_effect=record_hook_state),
+            ),
+            patch(
+                "mindroom.orchestrator.shutdown_approval_runtime",
+                new=AsyncMock(side_effect=RuntimeError("stop boundary")),
+            ),
+            patch(
+                "mindroom.orchestrator.set_scheduling_hook_registry",
+                side_effect=scheduling_registries.append,
+            ),
+            pytest.raises(RuntimeError, match="stop boundary"),
+        ):
+            await orchestrator.stop()
+
+        assert active_during_script_shutdown == [False]
+        assert scheduling_registries == [HookRegistry.empty()]
 
     @pytest.mark.asyncio
     async def test_config_update_forwards_plan_to_stable_script_runtime_before_replacement(
@@ -3311,7 +4192,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
         )
@@ -3347,7 +4228,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
         )
@@ -3383,7 +4264,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
         )
@@ -3418,7 +4299,7 @@ class TestMultiAgentOrchestrator:
             await orchestrator._apply_config_update_plan(current_config, plan, ())
 
         assert orchestrator.config is current_config
-        assert runtime._worker_replacement_pending is False
+        assert runtime._worker_replacement_phase == "idle"
         assert runtime.manager.worker_backend is old_backend
         assert runtime._current_worker_lease is lease
 
@@ -3440,7 +4321,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
         )
@@ -3491,7 +4372,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
         )
@@ -3694,15 +4575,13 @@ class TestMultiAgentOrchestrator:
                 msg = "boom"
                 raise RuntimeError(msg)
 
-        with (
-            patch("mindroom.orchestration.runtime.STARTUP_RETRY_INITIAL_DELAY_SECONDS", 0),
-            patch("mindroom.orchestration.runtime.STARTUP_RETRY_MAX_DELAY_SECONDS", 0),
-        ):
-            await run_with_retry(
-                "background retry",
-                _operation,
-                update_runtime_state=False,
-            )
+        await run_with_retry(
+            "background retry",
+            _operation,
+            update_runtime_state=False,
+            initial_delay_seconds=0,
+            max_delay_seconds=0,
+        )
 
         state = get_runtime_state()
         assert attempts == 2
@@ -3743,7 +4622,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
         )
@@ -3790,6 +4669,34 @@ class TestMultiAgentOrchestrator:
         assert not hasattr(orchestrator, "_schedule_knowledge_refresh")
 
     @pytest.mark.asyncio
+    async def test_router_invite_policy_reload_reconciles_cached_invites(self, tmp_path: Path) -> None:
+        """Allowing router invites must revisit invitations already present in the Matrix cache."""
+        orchestrator = _MultiAgentOrchestrator(runtime_paths=TestAgentBot._runtime_paths(tmp_path))
+        current_config = _runtime_bound_config(Config(router={"accept_invites": False}), tmp_path)
+        new_config = _runtime_bound_config(Config(router={"accept_invites": True}), tmp_path)
+        orchestrator.config = current_config
+        orchestrator.running = True
+        router_bot = MagicMock()
+        router_bot.config = current_config
+        router_bot.enable_streaming = True
+        router_bot._set_presence_with_model_info = AsyncMock()
+        router_bot.reconcile_pending_invites = AsyncMock(side_effect=RuntimeError("join failed"))
+        router_bot.schedule_pending_invite_reconciliation = MagicMock()
+        orchestrator.agent_bots = {ROUTER_AGENT_NAME: router_bot}
+
+        with (
+            patch("mindroom.orchestration.config_lifecycle.load_config", return_value=new_config),
+            patch("mindroom.orchestrator.load_plugins"),
+            patch.object(orchestrator._external_trigger_runtime, "sync_api_config_snapshot", new=AsyncMock()),
+            patch.object(orchestrator, "_sync_runtime_support_services", new=AsyncMock()),
+        ):
+            updated = await orchestrator.config_reload._update_config()
+
+        assert updated is False
+        router_bot.schedule_pending_invite_reconciliation.assert_called_once_with()
+        router_bot.reconcile_pending_invites.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_sync_runtime_support_services_rebinds_approval_cards(self, tmp_path: Path) -> None:
         """Approval transport should track the router bot that owns the card store.
 
@@ -3827,11 +4734,11 @@ class TestMultiAgentOrchestrator:
     async def test_update_config_uses_custom_config_path(self, tmp_path: Path) -> None:
         """Hot reload should keep reading the orchestrator's custom config path."""
         config_path = tmp_path / "custom-config.yaml"
-        current_config = MagicMock()
-        current_config.authorization.global_users = []
+        current_config = MagicMock(source_fingerprint=None)
+        current_config.administrators = []
         current_config.event_journal = EventJournalConfig()
-        new_config = MagicMock()
-        new_config.authorization.global_users = []
+        new_config = MagicMock(source_fingerprint=None)
+        new_config.administrators = []
         # The same journal, because a *changed* one is refused before the
         # reload reaches the support-only apply path under test here.
         new_config.event_journal = current_config.event_journal
@@ -3905,11 +4812,11 @@ class TestMultiAgentOrchestrator:
         """
         runtime_paths = TestAgentBot._runtime_paths(tmp_path)
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths)
-        current_config = MagicMock()
-        current_config.authorization.global_users = []
+        current_config = MagicMock(source_fingerprint=None)
+        current_config.administrators = []
         current_config.event_journal = EventJournalConfig()
-        new_config = MagicMock()
-        new_config.authorization.global_users = []
+        new_config = MagicMock(source_fingerprint=None)
+        new_config.administrators = []
         new_config.event_journal = EventJournalConfig(
             backend="postgres",
             database_url="postgresql://journal.invalid/moved",
@@ -3944,17 +4851,18 @@ class TestMultiAgentOrchestrator:
         mock_plan.assert_called_once(), "the reload was refused instead of applied around the inert field"
         warned = [call for call in mock_warning.call_args_list if "pending_restart" in str(call)]
         assert warned, "a journal edit that cannot take effect until restart was applied silently"
+        assert orchestrator.config_reload.status.status == "restart_required"
 
     @pytest.mark.asyncio
     async def test_update_config_does_not_swap_hook_runtime_on_failed_reload(self, tmp_path: Path) -> None:
         """Failed reloads must leave the active hook snapshot and scheduling registry untouched."""
         orchestrator = _MultiAgentOrchestrator(runtime_paths=TestAgentBot._runtime_paths(tmp_path))
 
-        current_config = MagicMock()
-        current_config.authorization.global_users = []
+        current_config = MagicMock(source_fingerprint=None)
+        current_config.administrators = []
         current_config.event_journal = MagicMock()
-        new_config = MagicMock()
-        new_config.authorization.global_users = []
+        new_config = MagicMock(source_fingerprint=None)
+        new_config.administrators = []
         # The same journal config object, because a *changed* one is refused
         # outright before the reload reaches the behaviour under test here.
         new_config.event_journal = current_config.event_journal
@@ -4027,7 +4935,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
         )
@@ -4073,7 +4981,7 @@ class TestMultiAgentOrchestrator:
         )
         (plugin_root / "tools.py").write_text(
             "from agno.tools import Toolkit\n"
-            "from mindroom.tool_system.declarations import ToolCategory\nfrom mindroom.tool_system.registration import register_tool_with_metadata\n"
+            "from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess\nfrom mindroom.tool_system.registration import register_tool_with_metadata\n"
             "\n"
             "class UpdatedTool(Toolkit):\n"
             "    def __init__(self) -> None:\n"
@@ -4081,6 +4989,7 @@ class TestMultiAgentOrchestrator:
             "\n"
             "@register_tool_with_metadata(\n"
             "    name='updated_plugin_tool',\n"
+            "    file_access=ToolFileAccess.NONE,\n"
             "    display_name='Updated Plugin Tool',\n"
             "    description='updated plugin tool',\n"
             "    category=ToolCategory.DEVELOPMENT,\n"
@@ -4131,7 +5040,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
         )
@@ -4202,7 +5111,7 @@ class TestMultiAgentOrchestrator:
             new_entities=set(),
             removed_entities=set(),
             mindroom_user_changed=False,
-            matrix_room_access_changed=False,
+            room_access_changed=False,
             matrix_space_changed=False,
             authorization_changed=False,
         )
@@ -4508,3 +5417,79 @@ class TestMultiAgentOrchestrator:
             for bot in orchestrator.agent_bots.values():
                 if hasattr(bot, "enable_streaming"):
                     assert bot.enable_streaming is False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_must_stop_startup_before_releasing_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup cannot acquire runtime resources once core teardown has begun."""
+    paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "data")
+    orchestrator = orchestrator_module._MultiAgentOrchestrator(runtime_paths=paths)
+    homeserver_wait_started = asyncio.Event()
+    homeserver_available = asyncio.Event()
+    acquired_after_teardown = []
+    teardown_started = False
+
+    async def wait_for_homeserver(**_kwargs: object) -> None:
+        homeserver_wait_started.set()
+        await homeserver_available.wait()
+
+    async def initialize() -> None:
+        # Production initialize acquires its journal and MCP manager at this seam.
+        acquired_after_teardown.append(teardown_started)
+        await asyncio.Event().wait()
+
+    async def stop() -> None:
+        nonlocal teardown_started
+        teardown_started = True
+        orchestrator._runtime_shutdown_event.set()
+        # A homeserver becoming reachable while teardown awaits another owner.
+        homeserver_available.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(orchestrator_module, "wait_for_matrix_homeserver", wait_for_homeserver)
+    monkeypatch.setattr(orchestrator, "initialize", initialize)
+    monkeypatch.setattr(orchestrator, "stop", stop)
+    startup = asyncio.create_task(orchestrator.start())
+    await homeserver_wait_started.wait()
+    finish_shutdown = orchestrator_module._finish_runtime_shutdown
+    await finish_shutdown(
+        shutdown_wait_task=None,
+        api_task=None,
+        orchestrator_task=startup,
+        auxiliary_tasks=[],
+        orchestrator=orchestrator,
+        stall_detector=None,
+    )
+    assert acquired_after_teardown == [], "Startup acquired new runtime resources after shutdown began"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_departure_uses_live_membership_owner(tmp_path: Path) -> None:
+    """A dashboard departure shares the current bot's gateway and replacement gate."""
+    paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "data", process_env={})
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=paths)
+    gate = orchestrator._response_admission_gate
+
+    async def change_membership(room_id: str, target: str) -> bool:
+        assert gate.in_flight_response_count == 1
+        assert (room_id, target) == ("!room:localhost", "leave")
+        return True
+
+    bot = MagicMock(running=True, change_local_membership=AsyncMock(side_effect=change_membership))
+    orchestrator.agent_bots["general"] = bot
+    assert await orchestrator.leave_matrix_room("general", "!room:localhost")
+    assert gate.in_flight_response_count == 0
+    bot.change_local_membership.assert_awaited_once_with("!room:localhost", "leave")
+    gate.close()
+    with pytest.raises(RuntimeError, match="starting or reloading"):
+        await orchestrator.leave_matrix_room("general", "!room:localhost")
+    assert bot.change_local_membership.await_count == 1
+    gate.reopen()
+    bot.running = False
+    with pytest.raises(RuntimeError, match="No running Matrix owner"):
+        await orchestrator.leave_matrix_room("general", "!room:localhost")
+    assert gate.in_flight_response_count == 0

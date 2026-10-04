@@ -328,7 +328,8 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
     await bot._turn_controller._handle_interactive_selection(
         room,
         selection=selection,
-        user_id="@user:localhost",
+        transport_sender_id="@user:localhost",
+        requester_user_id="@user:localhost",
         source_event_id="$selection:localhost",
     )
 
@@ -343,6 +344,8 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
     assert captured_metadata is not None
     assert captured_metadata[MATRIX_SOURCE_EVENT_IDS_METADATA_KEY] == ["$selection:localhost"]
     assert captured_metadata[MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY] == [selection.question_event_id]
+    request = bot._response_runner.generate_response.await_args.args[0]
+    assert request.history_boundary_event_id == "$selection:localhost"
     _assert_interactive_turn_aliases(bot, selection, "$selection:localhost")
 
 
@@ -415,7 +418,8 @@ async def test_handle_interactive_selection_does_not_mark_handled_when_runner_re
         await bot._turn_controller._handle_interactive_selection(
             room,
             selection=selection,
-            user_id="@user:localhost",
+            transport_sender_id="@user:localhost",
+            requester_user_id="@user:localhost",
             source_event_id="$selection:localhost",
         )
 
@@ -489,8 +493,8 @@ async def test_on_message_claims_interactive_text_by_durable_source_event(
     )
 
     with (
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
-        patch.object(bot._turn_policy, "can_reply_to_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
+        patch.object(bot._turn_policy, "can_reply_to_sender_in_room", return_value=True),
         patch.object(
             bot._conversation_resolver,
             "coalescing_thread_id",
@@ -601,8 +605,8 @@ async def test_sidecar_preview_claims_interactive_text_by_durable_source_event(
     )
 
     with (
-        patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
-        patch.object(bot._turn_policy, "can_reply_to_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
+        patch.object(bot._turn_policy, "can_reply_to_sender_in_room", return_value=True),
         patch.object(
             bot._conversation_resolver,
             "coalescing_thread_id",

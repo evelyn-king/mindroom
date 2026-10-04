@@ -9,7 +9,10 @@
 [![Downloads](https://img.shields.io/pypi/dm/mindroom)](https://pypi.org/project/mindroom/)
 [![GitHub](https://img.shields.io/badge/github-mindroom--ai%2Fmindroom-blue?logo=github)](https://github.com/mindroom-ai/mindroom)
 
-<img src="frontend/public/logo.png" alt="MindRoom Logo" align="right" width="150" />
+<picture>
+  <source media="(prefers-reduced-motion: no-preference)" srcset="assets/logo/logo-mark-animated.svg" />
+  <img src="assets/logo/logo-mark.svg" alt="MindRoom Logo" align="right" width="150" />
+</picture>
 
 **AI agents that live in your chat rooms.**
 
@@ -18,7 +21,9 @@ You define agents in a YAML file or in the web dashboard; MindRoom gives each on
 Because Matrix bridges to other platforms, the same agents also work in Slack, Telegram, Discord, WhatsApp, IRC, and email — with the same persistent memory everywhere.
 Self-host the whole stack, or run only the MindRoom backend locally and pair it with hosted Matrix at [mindroom.chat](https://mindroom.chat).
 
-https://github.com/user-attachments/assets/1f121c89-5418-4f42-bdfe-fb9de0fecd03
+https://github.com/user-attachments/assets/665d730b-83b3-42b6-aa98-7dde35f16244
+
+See the [showcase](https://docs.mindroom.chat/showcase/) for more recordings.
 
 ## Features
 
@@ -80,7 +85,7 @@ MindRoom plays in the same space but makes different architectural bets:
 
 - **Multi-agent and multi-user by default.** Both are personal-first: one owner talking to their assistant. In MindRoom every agent is a real Matrix user, so you run a fleet of specialists and teams, share them with family, a project, or a whole company, and scope access per user and per room.
 - **An AI-native interface on an open protocol.** With WhatsApp, Signal, or Telegram as the front end, you rent UX from platforms that were never designed for agents and can cut bots off at any time. MindRoom's home is Matrix, with [MindRoom Chat](https://github.com/mindroom-ai/mindroom-chat) tuned for AI: collapsible tool-call traces, model metadata on every response, streaming with in-place edits, response cancellation, and first-class threads. Bridges to those apps are additive, not the foundation.
-- **Sandboxing with real secrets isolation.** Execution tools (shell, Python, coding) can run in isolated container workers with no access to the primary process's secrets — your agent uses credentialed tools (Gmail, GitHub, ...) while the code it executes can never read those credentials. Per-tool [approval rules](docs/configuration/index.md) and [egress approval](docs/deployment/approved-egress.md) add human-in-the-loop control.
+- **Sandboxing with real secrets isolation.** Execution tools (shell, Python, coding) can run in isolated container workers with no access to the primary process's secrets — your agent uses credentialed tools (Gmail, GitHub, ...) while the code it executes can never read those credentials. Per-tool [approval rules](docs/tool-approval.md) and [egress approval](docs/deployment/approved-egress.md) add human-in-the-loop control.
 - **Batteries included.** 100+ built-in tool integrations with typed configuration, OAuth flows, and automatic dependency installation — plus OpenClaw-compatible skills on top.
 
 Coming from OpenClaw? MindRoom [imports OpenClaw workspaces](docs/openclaw.md) (`SOUL.md`, `MEMORY.md`, skills) and ships an `openclaw_compat` tool preset.
@@ -96,54 +101,64 @@ Watch the 2-minute setup video:
 <a href="https://youtu.be/jR3xLUxyWhg"><img src="https://img.youtube.com/vi/jR3xLUxyWhg/maxresdefault.jpg" alt="MindRoom: installing and talking to my first AI agent in 2 minutes" width="480"></a>
 
 ```bash
-# Create ~/.mindroom/config.yaml and ~/.mindroom/.env with hosted defaults
-uvx mindroom config init
-
-# Add model auth, or run `uvx mindroom config init --provider codex` and `codex login`
-$EDITOR ~/.mindroom/.env
-
-# Generate pair code in https://chat.mindroom.chat:
-# Settings -> Local MindRoom -> Generate Pair Code
-uvx mindroom connect --pair-code ABCD-EFGH
-
-# Start MindRoom
 uvx mindroom run
+# First run: choose a model provider; anthropic, openai, and openrouter also ask for an API key (Enter skips).
+# MindRoom writes ~/.mindroom/config.yaml and ~/.mindroom/.env with hosted defaults,
+# then prints a link and QR code: approve it with your MindRoom Chat account,
+# or enter the code in MindRoom Chat -> Settings -> Local MindRoom.
+# Finally, Enter keeps MindRoom running in the background as a login service (systemd or launchd); n runs it here
 ```
 
+Coding agents and scripts can answer every question with flags instead: `OPENAI_API_KEY=sk-... uvx mindroom run --provider openai --service`.
+To create or review the files without starting, run `uvx mindroom config init` (optionally with `--provider codex` or another preset), edit `~/.mindroom/.env`, and then run `uvx mindroom run`.
 See the [hosted Matrix deployment guide](docs/deployment/hosted-matrix.md) for full details.
 
 ### Self-hosted, from source
 
-Requires Python 3.12+ and [uv](https://github.com/astral-sh/uv); the repo dev shell provides Node.js 24 with [bun](https://bun.sh/) for optionally building the web dashboard.
+Requires Python 3.12+ and [uv](https://github.com/astral-sh/uv).
+For the dashboard in a fresh source checkout, install Node.js 24 and [Bun](https://bun.sh/) so the first run can build missing assets, or set `MINDROOM_FRONTEND_DIST` to a prebuilt dashboard directory.
+The repository dev shell provides Node.js 24 and Bun.
 
 ```bash
 git clone https://github.com/mindroom-ai/mindroom
 cd mindroom
 uv sync
 
-# Point at your Matrix homeserver, or bootstrap a local Synapse + MindRoom Chat stack:
-#   mindroom local-stack-setup --synapse-dir /path/to/mindroom-stack/local/matrix
-export MATRIX_HOMESERVER=https://your-matrix.server
-export ANTHROPIC_API_KEY=your-key-here
+# Create a starter config with an Anthropic model and self-hosted Matrix settings.
+uv run mindroom config init --path ./config.local.yaml --matrix-server self-hosted --provider anthropic
 
-# Start MindRoom (agents + API + web dashboard)
-uv run mindroom run
+# Set MATRIX_HOMESERVER, ANTHROPIC_API_KEY, and any required registration credentials.
+$EDITOR .env
+# Replace each owner placeholder with your quoted Matrix user ID.
+$EDITOR config.local.yaml
+
+# Optional: bootstrap this checkout's local Synapse + MindRoom Chat stack.
+# MINDROOM_CONFIG_PATH=./config.local.yaml uv run mindroom local-stack-setup --synapse-dir local/matrix
+
+# Start MindRoom with the generated config.
+uv run mindroom run --config ./config.local.yaml
 ```
 
-The web dashboard is available at http://localhost:8765.
+The checked-in `config.yaml` is a development setup with local model endpoints.
+In `config.local.yaml`, replace every `__MINDROOM_OWNER_USER_ID_FROM_PAIRING__` with your quoted Matrix user ID, such as `"@alice:matrix.example.com"`.
+See the [manual configuration and account provisioning instructions](docs/getting-started.md#configuration) for homeserver setup.
+The starter creates the `Mind` agent in the `personal` room.
+
+With dashboard assets available, open http://localhost:8765.
+Without assets and Bun, the API is available at http://localhost:8765/api but the dashboard is unavailable.
 Matrix E2EE support is installed by default.
 
-### macOS menu bar app
+### macOS app
 
-The menu bar app runs the local MindRoom service without keeping a terminal open.
+The macOS app provides a native window and menu bar companion for local agents and computer access.
 It bundles `uv`, uses `~/.mindroom` for config and state, and manages the `mindroom service` launchd service.
-The signed universal app supports both Apple silicon and Intel Macs.
+The signed app requires an Apple silicon Mac.
 
 ```bash
 brew install --cask mindroom-ai/tap/mindroom
 ```
 
-Open **MindRoom** from `/Applications` and use the menu bar item to install the runtime, pair with the hosted chat UI, and open the dashboard.
+Open **MindRoom** from `/Applications` to set up local agents, manage computer access, or open chat and the configuration dashboard.
 See the [macOS app guide](docs/installation/macos-app.md) for setup, updates, and uninstall instructions.
 
 ### First steps
@@ -189,6 +204,7 @@ Plain replies that never reach threaded context still stay plain replies.
 - `!edit_schedule <id> <task>` - Edit an existing scheduled task
 - `!config <operation>` - Manage configuration
 - `!desktop [setup|status|confirm|rotate|disconnect]` - Manage your Desktop target
+- `!mode <agent> minimal|standard|show|reset` - Switch one agent between standard tools and a Bash-only interface
 - `!model [name|list|reset]` - Show or switch the model used in the current thread
 - `!room_model [name|list|reset]` - Show the room model default or switch it (set/reset require a room admin)
 - `!thread_mode [room|thread|reset|show]` - Show or switch the thread mode used in the current room (room admin only)
@@ -212,13 +228,13 @@ agents:
     model: default
     rooms: [lobby]
     tools: [matrix_message]
-    accept_invites: true  # Optional: accept authorized ad-hoc room invites
+    accept_invites: true  # Accept all, none, or matching inviter ID patterns
     knowledge_bases: [engineering_docs]
 
 models:
   default:
     provider: anthropic
-    id: claude-sonnet-5
+    id: claude-sonnet-5-5
 
 knowledge_bases:
   engineering_docs:
@@ -229,29 +245,34 @@ voice:
   enabled: true
   stt:
     provider: openai
-    model: gpt-4o-transcribe
+    model: gpt-transcribe
 
 mindroom_user:
   username: mindroom_user  # Immutable once the account is created on first run
   display_name: MindRoomUser
 
+administrators: ["@alice:example.com"]
+room_defaults:
+  invite_users: ["@alice:example.com"]
+
 authorization:
-  global_users: ["@alice:example.com"]
-  default_room_access: false
+  config_command_enabled: false
 ```
 
-Environment variables go in `.env` (or `~/.mindroom/.env` for the hosted path):
+Environment variables go in `.env` next to the selected config file (`~/.mindroom/.env` for the hosted path):
 
 ```bash
 MATRIX_HOMESERVER=https://your-matrix.server
 ANTHROPIC_API_KEY=your-key-here
-# Optional: protect dashboard API endpoints (recommended for non-localhost)
-# MINDROOM_API_KEY=your-secret-key
-# Optional: use a non-default config location
-# MINDROOM_CONFIG_PATH=/path/to/config.yaml
+# Dashboard API key; generate one with `openssl rand -hex 32`.
+# Set it empty (MINDROOM_API_KEY=) only with `--api-host 127.0.0.1`; `mindroom run` listens on every interface by default.
+MINDROOM_API_KEY=replace-with-a-long-random-secret
 ```
 
-Teams, cultures, per-room models, context compaction, history controls, and memory backends are covered in the [configuration docs](docs/configuration/index.md) and at [docs.mindroom.chat](https://docs.mindroom.chat).
+Select another config with `mindroom run --config /path/to/config.yaml` or `export MINDROOM_CONFIG_PATH=/path/to/config.yaml` before running the CLI.
+MindRoom selects the config before loading the `.env` beside it.
+
+Teams, per-room models, context compaction, history controls, and memory backends are covered in the [configuration docs](docs/configuration/index.md) and at [docs.mindroom.chat](https://docs.mindroom.chat).
 
 ## Deployment
 
@@ -303,7 +324,7 @@ The `saas-platform/` directory contains infrastructure specific to running MindR
 ## Contributing
 
 We welcome contributions!
-See [CLAUDE.md](CLAUDE.md) for the current development workflow and quality checks.
+See [AGENTS.md](AGENTS.md) for the current development workflow and quality checks.
 
 ## License
 

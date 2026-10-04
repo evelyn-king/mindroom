@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import nio
 import pytest
 from nio.crypto import OutboundGroupSession
+from nio.crypto.attachments import decrypt_attachment
 
 from mindroom.constants import (
     AI_RUN_METADATA_KEY,
@@ -30,16 +31,18 @@ from mindroom.matrix.large_messages import (
     _NORMAL_MESSAGE_LIMIT,
     _SIDECAR_UPLOAD_FALLBACK_INDICATOR,
     _calculate_delivery_event_size,
-    _calculate_event_size,
     _create_preview,
-    _is_edit_message,
-    _oversized_nonterminal_streaming_edit_sent_at,
+    _oversized_nonterminal_streaming_edit_next_allowed_at,
+    _upload_text_as_mxc,
+    calculate_event_size,
+    is_edit_message,
     prepare_large_message,
     should_send_oversized_nonterminal_streaming_edit,
 )
 from mindroom.matrix.media import parse_matrix_media_event_source
 from mindroom.matrix.message_content import extract_and_resolve_message
 from mindroom.tool_system.events import _TOOL_TRACE_KEY
+from tests.conftest import TEST_ACCESS_TOKEN, FakeMediaResponse, serve_media_download
 
 _SIDECAR_UPLOAD_FALLBACK_TEXT = _SIDECAR_UPLOAD_FALLBACK_INDICATOR.strip()
 
@@ -65,6 +68,66 @@ class _UploadClient:
 
 def _large_text_content(prefix: str) -> dict[str, str]:
     return {"body": prefix + ("x" * 100000), "msgtype": "m.text"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encrypted", [False, True])
+@pytest.mark.parametrize(
+    ("mimetype", "filename"),
+    [("text/plain", "message.txt"), ("text/html", "message.html"), ("application/json", "message-content.json")],
+)
+async def test_text_upload_preserves_bytes_and_metadata(encrypted: bool, mimetype: str, filename: str) -> None:
+    """Sidecars retain plaintext size and type while uploading decryptable bytes under the right name."""
+    client = MagicMock(spec=nio.AsyncClient)
+    client.upload.return_value = (nio.UploadResponse("mxc://server/sidecar"), None)
+    text = "Sidecar with UTF-8: café"
+
+    uri, info = await _upload_text_as_mxc(client, text, mimetype=mimetype, room_encrypted=encrypted)
+
+    assert uri == "mxc://server/sidecar"
+    assert info is not None
+    assert info["url"] == uri
+    assert info["size"] == len(text.encode())
+    assert info["mimetype"] == mimetype
+    kwargs = client.upload.call_args.kwargs
+    uploaded = kwargs["data_provider"](None, None).read()
+    assert kwargs["filesize"] == len(uploaded)
+    assert kwargs["filename"] == (f"{filename}.enc" if encrypted else filename)
+    assert kwargs["content_type"] == ("application/octet-stream" if encrypted else mimetype)
+    if encrypted:
+        assert uploaded != text.encode()
+        assert info["v"] == "v2"
+        assert (
+            decrypt_attachment(
+                uploaded,
+                info["key"]["k"],
+                info["hashes"]["sha256"],
+                info["iv"],
+            )
+            == text.encode()
+        )
+    else:
+        assert uploaded == text.encode()
+        assert set(info) == {"url", "size", "mimetype"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_field", ["key", "iv", "hashes"])
+async def test_text_upload_rejects_incomplete_encryption_metadata(missing_field: str) -> None:
+    """Sidecars handle malformed SDK metadata as an encryption failure before uploading."""
+    client = _UploadClient(nio.UploadResponse("mxc://server/sidecar"))
+    encryption = {
+        "v": "v2",
+        "key": {"kty": "oct", "alg": "A256CTR", "ext": True, "k": "key", "key_ops": ["encrypt", "decrypt"]},
+        "iv": "iv",
+        "hashes": {"sha256": "hash"},
+    }
+    del encryption[missing_field]
+
+    with patch("mindroom.matrix.media.crypto.attachments.encrypt_attachment", return_value=(b"encrypted", encryption)):
+        assert await _upload_text_as_mxc(client, "secret", room_encrypted=True) == (None, None)
+
+    assert client.uploaded_data is None
 
 
 def _actual_encrypted_event_size(
@@ -101,7 +164,7 @@ def _actual_encrypted_event_size(
     config_reaction_id = content.get(CONFIG_CONFIRMATION_REACTION_KEY)
     if isinstance(config_reaction_id, str):
         encrypted_content[CONFIG_CONFIRMATION_REACTION_KEY] = config_reaction_id
-    return _calculate_event_size(encrypted_content)
+    return calculate_event_size(encrypted_content)
 
 
 def test_encrypted_event_size_estimate_bounds_real_megolm_output() -> None:
@@ -173,7 +236,7 @@ async def test_oversized_interactive_values_do_not_escape_the_matrix_event_limit
     )
 
     assert "io.mindroom.interactive" not in prepared
-    assert _calculate_event_size(prepared) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(prepared) <= _MATRIX_EVENT_HARD_LIMIT
 
 
 def _assert_text_sidecar_fallback(result: dict[str, object], expected_prefix: str) -> None:
@@ -187,29 +250,29 @@ def _assert_text_sidecar_fallback(result: dict[str, object], expected_prefix: st
     assert "url" not in result
     assert "file" not in result
     assert "io.mindroom.long_text" not in result
-    assert _calculate_event_size(result) <= _NORMAL_MESSAGE_LIMIT
+    assert calculate_event_size(result) <= _NORMAL_MESSAGE_LIMIT
 
 
 def test_calculate_event_size() -> None:
     """Test event size calculation."""
     # Small message
     content = {"body": "Hello", "msgtype": "m.text"}
-    size = _calculate_event_size(content)
+    size = calculate_event_size(content)
     assert size < 3000  # Small message + overhead
 
     # Large message
     large_text = "x" * 50000
     content = {"body": large_text, "msgtype": "m.text"}
-    size = _calculate_event_size(content)
+    size = calculate_event_size(content)
     assert size > 50000
     assert size < 55000  # Text + overhead
 
 
-def test__is_edit_message() -> None:
+def test_is_edit_message() -> None:
     """Test edit message detection."""
     # Regular message
     regular = {"body": "Hello", "msgtype": "m.text"}
-    assert not _is_edit_message(regular)
+    assert not is_edit_message(regular)
 
     # Edit with m.new_content
     edit1 = {
@@ -217,7 +280,7 @@ def test__is_edit_message() -> None:
         "m.new_content": {"body": "Hello", "msgtype": "m.text"},
         "msgtype": "m.text",
     }
-    assert _is_edit_message(edit1)
+    assert is_edit_message(edit1)
 
     # Edit with m.relates_to replace
     edit2 = {
@@ -225,45 +288,71 @@ def test__is_edit_message() -> None:
         "m.relates_to": {"rel_type": "m.replace", "event_id": "$123"},
         "msgtype": "m.text",
     }
-    assert _is_edit_message(edit2)
+    assert is_edit_message(edit2)
+
+
+def _oversized_edit_content(original_event_id: str, body: str) -> dict[str, object]:
+    return {
+        "body": f"* {body}",
+        "m.new_content": {
+            "body": body,
+            "msgtype": "m.text",
+            STREAM_STATUS_KEY: STREAM_STATUS_STREAMING,
+        },
+        "m.relates_to": {"rel_type": "m.replace", "event_id": original_event_id},
+        "msgtype": "m.text",
+    }
 
 
 def test_oversized_nonterminal_streaming_edit_rate_limit_prunes_expired_entries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Oversized streaming-edit rate state should not retain old streams forever."""
-    _oversized_nonterminal_streaming_edit_sent_at.clear()
     body = "x" * 40000
-
-    def oversized_edit_content(original_event_id: str) -> dict[str, object]:
-        return {
-            "body": f"* {body}",
-            "m.new_content": {
-                "body": body,
-                "msgtype": "m.text",
-                STREAM_STATUS_KEY: STREAM_STATUS_STREAMING,
-            },
-            "m.relates_to": {"rel_type": "m.replace", "event_id": original_event_id},
-            "msgtype": "m.text",
-        }
-
-    monotonic_values = iter([100.0, 106.0])
+    interval = max(5.0, calculate_event_size(_oversized_edit_content("$old", body)) / 4096)
+    monotonic_values = iter([100.0, 100.0 + interval])
     monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: next(monotonic_values))
 
     assert should_send_oversized_nonterminal_streaming_edit(
         room_id="!room:server",
         original_event_id="$old",
-        edit_content=oversized_edit_content("$old"),
+        edit_content=_oversized_edit_content("$old", body),
     )
-    assert _oversized_nonterminal_streaming_edit_sent_at == {("!room:server", "$old"): 100.0}
+    assert _oversized_nonterminal_streaming_edit_next_allowed_at == {("!room:server", "$old"): 100.0 + interval}
 
     assert should_send_oversized_nonterminal_streaming_edit(
         room_id="!room:server",
         original_event_id="$new",
-        edit_content=oversized_edit_content("$new"),
+        edit_content=_oversized_edit_content("$new", body),
     )
 
-    assert _oversized_nonterminal_streaming_edit_sent_at == {("!room:server", "$new"): 106.0}
+    assert _oversized_nonterminal_streaming_edit_next_allowed_at == {
+        ("!room:server", "$new"): 100.0 + 2 * interval,
+    }
+
+
+def test_oversized_nonterminal_streaming_edit_interval_grows_with_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Large in-progress edits upload sidecars at a bounded average byte rate."""
+    edit = _oversized_edit_content("$big", "x" * 1_000_000)
+    expected_interval = calculate_event_size(edit) / 4096
+    assert expected_interval > 200
+    now = {"value": 1000.0}
+    monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: now["value"])
+
+    def allowed() -> bool:
+        return should_send_oversized_nonterminal_streaming_edit(
+            room_id="!room:server",
+            original_event_id="$big",
+            edit_content=edit,
+        )
+
+    assert allowed()
+    now["value"] = 1000.0 + 6.0
+    assert not allowed()
+    now["value"] = 1000.0 + expected_interval - 1.0
+    assert not allowed()
+    now["value"] = 1000.0 + expected_interval + 0.001
+    assert allowed()
 
 
 def test__create_preview() -> None:
@@ -370,7 +459,7 @@ async def test_prepare_large_message_truncation() -> None:
     assert json.loads(client.uploaded_data.decode("utf-8")) == content
 
     # Preview should fit in limit
-    assert _calculate_event_size(result) <= _NORMAL_MESSAGE_LIMIT
+    assert calculate_event_size(result) <= _NORMAL_MESSAGE_LIMIT
 
 
 @pytest.mark.asyncio
@@ -400,7 +489,7 @@ async def test_prepare_large_message_missing_content_uri_falls_back_to_text(
     mock_logger.warning.assert_any_call(
         "large_message_sidecar_unavailable_using_text_fallback",
         room_id="!room:server",
-        original_size_bytes=_calculate_event_size(content),
+        original_size_bytes=calculate_event_size(content),
         is_edit=False,
         has_mxc_uri=False,
         has_file_info=False,
@@ -566,7 +655,7 @@ async def test_prepare_streaming_edit_encrypted_incomplete_file_metadata_omits_s
     assert "url" not in inner
     assert "io.mindroom.long_text" not in inner
     assert "[Streaming preview truncated]" in inner["body"]
-    assert _calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.asyncio
@@ -599,7 +688,7 @@ async def test_prepare_edit_message_upload_failure_falls_back_to_text() -> None:
     assert "url" not in inner
     assert "file" not in inner
     assert "io.mindroom.long_text" not in inner
-    assert _calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.asyncio
@@ -639,7 +728,7 @@ async def test_prepare_nonterminal_streaming_edit_double_fallback_preserves_noti
     assert inner["msgtype"] == "m.notice"
     assert inner[STREAM_STATUS_KEY] == STREAM_STATUS_STREAMING
     assert _SIDECAR_UPLOAD_FALLBACK_TEXT in inner["body"]
-    assert _calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.asyncio
@@ -710,6 +799,33 @@ async def test_prepare_edit_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prepare_text_edit_with_file_sidecar_keeps_parseable_fallback() -> None:
+    """Sidecar conversion must leave the edit fallback parseable by nio."""
+    client = _UploadClient(nio.UploadResponse("mxc://server/edit-sidecar"))
+    text = "sidecar-backed edit " * 2000
+    edit_content = {
+        "body": f"* {text}",
+        "m.new_content": {"body": text, "msgtype": "m.text"},
+        "m.relates_to": {"rel_type": "m.replace", "event_id": "$original"},
+        "msgtype": "m.text",
+    }
+
+    prepared = await prepare_large_message(client, "!room:server", edit_content)
+    parsed = nio.Event.parse_event(
+        {
+            "content": prepared,
+            "event_id": "$replacement",
+            "sender": "@agent:server",
+            "origin_server_ts": 123,
+            "type": "m.room.message",
+        },
+    )
+
+    assert prepared["m.new_content"]["msgtype"] == "m.file"
+    assert isinstance(parsed, nio.Event)
+
+
+@pytest.mark.asyncio
 async def test_prepare_terminal_edit_keeps_local_recovery_data_off_the_wire() -> None:
     """Local recovery facts belong in the outbox, not its event or sidecar."""
     client = _UploadClient(nio.UploadResponse("mxc://server/final-edit"))
@@ -729,7 +845,7 @@ async def test_prepare_terminal_edit_keeps_local_recovery_data_off_the_wire() ->
 
     result = await prepare_large_message(client, "!room:server", edit_content)
 
-    assert _calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
     assert DURABLE_FINAL_OUTCOME_KEY not in result
     assert DURABLE_FINAL_OUTCOME_KEY not in result["m.new_content"]
     assert client.uploaded_data is not None
@@ -759,7 +875,7 @@ async def test_prepare_terminal_edit_preserves_bounded_result_compatibility_mark
     result = await prepare_large_message(client, "!room:server", edit_content)
 
     assert result["m.new_content"][DURABLE_FINAL_OUTCOME_KEY] == {"version": 2}
-    assert _calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.asyncio
@@ -786,7 +902,7 @@ async def test_prepare_terminal_edit_updates_sidecar_size_after_inner_preview_sh
     assert len(inner["body"]) < 22_000
     assert inner["io.mindroom.long_text"]["preview_size"] == len(inner["body"])
     assert inner["io.mindroom.required_metadata"] == metadata
-    assert _calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.asyncio
@@ -812,7 +928,7 @@ async def test_prepare_terminal_edit_uses_empty_previews_at_the_metadata_boundar
     assert result["body"] == ""
     assert result["m.new_content"]["body"] == ""
     assert result["m.new_content"]["io.mindroom.required_metadata"] == metadata
-    assert _calculate_event_size(result) == _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(result) == _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.asyncio
@@ -864,13 +980,13 @@ async def test_prepare_terminal_edit_keeps_the_largest_outer_preview_that_fits()
     result = await prepare_large_message(client, "!room:server", edit_content)
 
     assert result["m.new_content"]["body"] == text
-    assert _calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(result) <= _MATRIX_EVENT_HARD_LIMIT
     outer_preview = result["body"][2:]
     assert outer_preview.endswith("[Message continues in attached file]")
     visible_prefix_length = len(outer_preview) - len("\n\n[Message continues in attached file]")
     one_more_byte = dict(result)
     one_more_byte["body"] = f"* {text[: visible_prefix_length + 1]}\n\n[Message continues in attached file]"
-    assert _calculate_event_size(one_more_byte) > _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(one_more_byte) > _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.asyncio
@@ -891,8 +1007,8 @@ async def test_prepare_terminal_edit_rejects_irreducible_metadata_before_repeate
 
     with (
         patch(
-            "mindroom.matrix.large_messages._calculate_event_size",
-            wraps=_calculate_event_size,
+            "mindroom.matrix.large_messages.calculate_event_size",
+            wraps=calculate_event_size,
         ) as calculate_size,
         pytest.raises(ValueError, match="cannot fit within the Matrix event limit"),
     ):
@@ -982,7 +1098,7 @@ async def test_prepare_oversized_file_edit_remains_parseable() -> None:
     assert prepared["url"] == prepared["m.new_content"]["url"]
     assert prepared["filename"] == prepared["m.new_content"]["filename"]
     assert prepared["info"] == prepared["m.new_content"]["info"]
-    assert _calculate_event_size(prepared) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(prepared) <= _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.asyncio
@@ -1047,7 +1163,7 @@ async def test_prepare_oversized_encrypted_file_edit_remains_parseable(
     assert prepared["file"] == prepared["m.new_content"]["file"]
     assert prepared["filename"] == prepared["m.new_content"]["filename"]
     assert prepared["info"] == prepared["m.new_content"]["info"]
-    assert _calculate_event_size(prepared) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(prepared) <= _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.parametrize("room_encrypted", [False, True])
@@ -1096,7 +1212,7 @@ async def test_prepare_oversized_file_edit_upload_failure_uses_parseable_text_fa
         for media_key in ("url", "file", "filename", "info"):
             assert media_key not in fallback
 
-    assert _calculate_event_size(prepared) <= _MATRIX_EVENT_HARD_LIMIT
+    assert calculate_event_size(prepared) <= _MATRIX_EVENT_HARD_LIMIT
 
 
 @pytest.mark.asyncio
@@ -1161,7 +1277,7 @@ async def test_prepare_nonterminal_streaming_edit_uses_rich_inline_preview() -> 
     uploaded_payload = json.loads(client.uploaded_data.decode("utf-8"))
     assert uploaded_payload == edit_content
     assert uploaded_payload["m.new_content"][_TOOL_TRACE_KEY] == tool_trace
-    assert _calculate_event_size(result) <= 64000
+    assert calculate_event_size(result) <= 64000
 
 
 @pytest.mark.asyncio
@@ -1221,7 +1337,7 @@ async def test_prepare_nonterminal_streaming_edit_keeps_preview_large_with_huge_
     assert client.uploaded_data is not None
     uploaded_payload = json.loads(client.uploaded_data.decode("utf-8"))
     assert uploaded_payload["m.new_content"][_TOOL_TRACE_KEY] == huge_tool_trace
-    assert _calculate_event_size(result) <= 64000
+    assert calculate_event_size(result) <= 64000
 
 
 @pytest.mark.asyncio
@@ -1330,6 +1446,7 @@ async def test_prepare_large_message_trusted_metadata_round_trips_through_sideca
         rooms: dict = {}  # noqa: RUF012
         uploaded_data: bytes | None = None
         user_id = "@mindroom_agent:localhost"
+        access_token = TEST_ACCESS_TOKEN
 
         async def upload(self, **kwargs) -> tuple:  # noqa: ANN003
             data_provider = kwargs.get("data_provider")
@@ -1345,6 +1462,9 @@ async def test_prepare_large_message_trusted_metadata_round_trips_through_sideca
             response = MagicMock(spec=nio.DownloadResponse)
             response.body = self.uploaded_data
             return response
+
+        async def send(self, _method: str, path: str, *_args: object, **_kwargs: object) -> FakeMediaResponse:
+            return await serve_media_download(self.download, path)
 
     client = MockClient()
     content = {

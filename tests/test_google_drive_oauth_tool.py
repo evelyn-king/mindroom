@@ -4,14 +4,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import pytest
 from agno.agent import Agent
 from agno.agent._tools import parse_tools
 from agno.models.base import Model
@@ -19,6 +18,7 @@ from agno.models.response import ModelResponse
 from agno.tools.function import Function
 from google.oauth2.credentials import Credentials as GoogleOAuthCredentials
 
+import mindroom.custom_tools.google_drive as google_drive_module
 from mindroom import constants
 from mindroom import tools as _mindroom_tools  # noqa: F401  # registers built-in tool metadata
 from mindroom.config.main import Config
@@ -28,9 +28,24 @@ from mindroom.oauth.google_drive import _GOOGLE_DRIVE_OAUTH_SCOPES, GOOGLE_DRIVE
 from mindroom.tool_approval import tool_may_require_approval
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
+from tests.oauth_test_utils import publish_oauth_credentials
 
 if TYPE_CHECKING:
-    import pytest
+    from typing import BinaryIO
+
+    from mindroom.config.models import FileAccess
+
+
+def _save_oauth_credentials(
+    credentials_manager: CredentialsManager,
+    credentials: Mapping[str, object],
+) -> None:
+    publish_oauth_credentials(
+        GoogleDriveTools._oauth_provider,
+        credentials,
+        credentials_manager=credentials_manager,
+        worker_target=None,
+    )
 
 
 class MinimalModel(Model):
@@ -61,8 +76,9 @@ class MinimalModel(Model):
 
 
 class _FakeDriveRequest:
-    def __init__(self, response: dict[str, object]) -> None:
+    def __init__(self, response: dict[str, object], media_content: bytes = b"hello") -> None:
         self._response = response
+        self.media_content = media_content
 
     def execute(self) -> dict[str, object]:
         return self._response
@@ -74,6 +90,7 @@ class _FakeDriveFilesResource:
         self.get_kwargs: dict[str, object] | None = None
         self.get_media_kwargs: dict[str, object] | None = None
         self.export_media_kwargs: dict[str, object] | None = None
+        self.media_content = b"hello"
         self.create_kwargs: dict[str, object] | None = None
         self.update_kwargs: dict[str, object] | None = None
         self.file_metadata: dict[str, object] = {
@@ -97,11 +114,11 @@ class _FakeDriveFilesResource:
 
     def get_media(self, **kwargs: object) -> _FakeDriveRequest:
         self.get_media_kwargs = kwargs
-        return _FakeDriveRequest({})
+        return _FakeDriveRequest({}, self.media_content)
 
     def export_media(self, **kwargs: object) -> _FakeDriveRequest:
         self.export_media_kwargs = kwargs
-        return _FakeDriveRequest({})
+        return _FakeDriveRequest({}, self.media_content)
 
     def create(self, **kwargs: object) -> _FakeDriveRequest:
         self.create_kwargs = kwargs
@@ -137,21 +154,23 @@ def _valid_credentials() -> GoogleOAuthCredentials:
 
 
 class _FakeMediaIoBaseDownload:
-    def __init__(self, file_handle: object, _request: object) -> None:
+    def __init__(self, file_handle: object, request: _FakeDriveRequest) -> None:
         self._file_handle = file_handle
+        self._media_content = request.media_content
         self._done = False
 
     def next_chunk(self) -> tuple[None, bool]:
         if not self._done:
-            self._file_handle.write(b"hello")
+            self._file_handle.write(self._media_content)
             self._done = True
         return None, self._done
 
 
-class _FakeMediaFileUpload:
-    def __init__(self, filename: str, *, mimetype: str) -> None:
-        self.filename = filename
+class _FakeMediaIoBaseUpload:
+    def __init__(self, file: BinaryIO, *, mimetype: str, resumable: bool = False) -> None:
+        self.content = file.read()
         self.mimetype = mimetype
+        self.resumable = resumable
 
 
 def _google_drive_download_tool(
@@ -159,6 +178,7 @@ def _google_drive_download_tool(
     monkeypatch: pytest.MonkeyPatch,
     *,
     download_dir: Path | None = None,
+    **tool_kwargs: object,
 ) -> tuple[GoogleDriveTools, _FakeDriveService]:
     monkeypatch.setattr("mindroom.custom_tools.google_drive.MediaIoBaseDownload", _FakeMediaIoBaseDownload)
     runtime_paths = _runtime_paths_with_google_drive_client(tmp_path)
@@ -168,6 +188,7 @@ def _google_drive_download_tool(
         creds=_valid_credentials(),
         download_file=True,
         tool_output_workspace_root=download_dir or tmp_path,
+        **tool_kwargs,
     )
     service = _FakeDriveService()
     tool.service = service
@@ -177,8 +198,9 @@ def _google_drive_download_tool(
 def _google_drive_write_tool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    file_access: FileAccess = "workspace",
 ) -> tuple[GoogleDriveTools, _FakeDriveService, Path]:
-    monkeypatch.setattr("mindroom.custom_tools.google_drive.MediaFileUpload", _FakeMediaFileUpload)
+    monkeypatch.setattr("mindroom.custom_tools.google_drive.MediaIoBaseUpload", _FakeMediaIoBaseUpload)
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     tool = GoogleDriveTools(
@@ -186,6 +208,7 @@ def _google_drive_write_tool(
         credentials_manager=CredentialsManager(tmp_path / "credentials"),
         creds=_valid_credentials(),
         tool_output_workspace_root=workspace_root,
+        file_access=file_access,
     )
     service = _FakeDriveService()
     tool.service = service
@@ -279,6 +302,7 @@ def test_google_drive_model_functions_do_not_collide_with_local_file_tools(tmp_p
         "google_drive_search_files",
         "google_drive_read_file",
         "google_drive_upload_file",
+        "google_drive_update_file",
         "google_drive_create_folder",
         "google_drive_move_file",
         "google_drive_trash_file",
@@ -307,21 +331,22 @@ def test_google_drive_write_config_defaults_enabled_and_can_disable(tmp_path: Pa
     )
     write_functions = {
         "google_drive_upload_file",
+        "google_drive_update_file",
         "google_drive_create_folder",
         "google_drive_move_file",
         "google_drive_trash_file",
     }
 
     assert write_functions <= enabled_tool.functions.keys()
-    assert write_functions <= enabled_tool.async_functions.keys()
+    assert not enabled_tool.async_functions
     assert write_functions.isdisjoint(disabled_tool.functions)
-    assert write_functions.isdisjoint(disabled_tool.async_functions)
     assert "google_drive_delete_file" not in enabled_tool.functions
 
 
 def test_google_drive_write_functions_can_require_approval() -> None:
     write_functions = (
         "google_drive_upload_file",
+        "google_drive_update_file",
         "google_drive_create_folder",
         "google_drive_move_file",
         "google_drive_trash_file",
@@ -351,8 +376,6 @@ def test_google_drive_download_uses_namespaced_model_function(tmp_path: Path) ->
 
     assert "google_drive_download_file" in tool.functions
     assert "download_file" not in tool.functions
-    assert "google_drive_download_file" in tool.async_functions
-    assert "download_file" not in tool.async_functions
     assert tool.download_dir == tmp_path / "google-drive-downloads"
 
 
@@ -369,7 +392,6 @@ def test_google_drive_download_disabled_without_workspace(tmp_path: Path) -> Non
     )
 
     assert "google_drive_download_file" not in tool.functions
-    assert "google_drive_download_file" not in tool.async_functions
     assert "google_drive_list_files" in tool.functions
 
 
@@ -468,8 +490,8 @@ def test_google_drive_loads_tokens_from_oauth_service(tmp_path: Path) -> None:
             "_source": "ui",
         },
     )
-    credentials_manager.save_credentials(
-        "google_drive_oauth",
+    _save_oauth_credentials(
+        credentials_manager,
         {
             "token": expected_value,
             "refresh_token": "refresh-token",
@@ -492,8 +514,8 @@ def test_google_drive_loads_tokens_from_oauth_service(tmp_path: Path) -> None:
 def test_google_drive_rejects_stored_token_missing_required_scopes(tmp_path: Path) -> None:
     runtime_paths = _runtime_paths_with_google_drive_client(tmp_path)
     credentials_manager = CredentialsManager(tmp_path / "credentials")
-    credentials_manager.save_credentials(
-        "google_drive_oauth",
+    _save_oauth_credentials(
+        credentials_manager,
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
@@ -519,8 +541,8 @@ def test_google_drive_readonly_grant_keeps_reads_and_requires_reconnect_for_writ
         {"MINDROOM_PUBLIC_URL": "https://mindroom.example.test"},
     )
     credentials_manager = CredentialsManager(tmp_path / "credentials")
-    credentials_manager.save_credentials(
-        "google_drive_oauth",
+    _save_oauth_credentials(
+        credentials_manager,
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
@@ -550,14 +572,14 @@ def test_google_drive_readonly_grant_keeps_reads_and_requires_reconnect_for_writ
     assert service.files_resource.create_kwargs is None
 
 
-def test_google_drive_readonly_grant_blocks_direct_async_write_methods(tmp_path: Path) -> None:
+def test_google_drive_readonly_grant_blocks_direct_write_methods(tmp_path: Path) -> None:
     runtime_paths = _runtime_paths_with_google_drive_client(
         tmp_path,
         {"MINDROOM_PUBLIC_URL": "https://mindroom.example.test"},
     )
     credentials_manager = CredentialsManager(tmp_path / "credentials")
-    credentials_manager.save_credentials(
-        "google_drive_oauth",
+    _save_oauth_credentials(
+        credentials_manager,
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
@@ -576,44 +598,16 @@ def test_google_drive_readonly_grant_blocks_direct_async_write_methods(tmp_path:
     tool.service = service
 
     results = (
-        asyncio.run(tool._aupload_file("plan.txt")),
-        asyncio.run(tool.acreate_folder("Plans")),
-        asyncio.run(tool.amove_file("file-id", "parent-id")),
-        asyncio.run(tool.atrash_file("file-id")),
+        tool.upload_file("plan.txt"),
+        tool.update_file("file-id", "plan.txt"),
+        tool.create_folder("Plans"),
+        tool.move_file("file-id", "parent-id"),
+        tool.trash_file("file-id"),
     )
 
     assert all(json.loads(result)["reason"] == "missing_write_scope" for result in results)
     assert service.files_resource.create_kwargs is None
     assert service.files_resource.update_kwargs is None
-
-
-def test_google_drive_async_write_scope_check_runs_off_event_loop(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime_paths = _runtime_paths_with_google_drive_client(tmp_path)
-    tool = GoogleDriveTools(
-        runtime_paths=runtime_paths,
-        credentials_manager=CredentialsManager(tmp_path / "credentials"),
-        worker_target=None,
-    )
-    event_loop_thread = threading.get_ident()
-    scope_check_threads: list[int] = []
-    expected_result = json.dumps({"reason": "missing_write_scope"})
-
-    def scope_upgrade_result() -> str:
-        scope_check_threads.append(threading.get_ident())
-        return expected_result
-
-    monkeypatch.setattr(tool, "_write_scope_upgrade_result", scope_upgrade_result)
-    entrypoint = tool.async_functions["google_drive_upload_file"].entrypoint
-    assert entrypoint is not None
-
-    result = asyncio.run(entrypoint("unused"))
-
-    assert result == expected_result
-    assert scope_check_threads
-    assert event_loop_thread not in scope_check_threads
 
 
 def test_google_drive_rejects_stored_token_disallowed_by_new_identity_policy(tmp_path: Path) -> None:
@@ -624,8 +618,8 @@ def test_google_drive_rejects_stored_token_disallowed_by_new_identity_policy(tmp
         },
     )
     credentials_manager = CredentialsManager(tmp_path / "credentials")
-    credentials_manager.save_credentials(
-        "google_drive_oauth",
+    _save_oauth_credentials(
+        credentials_manager,
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
@@ -657,8 +651,8 @@ def test_google_drive_rejects_stored_token_missing_claims_when_identity_policy_c
         },
     )
     credentials_manager = CredentialsManager(tmp_path / "credentials")
-    credentials_manager.save_credentials(
-        "google_drive_oauth",
+    _save_oauth_credentials(
+        credentials_manager,
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
@@ -686,8 +680,8 @@ def test_google_drive_stored_token_without_client_config_connects_on_invocation(
         process_env={"MINDROOM_PUBLIC_URL": "https://mindroom.example.test"},
     )
     credentials_manager = CredentialsManager(tmp_path / "credentials")
-    credentials_manager.save_credentials(
-        "google_drive_oauth",
+    _save_oauth_credentials(
+        credentials_manager,
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
@@ -718,8 +712,8 @@ def test_google_drive_mismatched_client_id_connects_on_invocation(tmp_path: Path
         {"MINDROOM_PUBLIC_URL": "https://mindroom.example.test"},
     )
     credentials_manager = CredentialsManager(tmp_path / "credentials")
-    credentials_manager.save_credentials(
-        "google_drive_oauth",
+    _save_oauth_credentials(
+        credentials_manager,
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
@@ -815,10 +809,10 @@ def test_google_drive_search_includes_shared_drive_parameters(tmp_path: Path) ->
         "q": "('folder-id' in parents) and trashed=false",
         "pageSize": 3,
         "orderBy": "modifiedTime desc",
-        "fields": f"incompleteSearch, {tool.SEARCH_FIELDS}",
-        "includeItemsFromAllDrives": True,
-        "supportsAllDrives": True,
+        "fields": tool.SEARCH_FIELDS,
         "corpora": "allDrives",
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
         "pageToken": cursor,
     }
 
@@ -844,9 +838,10 @@ def test_google_drive_upload_resolves_workspace_path_and_sets_metadata(
     assert result["id"] == "created-id"
     assert service.files_resource.create_kwargs is not None
     media = service.files_resource.create_kwargs["media_body"]
-    assert isinstance(media, _FakeMediaFileUpload)
-    assert Path(media.filename) == upload_path
+    assert isinstance(media, _FakeMediaIoBaseUpload)
+    assert media.content == upload_path.read_bytes()
     assert media.mimetype == "text/custom"
+    assert media.resumable
     assert service.files_resource.create_kwargs == {
         "body": {"name": "Launch plan.txt", "parents": ["folder-id"]},
         "media_body": media,
@@ -865,8 +860,66 @@ def test_google_drive_upload_rejects_workspace_escape(
 
     result = json.loads(tool.upload_file("../outside.txt"))
 
-    assert "must stay within the workspace root" in result["error"]
+    assert "inside the agent workspace" in result["error"]
     assert service.files_resource.create_kwargs is None
+
+
+def test_google_drive_update_replaces_binary_file_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, service, workspace_root = _google_drive_write_tool(tmp_path, monkeypatch)
+    replacement = workspace_root / "reports" / "plan.md"
+    replacement.parent.mkdir()
+    replacement.write_text("revised plan")
+    service.files_resource.file_metadata = {
+        "id": "file-id",
+        "name": "plan.md",
+        "mimeType": "text/markdown",
+    }
+
+    result = json.loads(tool.update_file("file-id", "reports/plan.md"))
+
+    assert result == {"id": "file-id"}
+    assert service.files_resource.get_kwargs == {
+        "fileId": "file-id",
+        "fields": "id,name,mimeType",
+        "supportsAllDrives": True,
+    }
+    assert service.files_resource.update_kwargs is not None
+    media = service.files_resource.update_kwargs["media_body"]
+    assert isinstance(media, _FakeMediaIoBaseUpload)
+    assert media.content == replacement.read_bytes()
+    assert media.mimetype == "text/markdown"
+    assert media.resumable
+    assert service.files_resource.update_kwargs == {
+        "fileId": "file-id",
+        "media_body": media,
+        "fields": "id,name,mimeType,modifiedTime,size,parents,trashed,webViewLink",
+        "supportsAllDrives": True,
+    }
+
+
+def test_google_drive_update_rejects_google_workspace_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, service, workspace_root = _google_drive_write_tool(tmp_path, monkeypatch)
+    replacement = workspace_root / "plan.txt"
+    replacement.write_text("revised plan")
+    service.files_resource.file_metadata = {
+        "id": "file-id",
+        "name": "Plan",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+
+    result = json.loads(tool.update_file("file-id", "plan.txt"))
+
+    assert result["error"] == (
+        "Google Drive content replacement only supports binary files; "
+        "application/vnd.google-apps.document requires its Google Workspace API"
+    )
+    assert service.files_resource.update_kwargs is None
 
 
 def test_google_drive_upload_rejects_absolute_workspace_escape(
@@ -879,15 +932,36 @@ def test_google_drive_upload_rejects_absolute_workspace_escape(
 
     result = json.loads(tool.upload_file(str(outside_path)))
 
-    assert "must stay within the workspace root" in result["error"]
+    assert "inside the agent workspace" in result["error"]
     assert service.files_resource.create_kwargs is None
+
+
+@pytest.mark.parametrize("file_access", ["workspace", "unrestricted"])
+def test_google_drive_upload_outside_workspace_follows_file_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    file_access: FileAccess,
+) -> None:
+    tool, service, _workspace_root = _google_drive_write_tool(tmp_path, monkeypatch, file_access)
+    outside_path = tmp_path / "outside.txt"
+    outside_path.write_text("private")
+
+    result = json.loads(tool.upload_file(str(outside_path)))
+
+    if file_access == "workspace":
+        assert "inside the agent workspace" in result["error"]
+        assert service.files_resource.create_kwargs is None
+        return
+    assert result["id"] == "created-id"
+    assert service.files_resource.create_kwargs is not None
+    assert service.files_resource.create_kwargs["media_body"].content == b"private"
 
 
 def test_google_drive_upload_requires_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("mindroom.custom_tools.google_drive.MediaFileUpload", _FakeMediaFileUpload)
+    monkeypatch.setattr("mindroom.custom_tools.google_drive.MediaIoBaseUpload", _FakeMediaIoBaseUpload)
     outside_path = tmp_path / "outside.txt"
     outside_path.write_text("private")
     tool = GoogleDriveTools(
@@ -901,7 +975,8 @@ def test_google_drive_upload_requires_workspace(
 
     result = json.loads(tool.upload_file(str(outside_path)))
 
-    assert result["error"] == "Google Drive local_path requires an agent workspace"
+    assert "Google Drive local_path" in result["error"]
+    assert "requires an agent workspace" in result["error"]
     assert service.files_resource.create_kwargs is None
 
 
@@ -1074,6 +1149,23 @@ def test_google_drive_download_media_supports_shared_drive_files(
     assert service.files_resource.export_media_kwargs is None
 
 
+def test_google_drive_download_returns_absolute_path_for_relative_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    workspace = Path("workspace")
+    workspace.mkdir()
+    tool, service = _google_drive_download_tool(tmp_path, monkeypatch, download_dir=workspace)
+    service.files_resource.file_metadata = {"name": "notes.txt", "mimeType": "text/plain"}
+
+    result = json.loads(tool.download_file("shared-drive-file-id"))
+
+    assert result["status"] == "downloaded"
+    assert Path(result["path"]) == tmp_path / "workspace" / "google-drive-downloads" / "notes.txt"
+    assert Path(result["path"]).read_bytes() == b"hello"
+
+
 def test_google_drive_download_rejects_parent_directory_traversal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1173,6 +1265,133 @@ def test_google_drive_download_rejects_symlink_escape(
     assert service.files_resource.export_media_kwargs is None
 
 
+@pytest.mark.parametrize("before_construction", [True, False])
+@pytest.mark.parametrize("mime_type", ["text/plain", "application/vnd.google-apps.document"])
+def test_google_drive_download_rejects_symlinked_download_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before_construction: bool,
+    mime_type: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "notes.txt"
+    outside_file.write_bytes(b"outside")
+    download_root = workspace / "google-drive-downloads"
+    if before_construction:
+        download_root.symlink_to(outside, target_is_directory=True)
+    tool, service = _google_drive_download_tool(tmp_path, monkeypatch, download_dir=workspace)
+    if not before_construction:
+        download_root.symlink_to(outside, target_is_directory=True)
+    service.files_resource.file_metadata = {"name": "notes.txt", "mimeType": mime_type}
+
+    result = json.loads(tool.download_file("shared-drive-file-id"))
+
+    assert outside_file.read_bytes() == b"outside"
+    assert "error" in result
+    assert service.files_resource.get_media_kwargs is None
+    assert service.files_resource.export_media_kwargs is None
+
+
+@pytest.mark.parametrize("mime_type", ["text/plain", "application/vnd.google-apps.document"])
+def test_google_drive_download_pins_directory_during_request_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mime_type: str,
+) -> None:
+    tool, service = _google_drive_download_tool(tmp_path, monkeypatch)
+    service.files_resource.file_metadata = {"name": "notes.txt", "mimeType": mime_type}
+    download_root = tmp_path / "google-drive-downloads"
+    original_root = tmp_path / "original-downloads"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "notes.txt"
+    outside_file.write_bytes(b"outside")
+
+    def swap_download_root(**_kwargs: object) -> _FakeDriveRequest:
+        download_root.rename(original_root)
+        download_root.symlink_to(outside, target_is_directory=True)
+        return _FakeDriveRequest({})
+
+    method_name = "get_media" if mime_type == "text/plain" else "export_media"
+    monkeypatch.setattr(service.files_resource, method_name, swap_download_root)
+
+    result = json.loads(tool.download_file("shared-drive-file-id"))
+
+    assert outside_file.read_bytes() == b"outside"
+    assert "error" not in result
+    assert (original_root / "notes.txt").read_bytes() == b"hello"
+
+
+def test_google_drive_download_failure_preserves_existing_file_and_cleans_partial_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, service = _google_drive_download_tool(tmp_path, monkeypatch)
+    service.files_resource.file_metadata = {"name": "notes.txt", "mimeType": "text/plain"}
+    download_root = tmp_path / "google-drive-downloads"
+    download_root.mkdir()
+    existing_file = download_root / "notes.txt"
+    existing_file.write_bytes(b"original")
+
+    class FailingDownload(_FakeMediaIoBaseDownload):
+        def next_chunk(self) -> tuple[None, bool]:
+            self._file_handle.write(b"partial")
+            msg = "Download interrupted"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr("mindroom.custom_tools.google_drive.MediaIoBaseDownload", FailingDownload)
+
+    result = json.loads(tool.download_file("shared-drive-file-id"))
+
+    assert "Download interrupted" in result["error"]
+    assert existing_file.read_bytes() == b"original"
+    assert list(download_root.iterdir()) == [existing_file]
+
+
+def test_google_drive_download_refuses_file_larger_than_max_download_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, service = _google_drive_download_tool(tmp_path, monkeypatch, max_download_size="4")
+    service.files_resource.file_metadata = {"name": "archive.bin", "mimeType": "application/zip", "size": "5"}
+
+    result = json.loads(tool.download_file("shared-drive-file-id"))
+
+    assert result["error"] == "File is 5 bytes, exceeds max_download_size (4)."
+    assert "size" in str(service.files_resource.get_kwargs["fields"]).split(",")
+    assert service.files_resource.get_media_kwargs is None
+    assert not (tmp_path / "google-drive-downloads").exists()
+
+
+@pytest.mark.parametrize("mime_type", ["text/plain", "application/vnd.google-apps.document"])
+def test_google_drive_download_stops_writing_past_max_download_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mime_type: str,
+) -> None:
+    """A stream longer than the limit is cut off and leaves no file, whatever the metadata said."""
+    tool, service = _google_drive_download_tool(tmp_path, monkeypatch, max_download_size=8)
+    service.files_resource.file_metadata = {"name": "notes.txt", "mimeType": mime_type}
+    chunks_written: list[bytes] = []
+
+    class OversizedDownload(_FakeMediaIoBaseDownload):
+        def next_chunk(self) -> tuple[None, bool]:
+            self._file_handle.write(b"hello")
+            chunks_written.append(b"hello")
+            return None, len(chunks_written) == 3
+
+    monkeypatch.setattr("mindroom.custom_tools.google_drive.MediaIoBaseDownload", OversizedDownload)
+
+    result = json.loads(tool.download_file("shared-drive-file-id"))
+
+    assert result["error"] == "Google Drive download exceeds max_download_size (8 bytes)"
+    assert len(chunks_written) <= 1
+    assert list((tmp_path / "google-drive-downloads").iterdir()) == []
+
+
 def test_google_drive_download_adds_export_extension_inside_download_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1183,7 +1402,7 @@ def test_google_drive_download_adds_export_extension_inside_download_dir(
         "mimeType": "application/vnd.google-apps.document",
         "webViewLink": "https://drive.google.com/document/d/example",
     }
-    tool._download_bytes = lambda _request: b"docx"
+    service.files_resource.media_content = b"docx"
 
     result = json.loads(tool.download_file("shared-drive-file-id"))
 
@@ -1207,7 +1426,7 @@ def test_google_drive_download_exports_complete_spreadsheet_as_xlsx(
         "mimeType": "application/vnd.google-apps.spreadsheet",
         "webViewLink": "https://drive.google.com/spreadsheets/d/example",
     }
-    tool._download_bytes = lambda _request: b"xlsx workbook"
+    service.files_resource.media_content = b"xlsx workbook"
 
     result = json.loads(tool.download_file("shared-drive-file-id"))
 
@@ -1231,7 +1450,7 @@ def test_google_drive_download_preserves_existing_export_extension(
         "mimeType": "application/vnd.google-apps.document",
         "webViewLink": "https://drive.google.com/document/d/example",
     }
-    tool._download_bytes = lambda _request: b"docx"
+    service.files_resource.media_content = b"docx"
 
     result = json.loads(tool.download_file("shared-drive-file-id"))
 
@@ -1244,3 +1463,29 @@ def test_google_drive_download_preserves_existing_export_extension(
         "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     }
     assert service.files_resource.get_media_kwargs is None
+
+
+def test_google_drive_upload_refuses_file_swapped_for_link_after_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker code swapping the checked workspace file for a link must not redirect the upload."""
+    tool, service, workspace_root = _google_drive_write_tool(tmp_path, monkeypatch)
+    checked = workspace_root / "plan.txt"
+    checked.write_text("plan")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("private")
+    resolve = google_drive_module.resolve_agent_file
+
+    def resolve_then_swap(*args: object, **kwargs: object) -> object:
+        authorized = resolve(*args, **kwargs)
+        checked.unlink()
+        checked.symlink_to(secret)
+        return authorized
+
+    monkeypatch.setattr(google_drive_module, "resolve_agent_file", resolve_then_swap)
+
+    result = json.loads(tool.upload_file("plan.txt"))
+
+    assert "error" in result
+    assert service.files_resource.create_kwargs is None

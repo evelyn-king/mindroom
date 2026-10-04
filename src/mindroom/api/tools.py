@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from mindroom.agent_policy import dashboard_credentials_supported_for_scope
 from mindroom.api import config_lifecycle
 from mindroom.api.dashboard_credential_scope import (
-    require_agent_credential_management_authorized,
+    require_agent_oauth_connection_authorized,
     resolve_dashboard_agent_execution_scope_request,
     resolve_dashboard_execution_scope_override,
 )
@@ -31,7 +31,12 @@ from mindroom.oauth.credential_lifecycle import (
 )
 from mindroom.oauth.registry import load_oauth_providers
 from mindroom.oauth.service import oauth_provider_service_account_configured
-from mindroom.tool_system.catalog import export_tools_metadata, resolved_tool_metadata_for_runtime
+from mindroom.tool_system.catalog import (
+    ensure_tool_registry_loaded,
+    export_tools_metadata,
+    resolved_tool_metadata_for_runtime,
+)
+from mindroom.tool_system.sandbox_proxy import primary_owns_tool_settings
 from mindroom.tool_system.worker_routing import (
     WorkerScope,
     build_worker_target_from_runtime_env,
@@ -39,7 +44,6 @@ from mindroom.tool_system.worker_routing import (
 )
 
 if TYPE_CHECKING:
-    from mindroom.config.auth import AuthorizationConfig
     from mindroom.constants import RuntimePaths
     from mindroom.credentials import CredentialsManager
     from mindroom.oauth.providers import OAuthProvider
@@ -68,7 +72,7 @@ class _ResolvedToolAvailabilityContext:
     auth_provider_credential_services: dict[str, str]
     oauth_providers: dict[str, OAuthProvider]
     runtime_paths: RuntimePaths
-    oauth_authorization: AuthorizationConfig | None = None
+    oauth_config: Config | None = None
 
 
 def _effective_allowed_shared_services(
@@ -193,6 +197,12 @@ def _annotate_dashboard_configuration_support(
         tool["dashboard_configuration_supported"] = supported
 
 
+def _annotate_lazy_loading_support(tools: list[dict[str, Any]]) -> None:
+    """Expose whether an agent's entry for each tool may set defer/initial."""
+    for tool in tools:
+        tool["lazy_loading_supported"] = Config.supports_lazy_loading(tool["name"])
+
+
 def _annotate_execution_scope_support(
     tools: list[dict[str, Any]],
     *,
@@ -255,7 +265,7 @@ def _resolve_tool_availability_context(
         execution_scope,
     )
     authorized_identity = (
-        require_agent_credential_management_authorized(
+        require_agent_oauth_connection_authorized(
             request,
             config=config,
             runtime_paths=runtime_paths,
@@ -279,6 +289,7 @@ def _resolve_tool_availability_context(
         else None
     )
     oauth_providers = load_oauth_providers(config, runtime_paths)
+    ensure_tool_registry_loaded(runtime_paths)
     return _ResolvedToolAvailabilityContext(
         execution_scope=execution_scope,
         dashboard_configuration_supported=status_authoritative,
@@ -291,7 +302,7 @@ def _resolve_tool_availability_context(
         },
         oauth_providers=oauth_providers,
         runtime_paths=runtime_paths,
-        oauth_authorization=config.authorization,
+        oauth_config=config,
     )
 
 
@@ -311,7 +322,7 @@ async def _load_oauth_provider_credentials(
         context.runtime_paths,
         context.credentials_manager,
         context.worker_target,
-        authorization=context.oauth_authorization,
+        config=context.oauth_config,
     )
     provider_target = credential_context.worker_target
     if provider.requester_scoped_credentials and provider_target is None:
@@ -351,6 +362,9 @@ async def _update_tools_statuses(
                     credentials_manager=context.credentials_manager,
                     worker_target=worker_target,
                     allowed_shared_services=allowed_shared_services,
+                    primary_built_tool=worker_target is not None
+                    and worker_target.routing_agent_name is not None
+                    and primary_owns_tool_settings(service, runtime_paths=context.runtime_paths),
                 )
             else:
                 credentials_cache[cache_key] = _load_shared_preview_credentials(
@@ -444,6 +458,7 @@ async def get_registered_tools(
         execution_scope_override=execution_scope_override,
     )
     _append_config_only_presets(tools)
+    _annotate_lazy_loading_support(tools)
     _annotate_execution_scope_support(
         tools,
         execution_scope=context.execution_scope,

@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,8 +29,10 @@ from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
+from urllib.parse import unquote, urlsplit
 
+import httpx
 import nio
 import pytest
 import pytest_asyncio
@@ -43,10 +46,15 @@ from structlog.typing import BindableLogger, Context, Processor, WrappedLogger
 
 import mindroom.approval_manager as approval_manager_module
 import mindroom.bot  # noqa: F401
+import mindroom.custom_tools.todo as todo_tool_module
 import mindroom.handled_turns as handled_turns_module
+import mindroom.managed_avatars as managed_avatars_module
+import mindroom.matrix.client_room_admin as client_room_admin_module
+import mindroom.matrix.rooms as matrix_rooms_module
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.agent_storage import get_agent_session, get_team_session
 from mindroom.ai import ResponseTurnContext
+from mindroom.authorization import _ReplyAuthorizationDecision
 from mindroom.bot import AgentBot, TeamBot
 from mindroom.coalescing import CoalescingDrainResult
 from mindroom.coalescing_batch import PendingEvent
@@ -82,17 +90,15 @@ from mindroom.event_journal import (
     VisibleMessage,
 )
 from mindroom.event_journal import reads as journal_reads
-from mindroom.event_journal.outbox import _legacy_delivery_result, matrix_delivery_payload
+from mindroom.event_journal.outbox import matrix_delivery_payload
 from mindroom.final_delivery import FinalDeliveryOutcome
 from mindroom.handled_turns import _reset_handled_turn_ledger_runtime
 from mindroom.history.runtime import (
-    ScopeSessionContext,
-    _resolve_history_scope,
     finalize_history_preparation,
-    open_scope_session_context,
     prepare_scope_history,
     resolve_agent_preparation_inputs,
 )
+from mindroom.history.session_context import ScopeSessionContext, open_scope_session_context, resolve_history_scope
 from mindroom.history.types import (
     CompactionLifecycle,
     HistoryScope,
@@ -104,15 +110,19 @@ from mindroom.hooks import EnrichmentItem, MessageEnvelope
 from mindroom.ingress_validation import IngressValidator
 from mindroom.interactive import InteractiveMetadata
 from mindroom.interactive_models import InteractivePrompt, interactive_prompt_content
+from mindroom.legacy_delivery_payloads import _inline_final_result
 from mindroom.matrix.client import DeliveredMatrixEvent, ResolvedVisibleMessage
 from mindroom.matrix.client_delivery import build_edit_event_content
+from mindroom.matrix.client_room_admin import RoomJoinOutcome
 from mindroom.matrix.conversation_reads import ConversationReader
 from mindroom.matrix.identity import MatrixID
+from mindroom.matrix.large_messages import _oversized_nonterminal_streaming_edit_next_allowed_at
 from mindroom.matrix.media import is_matrix_media_dispatch_event
 from mindroom.matrix.relation_lookup import RelationLookup
 from mindroom.matrix.thread_diagnostics import is_thread_history_degraded
 from mindroom.matrix_delivery import TurnHandoff
 from mindroom.message_target import MessageTarget
+from mindroom.personal_room_lifecycle import PersonalRoomLifecycle
 from mindroom.provider_media_fallback import reset_model_media_capability_cache
 from mindroom.reaction_dispatch import ReactionDispatcher
 from mindroom.response_payload_preparation import (
@@ -121,6 +131,7 @@ from mindroom.response_payload_preparation import (
     ResponsePayloadPreparer,
 )
 from mindroom.response_runner import PostLockRequestPreparationError, ResponseRequest, ResponseRunner
+from mindroom.response_sources import ResponseSources
 from mindroom.thread_utils import decide_agent_response
 from mindroom.turn_controller import TurnController, _DispatchPreparation, _ReplayGuardContext
 from mindroom.turn_origin import TurnOrigin, classify_turn_origin
@@ -143,6 +154,8 @@ if TYPE_CHECKING:
     from mindroom.event_journal import EventJournalStore
     from mindroom.event_journal.backend import Backend, Operation
     from mindroom.matrix_rtc.call_manager import CallManager
+    from mindroom.response_sources import ResponseAttempt
+    from mindroom.streaming import StreamingResponse
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 
@@ -177,10 +190,10 @@ _POSTGRES_JOURNAL_LOCALE = "en_US.utf8"
 # and `docker system df -v`, not `du`.
 _POSTGRES_JOURNAL_DATA_DIR = "/var/lib/postgresql/data"
 # A cap, not an allocation: tmpfs pages are only backed as they are written, and
-# a fresh cluster plus one database per xdist worker measures well under 1 GB.
+# each worker retains test schemas for the full suite, including their indexes.
 # Docker's default of half of host RAM is left behind on purpose -- an uncapped
 # runaway on a shared machine is the same class of failure as the disk leak.
-_POSTGRES_JOURNAL_TMPFS_SIZE = "2g"
+_POSTGRES_JOURNAL_TMPFS_SIZE = "4g"
 
 # A killed run reaches no teardown, so its container outlives it forever. The
 # tmpfs above means such a container no longer strands storage, but it still
@@ -405,6 +418,7 @@ __all__ = [
     "TEST_ACCESS_TOKEN",
     "TEST_PASSWORD",
     "FakeCredentialsManager",
+    "FakeMediaResponse",
     "activate_interactive_prompt",
     "agent_response_should_respond",
     "aioresponse",
@@ -421,6 +435,7 @@ __all__ = [
     "install_call_manager_mock",
     "install_edit_message_mock",
     "install_generate_response_mock",
+    "install_personal_room_shutdown_mock",
     "install_runtime_journal_support",
     "install_send_response_mock",
     "install_shutdown_drain_mocks",
@@ -444,6 +459,8 @@ __all__ = [
     "request_envelope",
     "requires_linux",
     "runtime_paths_for",
+    "serve_media_download",
+    "serve_media_from_download",
     "sync_bot_runtime_state",
     "test_runtime_paths",
     "unwrap_extracted_collaborator",
@@ -482,7 +499,7 @@ async def prepare_history_for_run_for_test(
     compaction_lifecycle: CompactionLifecycle | None = None,
 ) -> PreparedHistoryState:
     """Compose the production history-preparation seams for one test run."""
-    resolved_scope = scope or _resolve_history_scope(agent)
+    resolved_scope = scope or resolve_history_scope(agent)
     resolved_inputs = resolve_agent_preparation_inputs(
         agent=agent,
         agent_name=agent_name,
@@ -818,9 +835,15 @@ def _postgres_container_name(run_id: str, prefix: str) -> str:
     return f"{prefix}{run_id}"
 
 
+# The controller creates the pipe and every worker mounts it, so they must agree
+# on its directory. Captured at import, before pytest-shm points each process's
+# temp root into that process's own pytest base directory at session start.
+_OWNER_PIPE_ROOT = Path(tempfile.gettempdir())
+
+
 def _owner_pipe_dir(run_id: str) -> Path:
     """Return the host directory holding one run's owner pipe."""
-    return Path(tempfile.gettempdir()) / f"mindroom-pytest-owner-{run_id}"
+    return _OWNER_PIPE_ROOT / f"mindroom-pytest-owner-{run_id}"
 
 
 def _hold_owner_pipe(run_id: str) -> None:
@@ -1139,6 +1162,61 @@ class _AutoRoomCache(MutableMapping[str, nio.MatrixRoom]):
         return len(self._rooms)
 
 
+@dataclass
+class FakeMediaResponse:
+    """The part of an aiohttp response that a streamed Matrix media download reads."""
+
+    body: bytes
+    status: int = 200
+    headers: dict[str, str] = field(default_factory=dict)
+    streamed_bytes: int = 0
+    released: bool = False
+
+    @property
+    def content(self) -> "FakeMediaResponse":
+        """Stand in for the response's payload stream."""
+        return self
+
+    async def iter_chunked(self, size: int) -> AsyncIterator[bytes]:
+        """Yield the body in chunks, counting what the reader actually took."""
+        for start in range(0, len(self.body), size):
+            chunk = self.body[start : start + size]
+            self.streamed_bytes += len(chunk)
+            yield chunk
+
+    def release(self) -> None:
+        """Record that the reader gave the connection back."""
+        self.released = True
+
+
+async def serve_media_download(download: Callable[..., Awaitable[object]], path: str) -> FakeMediaResponse:
+    """Answer one streamed media download request from a test's ``download(mxc=...)`` fake."""
+    server_name, media_id = urlsplit(path).path.split("/")[-2:]
+    response = await download(mxc=f"mxc://{unquote(server_name)}/{unquote(media_id)}")
+    if isinstance(response, nio.DownloadResponse):
+        return FakeMediaResponse(response.body)
+    return FakeMediaResponse(b'{"errcode": "M_NOT_FOUND"}', status=404)
+
+
+def serve_media_from_download(client: AsyncMock) -> None:
+    """Answer streamed media requests on ``client.send`` from ``client.download`` as it is when each is sent."""
+
+    async def send(_method: str, path: str, *_args: object, **_kwargs: object) -> object:
+        if "/media/download/" not in path:
+            return DEFAULT
+        return await serve_media_download(client.download, path)
+
+    client.access_token = TEST_ACCESS_TOKEN
+    client.send = AsyncMock(side_effect=send)
+
+
+async def push_stream_chunk(streaming: "StreamingResponse", chunk: str, client: object) -> None:
+    """Apply one visible chunk to a stream and let its throttle decide whether to deliver it."""
+    prior_delta_at = streaming.last_delta_at
+    streaming._update(chunk)
+    await streaming._throttled_send(client, prior_delta_at=prior_delta_at)
+
+
 def make_matrix_client_mock(*, user_id: str = "@mindroom_test:example.com") -> AsyncMock:
     """Return an AsyncClient-shaped mock with safe defaults for sync nio APIs."""
     client = AsyncMock(spec=nio.AsyncClient)
@@ -1148,9 +1226,9 @@ def make_matrix_client_mock(*, user_id: str = "@mindroom_test:example.com") -> A
     client.device_id = "TESTDEVICE"
     client.olm = None
     client.rooms = _AutoRoomCache(user_id)
+    client.invited_rooms = {}
     client.next_batch = "s_test_token"
     client.loaded_sync_token = ""
-    client.has_uncommitted_classic_sync_state = False
     presence_response = MagicMock()
     presence_response.presence = "offline"
     presence_response.last_active_ago = 3_600_000
@@ -1164,19 +1242,8 @@ def make_matrix_client_mock(*, user_id: str = "@mindroom_test:example.com") -> A
     client.room_get_event_relations = MagicMock(return_value=_empty_async_iterator())
     client.room_messages = AsyncMock(return_value=room_messages_response)
     client.joined_rooms = AsyncMock(return_value=nio.JoinedRoomsResponse(rooms=[]))
+    serve_media_from_download(client)
 
-    async def reset_classic_sync_state() -> None:
-        client.next_batch = ""
-        client.loaded_sync_token = ""
-        client.rooms.clear()
-        client.has_uncommitted_classic_sync_state = False
-
-    def acknowledge_classic_sync(_next_batch: str) -> None:
-        client.has_uncommitted_classic_sync_state = False
-
-    client.clear_persisted_sync_recovery = MagicMock()
-    client.acknowledge_classic_sync = MagicMock(side_effect=acknowledge_classic_sync)
-    client.reset_classic_sync_state.side_effect = reset_classic_sync_state
     return client
 
 
@@ -1248,8 +1315,14 @@ def serve_conversation_reader(
                 sender=message.sender,
                 # `or ordinal` would rewrite a real timestamp of 0.
                 created_ts=ordinal if message.timestamp is None else message.timestamp,
-                revision_event_id=message.event_id,
-                revision_ts=ordinal if message.timestamp is None else message.timestamp,
+                revision_event_id=message.latest_event_id,
+                revision_ts=(
+                    message.edited_timestamp
+                    if message.edited_timestamp is not None
+                    else ordinal
+                    if message.timestamp is None
+                    else message.timestamp
+                ),
                 content=dict(message.content),
             )
             for ordinal, message in enumerate(messages, start=1)
@@ -1272,6 +1345,7 @@ class FakeOutbox:
 
     def __init__(self) -> None:
         self.rows: dict[tuple[str, str], MatrixDelivery] = {}
+        self.response_attempts: dict[str, ResponseAttempt] = {}
         # What each acknowledgement carried alongside it, so a test can
         # assert the terminal record and the acknowledgement are one write.
         self.acknowledged_terminal_turns: list[tuple[str, TerminalTurnWrite | None]] = []
@@ -1306,6 +1380,7 @@ class FakeOutbox:
         thread_id: str | None,
         payload: Mapping[str, object],
         result: Mapping[str, object] | None = None,
+        response_attempt: "ResponseAttempt | None" = None,
         event_type: str = "m.room.message",
         edits_event_id: str | None = None,
         settle_source_event_ids: tuple[str, ...] = (),
@@ -1330,6 +1405,11 @@ class FakeOutbox:
         to settle them in; whether the settlement really shares this
         transaction is pinned against the real backends.
         """
+        if response_attempt is not None:
+            existing_attempt = self.response_attempts.setdefault(delivery_id, response_attempt)
+            if existing_attempt != response_attempt:
+                message = "Conflicting response attempt identity"
+                raise ValueError(message)
         if settle_source_event_ids:
             self.handed_over.append(settle_source_event_ids)
         membership_epoch = await self.membership_epoch(room_id)
@@ -1357,7 +1437,7 @@ class FakeOutbox:
                 room_id=room_id,
                 thread_id=thread_id,
                 payload=matrix_delivery_payload(self.principal_id, delivery_id, stage, payload),
-                result=dict(result) if result is not None else _legacy_delivery_result(payload),
+                result=dict(result) if result is not None else _inline_final_result(payload),
                 event_type=event_type,
                 edits_event_id=edits_event_id,
                 permanent_failure_reason=permanent_failure_reason,
@@ -1375,7 +1455,7 @@ class FakeOutbox:
             thread_id=thread_id,
             transaction_id=transaction_id,
             payload=matrix_delivery_payload(self.principal_id, delivery_id, stage, payload),
-            result=dict(result) if result is not None else _legacy_delivery_result(payload),
+            result=dict(result) if result is not None else _inline_final_result(payload),
             edits_event_id=edits_event_id,
             acknowledged_event_id=None,
             created_at_ns=len(self.rows),
@@ -1506,7 +1586,7 @@ class FakeOutbox:
         )
         self.acknowledged_terminal_turns.append((delivery_id, terminal_turn))
         self.acknowledged_projections.append(delivered_projections)
-        return DeliveryAcknowledgement(settled_event_id=event_id, bound=True)
+        return DeliveryAcknowledgement(settled_event_id=event_id, bound=True, terminal_turn=terminal_turn)
 
     async def unacknowledged_matrix_deliveries(
         self,
@@ -1614,6 +1694,7 @@ class DiesAfterAcknowledgement:
         thread_id: str | None,
         payload: Mapping[str, object],
         result: Mapping[str, object] | None = None,
+        response_attempt: "ResponseAttempt | None" = None,
         event_type: str = "m.room.message",
         edits_event_id: str | None = None,
         settle_source_event_ids: tuple[str, ...] = (),
@@ -1627,6 +1708,7 @@ class DiesAfterAcknowledgement:
             thread_id=thread_id,
             payload=payload,
             result=result,
+            response_attempt=response_attempt,
             event_type=event_type,
             edits_event_id=edits_event_id,
             settle_source_event_ids=settle_source_event_ids,
@@ -1906,13 +1988,52 @@ def make_membership_stub() -> PrincipalStore:
 
 
 def install_runtime_journal_support(bot: RuntimeBot) -> RuntimeBot:
-    """Pin the journal identity a test bot certifies its sync checkpoints against.
+    """Install the durable-runtime stand-ins used by lightweight bot tests.
 
-    The real generation is a fresh UUID per database, so a test that saves a
-    checkpoint and restarts would exercise the first-open mint rejecting it
-    rather than the token logic it means to test.
+    These tests deliberately do not open an owned ingestion session. Route
+    their membership work through the mocked Matrix transports while keeping
+    production's durable gateway fail-closed when no session is attached.
     """
-    bot._sync_checkpoint_trust.store_generation = "test-store-generation"
+
+    async def change_membership(
+        room_id: str,
+        target_membership: str,
+        *,
+        is_authorized: Callable[[], bool] | None = None,
+    ) -> bool:
+        client = bot.client
+        if client is None:
+            msg = "Matrix client is not ready for test room membership work"
+            raise RuntimeError(msg)
+        if target_membership == "join":
+            position = await bot.journal_principal().ingestion_membership_position(room_id)
+            if is_authorized is not None and not is_authorized():
+                return False
+            rooms = client.rooms
+            if (
+                isinstance(rooms, Mapping)
+                and any(joined_room_id == room_id for joined_room_id in rooms)
+                and (position is None or position.membership == "join")
+            ):
+                return True
+            outcome = await client_room_admin_module.join_room(client, room_id)
+            joined = outcome is RoomJoinOutcome.JOINED or outcome is True
+            if joined:
+                client.rooms[room_id] = nio.MatrixRoom(room_id, client.user_id)
+                if isinstance(client.invited_rooms, dict):
+                    client.invited_rooms.pop(room_id, None)
+            return joined
+        if target_membership == "leave":
+            return await matrix_rooms_module.leave_room(client, room_id)
+        msg = f"Unsupported test room membership target: {target_membership}"
+        raise ValueError(msg)
+
+    bot._room_lifecycle.deps = replace(
+        bot._room_lifecycle.deps,
+        change_membership=change_membership,
+    )
+    bot.change_local_membership = change_membership  # type: ignore[method-assign]
+    bot.personal_rooms.change_membership = change_membership
     sync_bot_runtime_state(bot)
     return bot
 
@@ -2022,6 +2143,17 @@ class FakeCredentialsManager:
         """Return the shared credential layer for this fake manager."""
         return self
 
+    def for_primary_runtime_agent_scope(self, agent_name: str) -> "FakeCredentialsManager":
+        """Return an empty primary agent-scoped store."""
+        return FakeCredentialsManager({}, storage_root=self.storage_root / "primary" / agent_name)
+
+    def for_primary_runtime_scope(self, requester_id: str, agent_name: str | None) -> "FakeCredentialsManager":
+        """Return an empty primary requester-scoped store."""
+        return FakeCredentialsManager(
+            {},
+            storage_root=self.storage_root / "primary" / requester_id / (agent_name or ""),
+        )
+
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Skip tests marked with requires_matrix unless MATRIX_SERVER_URL is set."""
@@ -2102,6 +2234,18 @@ def write_config_yaml(config: Config, config_path: Path) -> None:
     safe_replace(tmp_path, path)
 
 
+def plant_workspace_entry(path: Path, kind: str, victim: Path | None = None) -> None:
+    """Put what worker code could plant at ``path``: a ``link`` to ``victim`` or a ``fifo``."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "fifo":
+        os.mkfifo(path)
+    else:
+        assert victim is not None
+        path.symlink_to(victim, target_is_directory=victim.is_dir())
+
+
 def bind_runtime_paths(
     config: Config,
     runtime_paths: RuntimePaths,
@@ -2145,7 +2289,8 @@ def create_mock_room(
     room.room_id = room_id
     if agents:
         domain = config.get_domain(runtime_paths_for(config)) if config is not None else "localhost"
-        room.users = {f"@mindroom_{agent}:{domain}": None for agent in agents}
+        user_ids = [f"@mindroom_{agent}:{domain}" for agent in agents]
+        room.users = {user_id: nio.MatrixUser(user_id) for user_id in user_ids}
     else:
         room.users = {}
     return room
@@ -2267,6 +2412,10 @@ async def prepare_payload_via_seam(bot: RuntimeBot, execute_args: tuple[object, 
     payload_inputs = cast("DispatchPayloadInputs", execute_args[4])
     await bot._request_payload_preparer.prepare(
         ResponseRequest(
+            sources=ResponseSources(
+                pending_event_ids=(dispatch.envelope.source_event_id,),
+                logical_source_event_ids=(dispatch.envelope.source_event_id,),
+            ),
             thread_history=dispatch.context.thread_history,
             prompt=event.body,
             response_envelope=dispatch.envelope,
@@ -2565,6 +2714,11 @@ def patch_response_runner_module(**changes: object) -> Generator[None, None, Non
         yield
 
 
+def install_personal_room_shutdown_mock(bot: AgentBot) -> None:
+    """Install lifecycle cancellation for partial shutdown fixtures through one seam."""
+    bot._personal_room_lifecycle = MagicMock(spec=PersonalRoomLifecycle)
+
+
 def install_shutdown_drain_mocks(
     bot: RuntimeBot,
     *,
@@ -2774,6 +2928,21 @@ def _never_build_the_dashboard(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _never_download_stock_avatars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep bot startup and room creation from fetching stock avatars over the network.
+
+    Tests behave like an offline machine, which leaves entities without a stock avatar.
+    `tests/test_managed_avatars.py` installs its own downloader to cover the real behavior.
+    """
+
+    async def offline(url: str) -> bytes:
+        message = "network disabled in tests"
+        raise httpx.ConnectError(message, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(managed_avatars_module, "_download_stock_avatar", offline)
+
+
+@pytest.fixture(autouse=True)
 def _reset_runtime_paths() -> Generator[None, None, None]:
     """Restore process env and bound test runtime mappings after each test."""
     original_env = os.environ.copy()
@@ -2791,6 +2960,14 @@ def _reset_model_media_capabilities() -> Generator[None, None, None]:
     reset_model_media_capability_cache()
     yield
     reset_model_media_capability_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_oversized_nonterminal_streaming_edit_rate_limit() -> Generator[None, None, None]:
+    """Keep the process-global oversized streaming-edit cadence isolated per test, even when one fails."""
+    _oversized_nonterminal_streaming_edit_next_allowed_at.clear()
+    yield
+    _oversized_nonterminal_streaming_edit_next_allowed_at.clear()
 
 
 _LEDGER_LOADING_TEST_MODULES = frozenset(
@@ -2877,18 +3054,64 @@ def bypass_authorization(request: pytest.FixtureRequest) -> Generator[None, None
 
     Tests in test_authorization.py are excluded since they test authorization itself.
     """
+
+    # These defaults never need call tracking. Plain stubs avoid creating six
+    # MagicMocks (and their reference cycles) for every test in the suite.
+    def allow_reply(*_args: object, **_kwargs: object) -> _ReplyAuthorizationDecision:
+        return _ReplyAuthorizationDecision.ALLOWED
+
+    def allow_sender(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def allow_target_room(*_args: object, **_kwargs: object) -> bool:
+        return True
+
     # Don't bypass authorization for tests that are specifically testing it
     if "test_authorization" in request.node.parent.name:
         yield
     else:
         with ExitStack() as stack:
-            stack.enter_context(patch("mindroom.ingress_validation.is_authorized_sender", return_value=True))
             if "enforce_turn_authorization" not in request.fixturenames:
                 stack.enter_context(
                     patch(
-                        "mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room",
-                        return_value=True,
+                        "mindroom.authorization._responder_reply_authorization",
+                        new=allow_reply,
                     ),
+                )
+                stack.enter_context(patch("mindroom.authorization.is_sender_allowed_for_responder", new=allow_sender))
+                stack.enter_context(
+                    patch(
+                        "mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room",
+                        new=allow_sender,
+                    ),
+                )
+                stack.enter_context(
+                    patch("mindroom.approval_inbound.is_sender_allowed_for_responder", new=allow_sender),
+                )
+                stack.enter_context(
+                    patch(
+                        "mindroom.custom_tools.attachment_helpers.is_sender_allowed_for_responder",
+                        new=allow_sender,
+                    ),
+                )
+                stack.enter_context(
+                    patch(
+                        "mindroom.custom_tools.attachment_helpers.requester_joined_target_room",
+                        new=allow_target_room,
+                    ),
+                )
+                stack.enter_context(
+                    patch(
+                        "mindroom.custom_tools.matrix_message_idempotency.requester_joined_target_room",
+                        new=allow_target_room,
+                    ),
+                )
+                stack.enter_context(
+                    patch("mindroom.delegation.lifecycle.is_sender_allowed_for_responder", new=allow_sender),
+                )
+                # The module is imported at collection, so it binds the real check before this bypass starts.
+                stack.enter_context(
+                    patch.object(todo_tool_module, "is_sender_allowed_for_responder", new=allow_sender),
                 )
             yield
 
@@ -2896,3 +3119,27 @@ def bypass_authorization(request: pytest.FixtureRequest) -> Generator[None, None
 @pytest.fixture
 def enforce_turn_authorization() -> None:
     """Keep final TurnPolicy authorization active for tests that exercise it."""
+
+
+def seed_session[SessionT: "AgentSession | TeamSession"](storage: "BaseDb", session: SessionT) -> SessionT:
+    """Persist a session row and every run it holds, in order, and return the session.
+
+    Production code writes runs explicitly (``save_runs``/``replace_runs``);
+    tests seed whole histories with this instead.
+    """
+    storage.upsert_session(session)
+    for run in session.runs or []:
+        storage.upsert_run(run=run, session_id=session.session_id, user_id=run.user_id)
+    return session
+
+
+def create_agno_2_sessions_db(path: "Path") -> "Path":
+    """Write the agno 2.6.12 ``code_sessions`` fixture database to ``path`` and return it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fixture = Path(__file__).parent / "fixtures" / "agno_2_6_12_code_sessions.sql"
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(fixture.read_text(encoding="utf-8"))
+    finally:
+        connection.close()
+    return path

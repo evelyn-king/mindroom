@@ -19,14 +19,13 @@ from agno.team import Team
 
 from mindroom.ai import _prepare_agent_and_prompt
 from mindroom.config.agent import AgentConfig
-from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.config.plugin import PluginEntryConfig
 from mindroom.dispatch_source import MESSAGE_SOURCE_KIND
 from mindroom.execution_preparation import _PreparedExecutionContext
 from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
-from mindroom.history.runtime import open_bound_scope_session_context
+from mindroom.history.session_context import open_bound_scope_session_context
 from mindroom.history.types import PreparedHistoryState
 from mindroom.hooks import (
     BUILTIN_EVENT_NAMES,
@@ -45,8 +44,10 @@ from mindroom.matrix.users import AgentMatrixUser
 from mindroom.memory import MemoryPromptParts
 from mindroom.message_target import MessageTarget
 from mindroom.response_runner import ResponseRequest
+from mindroom.response_sources import ResponseSources
 from mindroom.team_exact_members import ResolvedExactTeamMembers
 from mindroom.teams import TeamMode, build_materialized_team_instance, prepare_materialized_team_execution
+from tests.access_schema_support import with_current_room_member_access
 from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_PASSWORD,
@@ -69,17 +70,18 @@ if TYPE_CHECKING:
 def _config(tmp_path: Path) -> Config:
     runtime_paths = test_runtime_paths(tmp_path)
     return bind_runtime_paths(
-        Config(
-            agents={
-                "code": AgentConfig(display_name="CodeAgent", role="Write code", rooms=["!room:localhost"]),
-                "research": AgentConfig(
-                    display_name="ResearchAgent",
-                    role="Do research",
-                    rooms=["!room:localhost"],
-                ),
-            },
-            models={"default": ModelConfig(provider="ollama", id="test-model")},
-            authorization=AuthorizationConfig(default_room_access=True),
+        with_current_room_member_access(
+            Config(
+                agents={
+                    "code": AgentConfig(display_name="CodeAgent", role="Write code", rooms=["!room:localhost"]),
+                    "research": AgentConfig(
+                        display_name="ResearchAgent",
+                        role="Do research",
+                        rooms=["!room:localhost"],
+                    ),
+                },
+                models={"default": ModelConfig(provider="ollama", id="test-model")},
+            ),
         ),
         runtime_paths,
     )
@@ -635,6 +637,10 @@ async def test_process_and_respond_threads_system_enrichment_items(tmp_path: Pat
     ):
         generation = await bot._response_runner._process_and_respond(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$event",),
+                    logical_source_event_ids=("$event",),
+                ),
                 thread_history=[],
                 prompt="Please reply",
                 user_id="@user:localhost",
@@ -687,6 +693,10 @@ async def test_process_and_respond_streaming_threads_system_enrichment_items(tmp
     ):
         generation = await bot._response_runner._process_and_respond_streaming(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$event",),
+                    logical_source_event_ids=("$event",),
+                ),
                 thread_history=[],
                 prompt="Please reply",
                 user_id="@user:localhost",

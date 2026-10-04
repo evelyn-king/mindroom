@@ -24,6 +24,7 @@ from mindroom.matrix.conversation_hydration import (
     ConversationHydrator,
     _HydrationError,
 )
+from tests.journal_membership_helpers import admit_room_membership
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -268,7 +269,7 @@ async def stored_recovery_row(principal: PrincipalStore) -> dict[str, Any] | Non
     row = await principal._backend.read(
         lambda transaction: transaction.fetchone(
             """
-            SELECT state, revision FROM room_history_recovery
+            SELECT state, revision, attempted_policy_rank FROM room_history_recovery
             WHERE principal_id = ? AND room_id = ?
             """,
             (principal._principal_id, ROOM),
@@ -411,7 +412,7 @@ async def test_membership_epoch_change_stops_recovery_before_final_settlement(
 
     async def fence_before_second_page(page_number: int) -> None:
         if page_number == 2:
-            await principal.fence_departure(ROOM, source=DepartureSource.LOCAL)
+            await admit_room_membership(principal, ROOM, "leave", source=DepartureSource.LOCAL)
 
     recovery = await principal.record_room_history_recovery(ROOM)
     assert recovery is not None
@@ -552,12 +553,15 @@ async def test_unreadable_server_exhaustion_fails_without_installing(principal: 
             "device_id": "DEVICE",
         },
     }
-    client = PagedClient(pages=[([encrypted], None)])
+    client = PagedClient(pages=[([encrypted], "older"), ([encrypted], None)])
     recovery = await principal.record_room_history_recovery(ROOM)
 
-    with pytest.raises(_HydrationError, match="unreadable"):
+    with pytest.raises(_HydrationError, match="unreadable") as failure:
         await hydrator(principal, client).ensure_hydrated(room_id=ROOM, thread_id=None)
 
+    assert "encrypted_events=2" in str(failure.value)
+    assert "encrypted_sessions=1" in str(failure.value)
+    assert ROOM in str(failure.value)
     assert await principal.room_history_recovery(ROOM) == recovery
     assert await bodies(principal) == []
     assert not await principal.conversation_is_hydrated(room_id=ROOM, thread_id=None)
@@ -583,11 +587,49 @@ async def test_bad_event_at_server_exhaustion_stays_repairable(principal: Princi
 
     recovery = await principal.record_room_history_recovery(ROOM)
 
-    with pytest.raises(_HydrationError, match="unreadable"):
+    with pytest.raises(_HydrationError, match="unreadable") as failure:
         await hydrator(principal, BadEventClient(pages=[])).ensure_hydrated(room_id=ROOM, thread_id=None)
 
+    assert "invalid_events=1" in str(failure.value)
+    assert "encrypted_events=0" in str(failure.value)
+    assert "historical encryption keys" not in str(failure.value)
     assert await principal.room_history_recovery(ROOM) == recovery
     assert not await principal.conversation_is_hydrated(room_id=ROOM, thread_id=None)
+
+
+@pytest.mark.parametrize("old_event_type", ["encrypted_file", "cleared_avatar"])
+async def test_repair_accepts_encrypted_attachments_and_cleared_avatars(
+    principal: PrincipalStore,
+    old_event_type: str,
+) -> None:
+    """Readable historical metadata must not block newer conversation messages."""
+    old = raw("$old", "attachment.txt", ts=1_000)
+    if old_event_type == "encrypted_file":
+        old["content"] = {
+            "msgtype": "m.file",
+            "body": "attachment.txt",
+            "file": {
+                "url": "mxc://example.org/encrypted-attachment",
+                "key": {"alg": "A256CTR", "k": "test-key"},
+                "iv": "test-iv",
+                "hashes": {"sha256": "test-hash"},
+            },
+        }
+    else:
+        old.update(type="m.room.avatar", state_key="", content={"url": None})
+    client = PagedClient(pages=[([raw("$new", "new message", ts=2_000), old], None)])
+    await principal.record_room_history_recovery(ROOM)
+
+    await hydrator(principal, client).ensure_hydrated(room_id=ROOM, thread_id=None)
+
+    assert await principal.room_history_recovery(ROOM) is None
+    assert await principal.conversation_is_hydrated(room_id=ROOM, thread_id=None)
+    page = await principal.read_conversation(room_id=ROOM, thread_id=None, limit=10)
+    expected_ids = ["$old", "$new"] if old_event_type == "encrypted_file" else ["$new"]
+    assert [message.logical_event_id for message in page.messages] == expected_ids
+    if old_event_type == "encrypted_file":
+        assert page.messages[0].content["file"] == old["content"]["file"]
+    assert client.calls == 1
 
 
 async def test_repair_pagination_error_leaves_the_obligation_repairable(principal: PrincipalStore) -> None:
@@ -687,7 +729,7 @@ async def test_membership_movement_during_repair_installs_nothing(principal: Pri
             direction: object = None,
             limit: int = 10,
         ) -> nio.RoomMessagesResponse | nio.RoomMessagesError:
-            await principal.fence_departure(ROOM, source=DepartureSource.LOCAL)
+            await admit_room_membership(principal, ROOM, "leave", source=DepartureSource.LOCAL)
             return await super().room_messages(room_id, start, direction, limit)
 
     client = MovingMembershipClient(pages=[([raw("$stale", "stale", ts=1_000)], None)])
@@ -706,9 +748,9 @@ async def test_late_unknown_signal_after_departure_repairs_the_next_membership(
     """A stale Classic signal may over-repair the next epoch but cannot certify a hole."""
     await mark_complete(principal, None)
     old_epoch = await principal.membership_epoch(ROOM)
-    await principal.fence_departure(ROOM, source=DepartureSource.LOCAL)
+    await admit_room_membership(principal, ROOM, "leave", source=DepartureSource.LOCAL)
     assert await principal.membership_epoch(ROOM) == old_epoch + 1
-    await principal.note_membership_restarted(ROOM)
+    await admit_room_membership(principal, ROOM, "join")
 
     recovery = await principal.record_room_history_recovery(ROOM)
     client = PagedClient(pages=[([raw("$current", "current", ts=2_000)], None)])
@@ -726,7 +768,7 @@ async def test_unknown_signal_while_departure_is_fenced_is_a_no_op(
     principal: PrincipalStore,
 ) -> None:
     """A gap from an ended membership cannot create work until a join is confirmed."""
-    await principal.fence_departure(ROOM, source=DepartureSource.LOCAL)
+    await admit_room_membership(principal, ROOM, "leave", source=DepartureSource.LOCAL)
 
     recovery = await principal.record_room_history_recovery(ROOM)
 
@@ -747,6 +789,7 @@ async def test_recording_creates_a_repairable_unknown_obligation(principal: Prin
     assert await stored_recovery_row(principal) == {
         "state": "repairable",
         "revision": 0,
+        "attempted_policy_rank": 0,
     }
 
 
@@ -808,7 +851,12 @@ async def test_truncated_obligation_leaves_bounded_context_readable_but_incomple
     )
 
     assert outcome is HistoryRecoveryOutcome.TRUNCATED
-    assert (await principal.room_history_recovery(ROOM)).state is HistoryRecoveryState.TRUNCATED  # type: ignore[union-attr]
+    assert await principal.room_history_recovery(ROOM) == RoomHistoryRecovery(
+        room_id=ROOM,
+        state=HistoryRecoveryState.TRUNCATED,
+        revision=0,
+        attempted_policy_rank=3,
+    )
     assert await principal.conversation_is_hydrated(room_id=ROOM, thread_id=None)
     assert not await principal.conversation_is_complete(room_id=ROOM, thread_id=None)
     coverage = await principal.conversation_hydration_coverage(room_id=ROOM, thread_id=None)
@@ -836,6 +884,7 @@ async def test_a_new_abandonment_resets_truncated_to_repairable(principal: Princ
         room_id=ROOM,
         state=HistoryRecoveryState.REPAIRABLE,
         revision=1,
+        attempted_policy_rank=0,
     )
     assert not await principal.conversation_is_hydrated(room_id=ROOM, thread_id=None)
 

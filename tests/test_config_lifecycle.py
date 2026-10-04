@@ -43,6 +43,7 @@ def _make_lifecycle(
         load_initial_config=AsyncMock(return_value=False),
         apply_update_plan=AsyncMock(return_value=True),
         response_admission_gate=gate,
+        before_runtime_replacement=AsyncMock(),
     )
 
 
@@ -910,7 +911,7 @@ async def test_update_config_plugin_changes_restart_all_bots(
         new_entities=set(),
         removed_entities=set(),
         mindroom_user_changed=False,
-        matrix_room_access_changed=False,
+        room_access_changed=False,
         matrix_space_changed=False,
         authorization_changed=False,
     )

@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import subprocess
 import sys
 import warnings
 from typing import TYPE_CHECKING, NoReturn
 
+import aiohttp
+import nio
 import pytest
 
 from mindroom.constants import RuntimePaths
-from mindroom.logging_config import bound_log_context, get_logger, setup_logging
+from mindroom.logging_config import bound_log_context, configure_default_logging, get_logger, setup_logging
 from mindroom.message_target import MessageTarget
 
 if TYPE_CHECKING:
@@ -44,6 +48,16 @@ def _raise_value_error() -> NoReturn:
 
 def _raise_secret_value_error() -> NoReturn:
     msg = "api_key=api-secret"
+    raise ValueError(msg)
+
+
+# No redaction rule recognizes this value, so only omitting frame locals keeps it out of logs.
+_FRAME_LOCAL_CREDENTIAL = "frame-local-credential"
+
+
+def _raise_with_credential_in_frame(extra_header: str) -> NoReturn:
+    git_env = {"GIT_CONFIG_VALUE_0": extra_header}
+    msg = f"git failed with {', '.join(git_env)} configured"
     raise ValueError(msg)
 
 
@@ -291,6 +305,66 @@ def test_setup_logging_json_mode_foreign_logger_inherits_bound_log_context(
     assert payload["thread_id"] == "$thread:example.org"
 
 
+@pytest.mark.parametrize("log_format", ["json", "text"])
+@pytest.mark.parametrize("foreign_logger", [False, True])
+@pytest.mark.asyncio
+async def test_logging_preserves_nio_errors_with_real_transport_and_redacts_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    log_format: str,
+    foreign_logger: bool,
+) -> None:
+    """Live transport objects must not erase diagnostics or leak their credentials."""
+
+    async def respond(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        body = json.dumps(
+            {"errcode": "M_FORBIDDEN", "error": "synthetic denial; api_key=synthetic-message-secret"},
+        ).encode()
+        writer.write(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n"
+            b"Set-Cookie: session=synthetic-transport-secret\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body,
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", log_format)
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    capsys.readouterr()
+    server = await asyncio.start_server(respond, "127.0.0.1", 0)
+    async with server, aiohttp.ClientSession() as session:
+        url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/synthetic"
+        async with session.get(url, headers={"Authorization": "Bearer synthetic-request-secret"}) as transport:
+            response = nio.RoomSendError.from_dict(await transport.json(), room_id="!room:example.test")
+            response.transport_response = transport
+            logger_name = "tests.logging.transport"
+            if foreign_logger:
+                logging.getLogger(logger_name).warning("matrix_operation_failed", extra={"response": response})
+            else:
+                get_logger(logger_name).warning("matrix_operation_failed", response=response)
+
+    output = capsys.readouterr().err
+    assert "matrix_operation_failed" in output
+    assert logger_name in output
+    assert "warning" in output
+    assert "M_FORBIDDEN" in output
+    assert "synthetic denial" in output
+    assert "[redaction failed]" not in output
+    for secret in ("synthetic-message-secret", "synthetic-transport-secret", "synthetic-request-secret"):
+        assert secret not in output
+    if log_format == "json":
+        payload = json.loads(output.strip().splitlines()[-1])
+        assert payload["event"] == "matrix_operation_failed"
+        assert payload["level"] == "warning"
+        assert payload["logger"] == logger_name
+        assert payload["response"]["status_code"] == "M_FORBIDDEN"
+        assert payload["response"]["message"] == "synthetic denial; api_key=***redacted***"
+    assert response.transport_response is transport
+
+
 def test_setup_logging_text_mode_does_not_emit_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -310,13 +384,58 @@ def test_setup_logging_text_mode_does_not_emit_json(
         json.loads(line)
 
 
+@pytest.mark.parametrize(
+    ("is_terminal", "no_color", "console_colors"),
+    [(False, None, False), (True, None, True), (True, "", True), (True, "1", False)],
+)
+def test_log_colors_follow_output_and_no_color_without_coloring_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    is_terminal: bool,
+    no_color: str | None,
+    console_colors: bool,
+) -> None:
+    """Only interactive output without NO_COLOR may contain terminal styling."""
+    monkeypatch.delenv("MINDROOM_LOG_FORMAT", raising=False)
+    if no_color is None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+    else:
+        monkeypatch.setenv("NO_COLOR", no_color)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: is_terminal)
+    runtime_paths = _runtime_paths(tmp_path)
+    setup_logging(runtime_paths=runtime_paths)
+    capsys.readouterr()
+
+    get_logger("tests.logging").info("structured_event", sample_count=12)
+    logging.getLogger("nio.client.async_client").warning("Timed out, sleeping for 60s")
+    try:
+        _raise_value_error()
+    except ValueError:
+        get_logger("tests.logging").exception("exception_event")
+
+    console = capsys.readouterr().err
+    saved = next((runtime_paths.storage_root / "logs").glob("mindroom_*.log")).read_text()
+    for output in (console, saved):
+        assert "structured_event" in output
+        assert "Timed out, sleeping for 60s" in output
+        assert "ValueError" in output
+        assert "boom" in output
+    assert ("\x1b[" in console) is console_colors
+    assert "\x1b" not in saved
+
+
+@pytest.mark.parametrize("is_terminal", [False, True])
 def test_setup_logging_text_mode_redacts_exception_tracebacks_without_pretty_exception_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    is_terminal: bool,
 ) -> None:
-    """Text mode should keep pretty exception formatting without leaking exception secrets."""
+    """Text tracebacks suit their output stream without leaking exception secrets."""
     monkeypatch.delenv("MINDROOM_LOG_FORMAT", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: is_terminal)
     setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
     capsys.readouterr()
 
@@ -337,6 +456,9 @@ def test_setup_logging_text_mode_redacts_exception_tracebacks_without_pretty_exc
     assert "api-secret" not in output
     assert "auth-secret" not in output
     assert "***redacted***" in output
+    assert ("\x1b[" in output) is is_terminal
+    if not is_terminal:
+        assert "Traceback (most recent call last):" in output
 
 
 def test_setup_logging_json_mode_renders_exception_field_for_exc_info_true(
@@ -401,3 +523,59 @@ def test_setup_logging_json_mode_renders_exception_field_for_exc_info_tuple(
     assert payload["event"] == "test_exception_tuple"
     assert isinstance(payload["exception"], str)
     assert "ValueError: boom" in payload["exception"]
+
+
+@pytest.mark.parametrize(
+    ("renderer", "is_terminal"),
+    [("json", False), ("text", False), ("text", True), ("default", False)],
+    ids=["json", "text", "colored", "default"],
+)
+def test_logged_tracebacks_omit_frame_locals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    renderer: str,
+    is_terminal: bool,
+) -> None:
+    """Every renderer keeps the traceback without printing the locals of its frames."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", renderer)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: is_terminal)
+    if renderer == "default":
+        configure_default_logging()
+    else:
+        setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    capsys.readouterr()
+
+    try:
+        _raise_with_credential_in_frame(_FRAME_LOCAL_CREDENTIAL)
+    except ValueError:
+        get_logger("tests.logging").exception("test_exception")
+
+    captured = capsys.readouterr()
+    output = captured.out if renderer == "default" else captured.err
+
+    assert "_raise_with_credential_in_frame" in output
+    assert "git failed with GIT_CONFIG_VALUE_0 configured" in output
+    assert _FRAME_LOCAL_CREDENTIAL not in output
+
+
+def test_knowledge_refresh_subprocess_failure_omits_frame_locals() -> None:
+    """The refresh child never calls setup_logging, yet its failure traceback still omits frame locals."""
+    request = {"base_id": "docs", "config_data": {"GIT_CONFIG_VALUE_0": _FRAME_LOCAL_CREDENTIAL}}
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "mindroom.knowledge_refresh_runner"],
+        input=json.dumps(request).encode(),
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+    stderr = completed.stderr.decode()
+    assert completed.returncode == 1
+    assert "Knowledge refresh subprocess failed" in stderr
+    assert _FRAME_LOCAL_CREDENTIAL not in stderr
+    assert "Traceback (most recent call last):" in stderr
+    assert "_load_subprocess_refresh_request" in stderr
+    assert "missing config_path" in stderr

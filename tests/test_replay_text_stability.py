@@ -42,7 +42,6 @@ from mindroom.handled_turns import (
 from mindroom.history.types import HistoryScope
 from mindroom.message_target import MessageTarget
 from mindroom.prompt_message_tags import render_msg_tag
-from mindroom.sync_restart_retry import InterruptedTurnRooms
 from mindroom.timestamp_formatting import format_timestamp_ms
 from mindroom.turn_record import canonicalize_turn_record
 from mindroom.turn_store import TurnStore, TurnStoreDeps
@@ -79,7 +78,7 @@ def _text_event(event_id: str, body: str, *, server_timestamp: int) -> nio.RoomM
 def _pending_text(event_id: str, body: str, *, server_timestamp: int) -> PendingEvent:
     return make_pending_event(
         _text_event(event_id, body, server_timestamp=server_timestamp),
-        MagicMock(spec=nio.MatrixRoom),
+        nio.MatrixRoom(room_id=_ROOM_ID, own_user_id="@agent:localhost"),
         source_kind=MESSAGE_SOURCE_KIND,
         requester_user_id=_REQUESTER,
     )
@@ -101,6 +100,8 @@ async def _persist_and_reload(journal_store: EventJournalStore, record: TurnReco
         TurnStoreDeps(
             agent_name=_AGENT_NAME,
             turn_records=journal_store.turn_records(_AGENT_NAME),
+            redacted_event_ids=journal_store.principal("agent@alice").redacted_event_ids,
+            relations=journal_store.principal("agent@alice"),
             legacy_responses_file=None,
             state_writer=MagicMock(),
             resolver=MagicMock(),
@@ -143,7 +144,7 @@ async def _regeneration_prompt(record: TurnRecord) -> str:
     )
     envelope = request_envelope(
         room_id=_ROOM_ID,
-        reply_to_event_id=source_event_id,
+        reply_to_event_id="$same-body-edit",
         thread_id=_THREAD_ID,
         prompt=body,
         user_id=_REQUESTER,
@@ -164,7 +165,6 @@ async def _regeneration_prompt(record: TurnRecord) -> str:
             generate_response=AsyncMock(),
             wait_for_turn_settled=AsyncMock(),
             receipt_order=AsyncMock(return_value=1),
-            interrupted_turn_rooms=InterruptedTurnRooms(),
             timestamp_formatter=_timestamp_formatter,
         ),
     )

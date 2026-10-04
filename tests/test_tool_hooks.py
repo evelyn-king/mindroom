@@ -30,6 +30,7 @@ from mindroom.hooks import (
     EVENT_TOOL_BEFORE_CALL,
     CustomEventContext,
     HookRegistry,
+    HookRegistryState,
     ToolAfterCallContext,
     ToolBeforeCallContext,
     emit_gate,
@@ -41,6 +42,7 @@ from mindroom.message_target import MessageTarget
 from mindroom.oauth.providers import OAuthConnectionRequired
 from mindroom.orchestrator import _MultiAgentOrchestrator
 from mindroom.session_ids import create_session_id
+from mindroom.tool_system.declarations import ToolFileAccess
 from mindroom.tool_system.metadata import TOOL_METADATA, TOOL_REGISTRY, ToolCategory
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.runtime_context import (
@@ -1771,6 +1773,7 @@ async def test_agent_bot_tool_runtime_context_routes_custom_events_from_tool_hoo
 
     @register_tool_with_metadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Tool Hooks Runtime Event Tool",
         description="Test tool for runtime hook event delivery.",
         category=ToolCategory.DEVELOPMENT,
@@ -1868,6 +1871,7 @@ async def test_emit_custom_event_preserves_message_received_depth_and_bound_room
     custom_event_name = "demo:tool_custom_event"
     sent: list[dict[str, object] | None] = []
     seen: list[tuple[dict[str, object] | None, bool]] = []
+    active_states: list[bool] = []
     room_state_querier = AsyncMock(return_value={"name": "Lobby"})
     room_state_putter = AsyncMock(return_value=True)
 
@@ -1886,6 +1890,10 @@ async def test_emit_custom_event_preserves_message_received_depth_and_bound_room
 
     @hook(custom_event_name)
     async def on_custom_event(ctx: CustomEventContext) -> None:
+        active_states.append(ctx.is_active())
+        registry_state.registry = HookRegistry.empty()
+        active_states.append(ctx.is_active())
+        registry_state.registry = registry
         query_result = await ctx.query_room_state("!room:localhost", "m.room.name", "")
         put_result = await ctx.put_room_state(
             "!room:localhost",
@@ -1898,19 +1906,24 @@ async def test_emit_custom_event_preserves_message_received_depth_and_bound_room
         assert event_id == "$dispatch-event"
 
     registry = HookRegistry.from_plugins([_plugin("tool-policy", [on_custom_event])])
-    runtime_context = _tool_runtime_context(
-        tmp_path,
-        hook_message_sender=hook_message_sender,
-        room_state_querier=room_state_querier,
-        room_state_putter=room_state_putter,
-        message_received_depth=1,
-        hook_registry=registry,
+    registry_state = HookRegistryState(registry)
+    runtime_context = replace(
+        _tool_runtime_context(
+            tmp_path,
+            hook_message_sender=hook_message_sender,
+            room_state_querier=room_state_querier,
+            room_state_putter=room_state_putter,
+            message_received_depth=1,
+            hook_registry=registry,
+        ),
+        hook_registry_state=registry_state,
     )
 
     with tool_runtime_context(runtime_context):
         await emit_custom_event("tool-policy", custom_event_name, {"item_id": "123"})
 
     assert seen == [({"name": "Lobby"}, True)]
+    assert active_states == [True, False]
     room_state_querier.assert_awaited_once_with("!room:localhost", "m.room.name", "")
     room_state_putter.assert_awaited_once_with(
         "!room:localhost",
@@ -1981,6 +1994,45 @@ async def test_tool_hook_bridge_fails_open_when_before_hook_raises(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_tool_hook_contexts_track_registry_lifecycle(tmp_path: Path) -> None:
+    """Before- and after-call hooks can detect registry replacement."""
+    active_states: list[tuple[str, bool]] = []
+
+    @hook(EVENT_TOOL_BEFORE_CALL)
+    async def before(ctx: ToolBeforeCallContext) -> None:
+        active_states.append(("before", ctx.is_active()))
+        registry_state.registry = HookRegistry.empty()
+        active_states.append(("before", ctx.is_active()))
+        registry_state.registry = registry
+
+    @hook(EVENT_TOOL_AFTER_CALL)
+    async def after(ctx: ToolAfterCallContext) -> None:
+        active_states.append(("after", ctx.is_active()))
+        registry_state.registry = HookRegistry.empty()
+        active_states.append(("after", ctx.is_active()))
+        registry_state.registry = registry
+
+    registry = HookRegistry.from_plugins([_plugin("tool-policy", [before, after])])
+    registry_state = HookRegistryState(registry)
+    runtime_context = replace(
+        _tool_runtime_context(tmp_path, hook_registry=registry),
+        hook_registry_state=registry_state,
+    )
+    bridge = build_tool_hook_bridge(registry, agent_name="code")
+
+    with tool_runtime_context(runtime_context):
+        result = await bridge("read_file", AsyncMock(return_value="ok"), {})
+
+    assert result == "ok"
+    assert active_states == [
+        ("before", True),
+        ("before", False),
+        ("after", True),
+        ("after", False),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_prepend_tool_hook_bridge_preserves_existing_function_hooks() -> None:
     """The MindRoom bridge should prepend without overwriting existing Agno tool hooks."""
     seen: list[str] = []
@@ -2047,6 +2099,7 @@ async def test_create_agent_prepends_bridge_to_real_tool_functions(tmp_path: Pat
 
     @register_tool_with_metadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Tool Hooks Test Tool",
         description="Test tool for tool hook interception.",
         category=ToolCategory.DEVELOPMENT,

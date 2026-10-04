@@ -24,13 +24,15 @@ _background_task_owners: dict[asyncio.Task[Any], object] = {}
 
 async def run_coroutine_until_complete[Result](
     coroutine: Coroutine[Any, Any, Result],
+    *,
+    on_cancelled: Callable[[], None] | None = None,
 ) -> Result:
     """Finish one accepted coroutine before propagating cancellation."""
     worker_task = asyncio.create_task(coroutine)
-    return await wait_for_future_until_complete(worker_task)
+    return await wait_for_future_until_complete(worker_task, on_cancel=on_cancelled)
 
 
-async def wait_for_future_until_complete[Result](
+async def wait_for_future_until_complete[Result](  # noqa: C901
     future: asyncio.Future[Result],
     *,
     on_cancel: Callable[[], None] | None = None,
@@ -47,6 +49,8 @@ async def wait_for_future_until_complete[Result](
             try:
                 await asyncio.shield(future)
             except asyncio.CancelledError as exc:
+                if not future.done() and on_cancel is not None:
+                    on_cancel()
                 result_error = exc if future.done() else None
             except Exception as exc:
                 result_error = exc
@@ -89,8 +93,8 @@ def create_background_task(
         error_handler: Optional error handler function
         owner: Optional logical owner used for scoped shutdown waits
         log_exceptions: Whether unhandled task exceptions should be logged automatically
-        context: Execution context for the task. ``None`` preserves asyncio's normal
-            caller-context inheritance.
+        context: Execution context for the task and its completion callback. ``None``
+            preserves asyncio's normal caller-context inheritance.
 
     Returns:
         The created task
@@ -125,7 +129,8 @@ def create_background_task(
                 except Exception as handler_error:
                     logger.exception("Error handler for task failed", task_name=task_name, error=str(handler_error))
 
-    task.add_done_callback(_task_done_callback)
+    # Otherwise the callback captures the creator's context, which a detached task would keep until it finishes.
+    task.add_done_callback(_task_done_callback, context=context)
     return task
 
 
@@ -146,7 +151,11 @@ async def _cancel_and_drain_background_tasks(
         if not pending_tasks:
             return
         for task in pending_tasks:
-            request_task_cancel(task, cancel_source=shutdown_intent.cancel_source)
+            request_task_cancel(
+                task,
+                cancel_source=shutdown_intent.cancel_source,
+                process_shutdown=shutdown_intent.hands_off_unfinished_work,
+            )
         done, _pending = await asyncio.wait(
             pending_tasks,
             timeout=_BACKGROUND_TASK_CANCEL_ROUND_TIMEOUT_SECONDS,

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from mindroom.event_journal.models import MatrixDelivery, TerminalTurnWrite
     from mindroom.event_journal.projection import ProjectedEvent
     from mindroom.event_journal.views import MatrixDeliveryView
+    from mindroom.response_sources import ResponseAttempt
 
 logger = get_logger(__name__)
 
@@ -42,16 +43,16 @@ type _ObserveDelivered = Callable[[MatrixDelivery, str], Awaitable[tuple[Project
 # the answer is already in the room, or ``None`` if it never arrived.
 type ResolveDelivered = Callable[[MatrixDelivery], Awaitable[str | None]]
 
-# The terminal turn record one delivered answer completes, given ``(delivery_id,
-# response_event_id)``. Returns ``None`` when there is nothing to write --
+# The terminal turn record one delivered answer completes, given the claimed
+# delivery and canonical response event ID. Returns None when there is nothing to write --
 # no record for the turn, or one that already knows its response event.
-type _TerminalTurnFor = Callable[[str, str], "TerminalTurnWrite | None"]
+type _TerminalTurnFor = Callable[[MatrixDelivery, str], "TerminalTurnWrite | None"]
 
 # Told after an acknowledgement this caller actually bound, so the record the
 # transaction committed can be re-asserted through whatever ordering the ledger
 # uses for every other write. A caller that lost the row is never told, because
 # it committed nothing to settle.
-type _TerminalTurnCommitted = Callable[[str, str], Awaitable[None]]
+type _TerminalTurnCommitted = Callable[[str, str, "TerminalTurnWrite | None"], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +94,7 @@ class _FlushOutcome:
     event_id: str | None
     terminal_response_event_id: str | None = None
     publish_committed_terminal: bool = False
+    committed_terminal: TerminalTurnWrite | None = None
     retry_required: bool = False
     propagate_cancellation: asyncio.CancelledError | None = field(default=None, repr=False, compare=False)
 
@@ -105,7 +107,7 @@ class MatrixDeliveryWorker:
     send: SendDelivery
     observe_delivered: _ObserveDelivered | None = None
     event_type: str = "m.room.message"
-    resend_after_reconciliation_miss: bool = True
+    resend_after_reconciliation_miss: bool | Callable[[MatrixDelivery], bool] = True
     # The device this process is logged in as, recorded on every claim. A
     # Matrix transaction ID is idempotent within one device and meaningless
     # across a change of one, so the row has to remember which device's
@@ -128,6 +130,8 @@ class MatrixDeliveryWorker:
     # apart leaves a delivered answer whose record cannot be edited.
     terminal_turn_for: _TerminalTurnFor | None = None
     terminal_turn_committed: _TerminalTurnCommitted | None = None
+    process_shutdown_requested: Callable[[], bool] = lambda: False
+    cleanup_deleted_initial: Callable[[MatrixDeliveryWorker, str], Awaitable[bool]] | None = None
     delivery_locks: WeakValueDictionary[str, asyncio.Lock] = field(
         default_factory=WeakValueDictionary,
         repr=False,
@@ -151,6 +155,7 @@ class MatrixDeliveryWorker:
         thread_id: str | None,
         payload: Mapping[str, object],
         result: Mapping[str, object] | None = None,
+        response_attempt: ResponseAttempt | None = None,
         edits_event_id: str | None = None,
         permanent_failure_reason: str | None = None,
     ) -> str | None:
@@ -188,6 +193,7 @@ class MatrixDeliveryWorker:
                 thread_id=thread_id,
                 payload=payload,
                 result=result,
+                response_attempt=response_attempt,
                 edits_event_id=edits_event_id,
                 permanent_failure_reason=permanent_failure_reason,
             )
@@ -202,11 +208,17 @@ class MatrixDeliveryWorker:
         thread_id: str | None,
         payload: Mapping[str, object],
         result: Mapping[str, object] | None,
+        response_attempt: ResponseAttempt | None,
         edits_event_id: str | None,
         permanent_failure_reason: str | None,
     ) -> _FlushOutcome:
         """Finish a delivery whose durable handoff may already have committed."""
         completed: _FlushOutcome | None = None
+        process_shutdown_requested = False
+
+        def note_cancellation() -> None:
+            nonlocal process_shutdown_requested
+            process_shutdown_requested |= self.process_shutdown_requested()
 
         async def finish() -> _FlushOutcome:
             nonlocal completed
@@ -220,6 +232,7 @@ class MatrixDeliveryWorker:
                 thread_id=thread_id,
                 payload=payload,
                 result=result,
+                response_attempt=response_attempt,
                 edits_event_id=edits_event_id,
                 settle_source_event_ids=handed_over,
                 permanent_failure_reason=permanent_failure_reason,
@@ -230,7 +243,15 @@ class MatrixDeliveryWorker:
                 return completed
             if handoff is not None:
                 handoff.released(handed_over)
-            outcome = await self._flush(delivery_id=delivery_id, stage=stage)
+            if process_shutdown_requested:
+                completed = _FlushOutcome(event_id=None)
+                return completed
+            outcome = await self._flush(
+                delivery_id=delivery_id,
+                stage=stage,
+                process_shutdown_requested=lambda: process_shutdown_requested,
+                on_cancelled=note_cancellation,
+            )
             if stage is DeliveryStage.FINAL and outcome.retry_required:
                 # A prior process may have attempted the placeholder without
                 # recording whether Matrix accepted it. FINAL is durably
@@ -238,13 +259,29 @@ class MatrixDeliveryWorker:
                 # delivery failure would run terminal cancellation hooks even
                 # though recovery later shows the answer. Resolve INITIAL,
                 # then retry FINAL before returning a lifecycle-visible result.
-                await self._flush(delivery_id=delivery_id, stage=DeliveryStage.INITIAL)
-                outcome = await self._flush(delivery_id=delivery_id, stage=DeliveryStage.FINAL)
+                await self._flush(
+                    delivery_id=delivery_id,
+                    stage=DeliveryStage.INITIAL,
+                    process_shutdown_requested=lambda: process_shutdown_requested,
+                    on_cancelled=note_cancellation,
+                )
+                if process_shutdown_requested:
+                    completed = _FlushOutcome(event_id=None)
+                    return completed
+                outcome = await self._flush(
+                    delivery_id=delivery_id,
+                    stage=DeliveryStage.FINAL,
+                    process_shutdown_requested=lambda: process_shutdown_requested,
+                    on_cancelled=note_cancellation,
+                )
             completed = outcome
             return completed
 
         try:
-            return await run_coroutine_until_complete(finish())
+            return await run_coroutine_until_complete(
+                finish(),
+                on_cancelled=note_cancellation,
+            )
         except asyncio.CancelledError as cancellation:
             if completed is None:
                 raise
@@ -307,12 +344,36 @@ class MatrixDeliveryWorker:
         asked directly, and an answer already there is adopted instead of sent
         again.
         """
+        process_shutdown_requested = False
+
+        def note_cancellation() -> None:
+            nonlocal process_shutdown_requested
+            process_shutdown_requested |= self.process_shutdown_requested()
+
         async with self._delivery_lock(delivery_id):
-            outcome = await self._flush(delivery_id=delivery_id, stage=stage)
+            outcome = await self._flush(
+                delivery_id=delivery_id,
+                stage=stage,
+                process_shutdown_requested=lambda: process_shutdown_requested,
+                on_cancelled=note_cancellation,
+            )
         return await self._finish_flush(delivery_id, outcome)
 
-    async def _flush(self, *, delivery_id: str, stage: DeliveryStage) -> _FlushOutcome:
+    async def _flush(
+        self,
+        *,
+        delivery_id: str,
+        stage: DeliveryStage,
+        process_shutdown_requested: Callable[[], bool] | None = None,
+        on_cancelled: Callable[[], None] | None = None,
+    ) -> _FlushOutcome:
         """Send one delivery while holding its visible-delivery lock."""
+        if (
+            stage is DeliveryStage.INITIAL
+            and self.cleanup_deleted_initial is not None
+            and await self.cleanup_deleted_initial(self, delivery_id)
+        ):
+            return _FlushOutcome(event_id=None)
         claimed = await self.store.claim_matrix_delivery(
             delivery_id=delivery_id,
             stage=stage,
@@ -338,12 +399,24 @@ class MatrixDeliveryWorker:
             return _FlushOutcome(event_id=None, retry_required=blocked_final)
         if claimed.acknowledged_event_id is not None:
             return _FlushOutcome(event_id=claimed.acknowledged_event_id)
+        if process_shutdown_requested is not None and process_shutdown_requested():
+            return _FlushOutcome(event_id=None)
         current_epoch = await self.store.membership_epoch(claimed.room_id)
         if claimed.membership_epoch != current_epoch:
             return await self._reconcile_stale_delivery(claimed)
-        return await self._flush_current_delivery(claimed)
+        return await self._flush_current_delivery(
+            claimed,
+            process_shutdown_requested=process_shutdown_requested,
+            on_cancelled=on_cancelled,
+        )
 
-    async def _flush_current_delivery(self, claimed: MatrixDelivery) -> _FlushOutcome:
+    async def _flush_current_delivery(
+        self,
+        claimed: MatrixDelivery,
+        *,
+        process_shutdown_requested: Callable[[], bool] | None = None,
+        on_cancelled: Callable[[], None] | None = None,
+    ) -> _FlushOutcome:
         """Reconcile or send one delivery owned by the current membership."""
         if not self._transaction_id_still_deduplicates(claimed):
             already_delivered = await self._resolve_delivered_event(claimed)
@@ -353,14 +426,51 @@ class MatrixDeliveryWorker:
             # inconclusive bounded scan. Its terminal edit is different: the
             # exact decision is already durable, so replaying the identical
             # replacement preserves cleanup liveness without another action.
-            if not self.resend_after_reconciliation_miss and claimed.edits_event_id is None:
+            may_resend = (
+                self.resend_after_reconciliation_miss(claimed)
+                if callable(self.resend_after_reconciliation_miss)
+                else self.resend_after_reconciliation_miss
+            )
+            if not may_resend and claimed.edits_event_id is None:
                 return _FlushOutcome(event_id=None, retry_required=True)
         # Only now, with a send actually about to happen. Writing this at claim
         # time instead loses the fact that a lookup is still owed: a room scan
         # that raises would leave the row unacknowledged but stamped with this
         # device, and the next pass would see its own marker, skip the lookup
         # and post the answer twice.
-        return await self._complete_send_across_cancellation(claimed)
+        return await self._complete_send_across_cancellation(
+            claimed,
+            process_shutdown_requested=process_shutdown_requested,
+            on_cancelled=on_cancelled,
+        )
+
+    async def _complete_send_across_cancellation(
+        self,
+        claimed: MatrixDelivery,
+        *,
+        process_shutdown_requested: Callable[[], bool] | None = None,
+        on_cancelled: Callable[[], None] | None = None,
+    ) -> _FlushOutcome:
+        """Retain a completed outcome while delaying cancellation until post-lock work."""
+        completed: _FlushOutcome | None = None
+
+        async def finish() -> _FlushOutcome:
+            nonlocal completed
+            completed = await self._send_and_acknowledge(
+                claimed,
+                process_shutdown_requested=process_shutdown_requested,
+            )
+            return completed
+
+        try:
+            return await run_coroutine_until_complete(
+                finish(),
+                on_cancelled=on_cancelled,
+            )
+        except asyncio.CancelledError as cancellation:
+            if completed is None:
+                raise
+            return replace(completed, propagate_cancellation=cancellation)
 
     async def _reconcile_stale_delivery(self, claimed: MatrixDelivery) -> _FlushOutcome:
         """Adopt or retire an old membership's attempt without sending it now."""
@@ -382,29 +492,20 @@ class MatrixDeliveryWorker:
         )
         return _FlushOutcome(event_id=acknowledged_event_id)
 
-    async def _complete_send_across_cancellation(self, claimed: MatrixDelivery) -> _FlushOutcome:
-        """Retain a completed outcome while delaying cancellation until post-lock work."""
-        completed: _FlushOutcome | None = None
-
-        async def finish() -> _FlushOutcome:
-            nonlocal completed
-            completed = await self._send_and_acknowledge(claimed)
-            return completed
-
-        try:
-            return await run_coroutine_until_complete(finish())
-        except asyncio.CancelledError as cancellation:
-            if completed is None:
-                raise
-            return replace(completed, propagate_cancellation=cancellation)
-
-    async def _send_and_acknowledge(self, claimed: MatrixDelivery) -> _FlushOutcome:
+    async def _send_and_acknowledge(
+        self,
+        claimed: MatrixDelivery,
+        *,
+        process_shutdown_requested: Callable[[], bool] | None = None,
+    ) -> _FlushOutcome:
         """Finish an accepted Matrix attempt before propagating local cancellation."""
         await self.store.record_matrix_delivery_device(
             delivery_id=claimed.delivery_id,
             stage=claimed.stage,
             device_id=self.sending_device_id,
         )
+        if process_shutdown_requested is not None and process_shutdown_requested():
+            return _FlushOutcome(event_id=None)
         try:
             event_id = await self.send(claimed)
         except PermanentDeliveryError as error:
@@ -456,8 +557,7 @@ class MatrixDeliveryWorker:
             event_id=event_id,
             delivered_projections=delivered_projections,
             terminal_turn=self._terminal_turn(
-                claimed.delivery_id,
-                claimed.stage,
+                claimed,
                 terminal_response_event_id,
             ),
         )
@@ -468,6 +568,7 @@ class MatrixDeliveryWorker:
             event_id=acknowledged.settled_event_id,
             terminal_response_event_id=terminal_response_event_id if bound_terminal else None,
             publish_committed_terminal=bound_terminal,
+            committed_terminal=acknowledged.terminal_turn,
         )
 
     async def _delivered_projections(
@@ -487,26 +588,39 @@ class MatrixDeliveryWorker:
 
     async def _finish_flush(self, delivery_id: str, outcome: _FlushOutcome) -> str | None:
         """Run post-lock bookkeeping and return the visible event."""
+        event_id = outcome.event_id
         if (
             outcome.publish_committed_terminal
             and outcome.terminal_response_event_id is not None
             and self.terminal_turn_committed is not None
         ):
-            await self.terminal_turn_committed(delivery_id, outcome.terminal_response_event_id)
+
+            async def publish_committed_terminal() -> None:
+                assert self.terminal_turn_committed is not None
+                assert outcome.terminal_response_event_id is not None
+                await self.terminal_turn_committed(
+                    delivery_id,
+                    outcome.terminal_response_event_id,
+                    outcome.committed_terminal,
+                )
+
+            await run_coroutine_until_complete(
+                publish_committed_terminal(),
+            )
         if outcome.propagate_cancellation is not None:
             raise outcome.propagate_cancellation
-        return outcome.event_id
+        return event_id
 
-    def _terminal_turn(self, delivery_id: str, stage: DeliveryStage, event_id: str) -> TerminalTurnWrite | None:
+    def _terminal_turn(self, delivery: MatrixDelivery, event_id: str) -> TerminalTurnWrite | None:
         """Return the turn record this acknowledgement should also commit.
 
         Only for ``FINAL``. An ``INITIAL`` row is a placeholder, and binding a
         turn's terminal record to one would call a turn finished while the
         model is still running.
         """
-        if stage is not DeliveryStage.FINAL or self.terminal_turn_for is None:
+        if delivery.stage is not DeliveryStage.FINAL or self.terminal_turn_for is None:
             return None
-        return self.terminal_turn_for(delivery_id, event_id)
+        return self.terminal_turn_for(delivery, event_id)
 
     async def _resolve_delivered_event(self, claimed: MatrixDelivery) -> str | None:
         """Return the event an earlier attempt left in the room, if any.
@@ -561,6 +675,12 @@ class MatrixDeliveryWorker:
         not send is not a pass that finished, and the rows it left behind are
         answers a user is waiting for.
         """
+        process_shutdown_requested = False
+
+        def note_cancellation() -> None:
+            nonlocal process_shutdown_requested
+            process_shutdown_requested |= self.process_shutdown_requested()
+
         recovered = 0
         failed_deliveries: set[tuple[str, DeliveryStage]] = set()
         # A failure leaves the row unacknowledged, so it stays in the query's
@@ -590,7 +710,12 @@ class MatrixDeliveryWorker:
                     continue
                 try:
                     async with self._delivery_lock(delivery.delivery_id):
-                        outcome = await self._flush(delivery_id=delivery.delivery_id, stage=delivery.stage)
+                        outcome = await self._flush(
+                            delivery_id=delivery.delivery_id,
+                            stage=delivery.stage,
+                            process_shutdown_requested=lambda: process_shutdown_requested,
+                            on_cancelled=note_cancellation,
+                        )
                     sent = await self._finish_flush(delivery.delivery_id, outcome)
                 except Exception:
                     logger.exception(

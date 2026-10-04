@@ -2,23 +2,32 @@
 
 from __future__ import annotations
 
+import json
+import os
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 import yaml
 
+from mindroom import yaml_io
+from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
+from mindroom.thread_export import clear_thread_export_root
+from mindroom.thread_export import storage as thread_export_storage
 from mindroom.thread_export.models import ThreadExportRoom
 from mindroom.thread_export.storage import (
     _ROOT_MARKER_FILENAME,
     _ROOT_MARKER_TEXT,
     _safe_path_segment,
     _UnsafeThreadExportPathError,
+    exported_content,
     prepare_export_root,
     reconcile_room_directories,
     remove_room_export,
     remove_stale_thread_exports,
     room_has_thread_exports,
+    thread_payload,
     write_room_index,
     write_thread_payload,
 )
@@ -63,6 +72,96 @@ def _write_thread_export(room_dir: Path, thread_id: str = "$thread:localhost") -
     return path
 
 
+def test_clear_thread_export_root_removes_only_owned_content(tmp_path: Path) -> None:
+    """Plugins can retract a target without owning path traversal or broad deletion."""
+    output_dir = tmp_path / "agent" / "workspace" / "thread_exports"
+    _mark_export_root(output_dir)
+    room_dir = output_dir / "lobby"
+    room_dir.mkdir()
+    _write_thread_export(room_dir)
+    (room_dir / "index.json").write_text("{}\n", encoding="utf-8")
+    note = output_dir / "operator-note.txt"
+    note.write_text("keep", encoding="utf-8")
+
+    clear_thread_export_root(output_dir, trusted_root=tmp_path)
+
+    assert not room_dir.exists()
+    assert (output_dir / _ROOT_MARKER_FILENAME).exists()
+    assert note.read_text(encoding="utf-8") == "keep"
+
+    prepare_export_root(output_dir, trusted_root=tmp_path)
+
+
+def test_clear_thread_export_root_retains_empty_owned_directory(
+    tmp_path: Path,
+) -> None:
+    """Cleanup retains the owned root so later exports can reuse it safely."""
+    output_dir = tmp_path / "agent" / "workspace" / "thread_exports"
+    _mark_export_root(output_dir)
+
+    clear_thread_export_root(output_dir, trusted_root=tmp_path)
+
+    assert (output_dir / _ROOT_MARKER_FILENAME).read_text(encoding="utf-8") == _ROOT_MARKER_TEXT
+
+
+def test_clear_thread_export_root_never_drops_ownership_before_cleanup_finishes(
+    tmp_path: Path,
+) -> None:
+    """Cleanup must not expose a markerless root to concurrent writers."""
+    output_dir = tmp_path / "agent" / "workspace" / "thread_exports"
+    _mark_export_root(output_dir)
+
+    with patch("mindroom.thread_export.storage.os.unlink") as unlink:
+        clear_thread_export_root(output_dir, trusted_root=tmp_path)
+
+    unlink.assert_not_called()
+    assert (output_dir / _ROOT_MARKER_FILENAME).read_text(encoding="utf-8") == _ROOT_MARKER_TEXT
+
+
+def test_clear_thread_export_root_rejects_replaced_parent(tmp_path: Path) -> None:
+    """Cleanup cannot follow an intermediate symlink installed after discovery."""
+    instance_root = tmp_path / "private_instances" / "scope" / "agent"
+    output_dir = instance_root / "workspace" / "thread_exports"
+    _mark_export_root(output_dir)
+    saved_instance_root = instance_root.with_name("agent-saved")
+    instance_root.rename(saved_instance_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    instance_root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="thread export root parent"):
+        clear_thread_export_root(output_dir, trusted_root=tmp_path)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert (saved_instance_root / "workspace" / "thread_exports" / _ROOT_MARKER_FILENAME).exists()
+
+
+def test_write_thread_payload_rejects_replaced_parent(tmp_path: Path) -> None:
+    """A prepared target cannot be redirected before a later write."""
+    instance_root = tmp_path / "private_instances" / "scope" / "agent"
+    output_dir = instance_root / "workspace" / "thread_exports"
+    prepare_export_root(output_dir, trusted_root=tmp_path)
+    saved_instance_root = instance_root.with_name("agent-saved")
+    instance_root.rename(saved_instance_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    instance_root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="thread export root parent"):
+        write_thread_payload(
+            output_dir,
+            _room(),
+            "$thread:localhost",
+            {"messages": []},
+            trusted_root=tmp_path,
+        )
+
+    assert not (outside / "workspace" / "thread_exports").exists()
+    assert (saved_instance_root / "workspace" / "thread_exports" / _ROOT_MARKER_FILENAME).exists()
+
+
 def test_safe_path_segment_blocks_dot_directory_segments() -> None:
     """Path segments should not allow current or parent directory traversal."""
     assert _safe_path_segment(".") == "%2E"
@@ -79,102 +178,20 @@ def test_exporter_marks_a_new_empty_root_automatically(tmp_path: Path) -> None:
     assert (output_dir / _ROOT_MARKER_FILENAME).read_text(encoding="utf-8") == _ROOT_MARKER_TEXT
 
 
-def test_exporter_marks_a_recognizable_legacy_root_automatically(tmp_path: Path) -> None:
-    """A markerless tree containing only known export shapes should be claimed."""
+def test_exporter_refuses_populated_unmarked_root_and_preserves_content(tmp_path: Path) -> None:
+    """A populated markerless root must remain untouched until explicitly marked."""
     output_dir = tmp_path / "thread_exports"
     room_dir = output_dir / "lobby"
     room_dir.mkdir(parents=True)
     (room_dir / "index.json").write_text("{}\n", encoding="utf-8")
-    _write_thread_export(room_dir)
+    existing_export = _write_thread_export(room_dir)
+    before = existing_export.read_bytes()
 
-    prepare_export_root(output_dir)
+    with pytest.raises(RuntimeError, match="unowned thread export root"):
+        prepare_export_root(output_dir)
 
-    assert (output_dir / _ROOT_MARKER_FILENAME).read_text(encoding="utf-8") == _ROOT_MARKER_TEXT
-
-
-def test_exporter_replaces_an_invalid_marker_on_a_recognizable_legacy_root(tmp_path: Path) -> None:
-    """An invalid reserved marker should not prevent adoption of an otherwise recognizable tree."""
-    output_dir = tmp_path / "thread_exports"
-    room_dir = output_dir / "lobby"
-    room_dir.mkdir(parents=True)
-    (room_dir / "index.json").write_text("{}\n", encoding="utf-8")
-    _write_thread_export(room_dir)
-    (output_dir / _ROOT_MARKER_FILENAME).write_text("invalid\n", encoding="utf-8")
-
-    prepare_export_root(output_dir)
-
-    assert (output_dir / _ROOT_MARKER_FILENAME).read_text(encoding="utf-8") == _ROOT_MARKER_TEXT
-
-
-def test_exporter_ignores_its_atomic_write_residue_when_claiming_a_legacy_root(tmp_path: Path) -> None:
-    """Exact exporter temp files should not strand an otherwise recognizable legacy tree."""
-    output_dir = tmp_path / "thread_exports"
-    room_dir = output_dir / "lobby"
-    room_dir.mkdir(parents=True)
-    (room_dir / "index.json").write_text("{}\n", encoding="utf-8")
-    _write_thread_export(room_dir)
-    room_temp = room_dir / f".index.json.{'a' * 32}.tmp"
-    root_temp = output_dir / f".{_ROOT_MARKER_FILENAME}.{'b' * 32}.tmp"
-    room_temp.write_text('{"version":', encoding="utf-8")
-    root_temp.write_text('{"format":', encoding="utf-8")
-
-    prepare_export_root(output_dir)
-
-    assert room_temp.read_text(encoding="utf-8") == '{"version":'
-    assert root_temp.read_text(encoding="utf-8") == '{"format":'
-    assert (output_dir / _ROOT_MARKER_FILENAME).read_text(encoding="utf-8") == _ROOT_MARKER_TEXT
-
-
-@pytest.mark.parametrize(
-    "foreign_entry",
-    [
-        pytest.param(".DS_Store", id="finder-metadata"),
-        pytest.param("README.md", id="operator-note"),
-    ],
-)
-def test_exporter_claims_a_legacy_root_beside_a_foreign_file(tmp_path: Path, foreign_entry: str) -> None:
-    """A stray file next to a real corpus must not strand the whole target."""
-    output_dir = tmp_path / "thread_exports"
-    room_dir = output_dir / "lobby"
-    room_dir.mkdir(parents=True)
-    (room_dir / "index.json").write_text("{}\n", encoding="utf-8")
-    _write_thread_export(room_dir)
-    foreign = output_dir / foreign_entry
-    foreign.write_text("unrelated", encoding="utf-8")
-
-    prepare_export_root(output_dir)
-
-    assert (output_dir / _ROOT_MARKER_FILENAME).read_text(encoding="utf-8") == _ROOT_MARKER_TEXT
-    assert foreign.read_text(encoding="utf-8") == "unrelated"
-
-
-def test_exporter_claims_a_legacy_root_beside_a_foreign_directory(tmp_path: Path) -> None:
-    """A version-control directory beside a real corpus must not strand the target."""
-    output_dir = tmp_path / "thread_exports"
-    room_dir = output_dir / "lobby"
-    room_dir.mkdir(parents=True)
-    (room_dir / "index.json").write_text("{}\n", encoding="utf-8")
-    _write_thread_export(room_dir)
-    keep = output_dir / ".git" / "HEAD"
-    keep.parent.mkdir()
-    keep.write_text("ref: refs/heads/main\n", encoding="utf-8")
-
-    prepare_export_root(output_dir)
-
-    assert (output_dir / _ROOT_MARKER_FILENAME).read_text(encoding="utf-8") == _ROOT_MARKER_TEXT
-    assert keep.read_text(encoding="utf-8") == "ref: refs/heads/main\n"
-
-
-def test_exporter_claims_a_room_left_without_an_index_by_an_interrupted_pass(tmp_path: Path) -> None:
-    """Thread YAML written before an interrupted index write still proves ownership."""
-    output_dir = tmp_path / "thread_exports"
-    room_dir = output_dir / "lobby"
-    room_dir.mkdir(parents=True)
-    _write_thread_export(room_dir)
-
-    prepare_export_root(output_dir)
-
-    assert (output_dir / _ROOT_MARKER_FILENAME).read_text(encoding="utf-8") == _ROOT_MARKER_TEXT
+    assert existing_export.read_bytes() == before
+    assert not (output_dir / _ROOT_MARKER_FILENAME).exists()
 
 
 def test_a_stray_index_json_does_not_make_a_project_directory_adoptable(tmp_path: Path) -> None:
@@ -229,7 +246,7 @@ def test_unrecognized_root_is_not_marked(tmp_path: Path) -> None:
 def test_markerless_destructive_operations_fail_closed(
     tmp_path: Path,
 ) -> None:
-    """Recognizable legacy contents still require the marker before deletion."""
+    """Populated markerless contents still require the marker before deletion."""
     output_dir = tmp_path / "thread_exports"
     room_dir = output_dir / "lobby"
     room_dir.mkdir(parents=True)
@@ -474,3 +491,237 @@ def test_room_export_query_ignores_unrecognized_yaml(tmp_path: Path) -> None:
 
     (room_dir / _thread_filename("$thread:localhost")).write_text("version: 1\n", encoding="utf-8")
     assert room_has_thread_exports(output_dir, _room()) is True
+
+
+def test_thread_export_yaml_with_aliases_is_refused(tmp_path: Path) -> None:
+    """Thread exports sit in the worker-writable workspace, so an aliased file is left out of the index and replaced."""
+    output_dir = tmp_path / "thread_exports"
+    room = _room()
+    payload: dict[str, object] = {
+        "version": 1,
+        "thread": {"id": "$aliased:localhost", "source": "matrix", "summary": "$aliased:localhost"},
+        "messages": [],
+    }
+    write_thread_payload(output_dir, room, "$aliased:localhost", payload)
+    planted = output_dir / "lobby" / _thread_filename("$aliased:localhost")
+    planted.write_text(
+        'version: 1\nthread:\n  id: &id "$aliased:localhost"\n  source: matrix\n  summary: *id\nmessages: []\n',
+        encoding="utf-8",
+    )
+
+    write_room_index(output_dir, room)
+    assert json.loads((output_dir / "lobby" / "index.json").read_text(encoding="utf-8"))["threads"] == []
+
+    assert write_thread_payload(output_dir, room, "$aliased:localhost", payload) is True
+    assert "*id" not in planted.read_text(encoding="utf-8")
+
+
+def test_thread_export_yaml_with_too_many_nodes_is_refused(tmp_path: Path) -> None:
+    """A planted file is refused before its node graph, hundreds of bytes per node, fills the primary's memory."""
+    output_dir = tmp_path / "thread_exports"
+    room = _room()
+    payload: dict[str, object] = {
+        "version": 1,
+        "thread": {"id": "$planted:localhost", "source": "matrix"},
+        "messages": [],
+    }
+    write_thread_payload(output_dir, room, "$planted:localhost", payload)
+    planted = output_dir / "lobby" / _thread_filename("$planted:localhost")
+    planted.write_text(
+        'version: 1\nthread:\n  id: "$planted:localhost"\n  source: matrix\n'
+        f"messages:\n- sender: '@planted:localhost'\n  padding: [{'a,' * 250_000}a]\n",
+        encoding="utf-8",
+    )
+
+    write_room_index(output_dir, room)
+    [entry] = json.loads((output_dir / "lobby" / "index.json").read_text(encoding="utf-8"))["threads"]
+    assert entry["thread_id"] == "$planted:localhost"
+    assert entry["participants"] == []
+
+    assert write_thread_payload(output_dir, room, "$planted:localhost", payload) is True
+    assert "padding" not in planted.read_text(encoding="utf-8")
+
+
+def test_thread_too_long_to_parse_whole_stays_indexed_and_is_not_rewritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The primary's own export of a thread above the YAML node limit is indexed and left alone while unchanged."""
+    monkeypatch.setattr(yaml_io, "_MAX_UNTRUSTED_NODES", 500)
+    output_dir = tmp_path / "thread_exports"
+    room = _room()
+    messages = [
+        {"event_id": f"$event-{index}:localhost", "sender": "@user:localhost", "timestamp": index + 1, "body": "hi"}
+        for index in range(100)
+    ]
+
+    def payload(exported_at: str) -> dict[str, object]:
+        return {
+            "version": 1,
+            "room": {"key": "lobby", "id": "!lobby:localhost", "name": "Lobby", "alias": "#lobby:localhost"},
+            "thread": {"id": "$long:localhost", "source": "matrix", "exported_at": exported_at, "message_count": 100},
+            "messages": messages,
+        }
+
+    assert write_thread_payload(output_dir, room, "$long:localhost", payload("2026-10-01T00:00:00+00:00")) is True
+    write_room_index(output_dir, room)
+    [entry] = json.loads((output_dir / "lobby" / "index.json").read_text(encoding="utf-8"))["threads"]
+    assert entry["thread_id"] == "$long:localhost"
+    assert entry["message_count"] == 100
+
+    with patch.object(thread_export_storage, "_atomic_write_at", side_effect=AssertionError("rewrote an export")):
+        assert write_thread_payload(output_dir, room, "$long:localhost", payload("2026-10-02T00:00:00+00:00")) is False
+        write_room_index(output_dir, room)
+
+
+def test_thread_above_the_read_cap_stays_indexed_and_is_not_rewritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread file above the read cap is still written, indexed from its header, and left alone while unchanged."""
+    monkeypatch.setattr(thread_export_storage, "MAX_READ_BYTES", 4_096)
+    # `_read_text_at` binds the cap as its default, so it is lowered there too.
+    monkeypatch.setitem(thread_export_storage._read_text_at.__kwdefaults__, "max_bytes", 4_096)
+    output_dir = tmp_path / "thread_exports"
+    room = _room()
+
+    def payload(exported_at: str) -> dict[str, object]:
+        return {
+            "version": 1,
+            "room": {"key": "lobby", "id": "!lobby:localhost", "name": "Lobby", "alias": "#lobby:localhost"},
+            "thread": {"id": "$long:localhost", "source": "matrix", "exported_at": exported_at, "message_count": 1},
+            "messages": [
+                {"event_id": "$e:localhost", "sender": "@user:localhost", "timestamp": 1, "body": "x" * 5_000},
+            ],
+        }
+
+    assert (
+        write_thread_payload(output_dir, room, "$long:localhost", payload("2026-10-01T00:00:00.123456+00:00")) is True
+    )
+    write_room_index(output_dir, room)
+    [entry] = json.loads((output_dir / "lobby" / "index.json").read_text(encoding="utf-8"))["threads"]
+    assert entry == {
+        "file": _thread_filename("$long:localhost"),
+        "thread_id": "$long:localhost",
+        "message_count": 1,
+        "participants": [],
+    }
+
+    # The new export is shorter than the existing file by its timestamp alone, and the comparison still reads all of it.
+    with patch.object(thread_export_storage, "_atomic_write_at", side_effect=AssertionError("rewrote an export")):
+        assert write_thread_payload(output_dir, room, "$long:localhost", payload("2026-10-02T00:00:00+00:00")) is False
+        write_room_index(output_dir, room)
+
+
+def test_exported_content_keeps_everything_a_thread_payload_writes() -> None:
+    """A fetched thread drops the content its export never writes, and the written payload stays the same."""
+    router = "@mindroom_router:localhost"
+    contents: list[dict[str, object]] = [
+        {
+            "msgtype": "m.notice",
+            "body": "Summary text",
+            "formatted_body": "<p>Summary text</p>",
+            "m.relates_to": {"rel_type": "m.thread", "event_id": "$root", "m.in_reply_to": {"event_id": "$root"}},
+            "io.mindroom.thread_summary": {"version": 1, "summary": "Deploy fix"},
+            "io.mindroom.stream_status": "completed",
+            "padding": ["unused"] * 100,
+        },
+        {"msgtype": "m.text", "body": "later notice", "io.mindroom.thread_summary": {"version": 1}},
+        {"body": "plain", "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"}},
+    ]
+    messages = [
+        ResolvedVisibleMessage.from_message_data(
+            {
+                "sender": router,
+                "body": str(content["body"]),
+                "timestamp": index + 1,
+                "event_id": f"$event-{index}",
+                "content": content,
+            },
+            thread_id="$root",
+            latest_event_id=f"$event-{index}",
+        )
+        for index, content in enumerate(contents)
+    ]
+
+    def payload() -> dict[str, object]:
+        return thread_payload(
+            room=_room(),
+            thread_id="$root",
+            messages=messages,
+            exported_at=datetime(2026, 10, 1, tzinfo=UTC),
+            trusted_sender_ids={router},
+        )
+
+    written = payload()
+    for message in messages:
+        message.content = exported_content(message)
+
+    assert payload() == written
+    assert [set(message.content) for message in messages] == [
+        {"msgtype", "m.relates_to", "io.mindroom.thread_summary"},
+        {"msgtype", "io.mindroom.thread_summary"},
+        set(),
+    ]
+
+
+def test_room_index_rebuild_reads_its_newest_threads_within_a_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Thread files added to a room cannot make one rebuild read without end, and the newest threads stay indexed."""
+    output_dir = tmp_path / "thread_exports"
+    room = _room()
+
+    def write(index: int) -> Path:
+        thread_id = f"$thread-{index}:localhost"
+        payload = {"version": 1, "thread": {"id": thread_id, "source": "matrix", "message_count": 0}, "messages": []}
+        write_thread_payload(output_dir, room, thread_id, payload)
+        return output_dir / "lobby" / _thread_filename(thread_id)
+
+    paths = [write(index) for index in range(3)]
+    for index, path in enumerate(paths):
+        os.utime(path, ns=(index * 1_000_000_000, index * 1_000_000_000))
+    monkeypatch.setattr(
+        thread_export_storage,
+        "_MAX_ROOM_INDEX_BYTES",
+        paths[1].stat().st_size + paths[2].stat().st_size,
+    )
+
+    def indexed() -> tuple[list[str], list[str]]:
+        index = json.loads((output_dir / "lobby" / "index.json").read_text(encoding="utf-8"))
+        return sorted(entry["thread_id"] for entry in index["threads"]), index.get("unindexed_files", [])
+
+    with patch("mindroom.thread_export.storage.logger.warning") as warning:
+        write_room_index(output_dir, room)
+        assert indexed() == (["$thread-1:localhost", "$thread-2:localhost"], [paths[0].name])
+        assert paths[0].exists()
+
+        # The files the budget left out are not drift, so an unchanged pass skips the rebuild.
+        with patch.object(thread_export_storage, "_thread_index_entry", side_effect=AssertionError("reparsed")):
+            write_room_index(output_dir, room, thread_files_changed=False)
+        warning.assert_called_once()
+
+        # An added or deleted file still rebuilds the index.
+        added = write(3)
+        write_room_index(output_dir, room, thread_files_changed=False)
+        assert indexed() == (["$thread-2:localhost", "$thread-3:localhost"], sorted([paths[0].name, paths[1].name]))
+        paths[0].unlink()
+        added.unlink()
+        write_room_index(output_dir, room, thread_files_changed=False)
+        assert indexed() == (["$thread-1:localhost", "$thread-2:localhost"], [])
+
+
+@pytest.mark.parametrize("filename", ["marker", "index"])
+def test_export_reads_never_block_on_a_planted_fifo(tmp_path: Path, filename: str) -> None:
+    """A FIFO agent code plants where an export file belongs is refused instead of blocking the primary."""
+    os.mkfifo(tmp_path / ("marker" if filename == "marker" else "index.yaml"))
+    root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        if filename == "marker":
+            (tmp_path / "marker").rename(tmp_path / thread_export_storage._ROOT_MARKER_FILENAME)
+            assert thread_export_storage._has_valid_export_root_marker(root_fd) is False
+        else:
+            assert thread_export_storage._read_text_at(root_fd, "index.yaml") is None
+    finally:
+        os.close(root_fd)

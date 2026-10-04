@@ -21,6 +21,7 @@ from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.constants import STREAM_STATUS_ERROR, STREAM_STATUS_KEY
 from mindroom.final_delivery import StreamTransportOutcome
+from mindroom.history.session_context import ScopeSessionContext
 from mindroom.history.types import HistoryScope, PreparedHistoryState
 from mindroom.hooks import HookRegistry
 from mindroom.knowledge.utils import _KnowledgeResolution
@@ -28,6 +29,7 @@ from mindroom.matrix.client import DeliveredMatrixEvent
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
 from mindroom.response_runner import ResponseRequest
+from mindroom.response_sources import ResponseSources
 from mindroom.streaming import _CANCELLED_RESPONSE_NOTE, _INTERRUPTED_RESPONSE_NOTE, build_restart_interrupted_body
 from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
@@ -41,6 +43,7 @@ from tests.conftest import (
     runtime_paths_for,
     test_runtime_paths,
 )
+from tests.response_attempt_helpers import install_direct_response_admission
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -73,6 +76,7 @@ def _mock_bot(tmp_path: Path) -> AgentBot:
         runtime_paths_for(config),
         rooms=["!room:localhost"],
     )
+    install_direct_response_admission(bot)
     bot.logger = MagicMock()
     bot.stop_manager.remove_stop_button = AsyncMock()
     bot.client = make_matrix_client_mock(user_id=bot.agent_user.user_id)
@@ -86,7 +90,7 @@ def _mock_bot(tmp_path: Path) -> AgentBot:
     )
     bot._conversation_state_writer = MagicMock()
     bot._conversation_state_writer.create_storage = MagicMock(return_value=MagicMock())
-    bot._conversation_state_writer.persist_response_event_id_in_session_run = MagicMock()
+    bot._conversation_state_writer.apersist_response_event_id_in_session_run = AsyncMock()
     bot._conversation_state_writer.history_scope = MagicMock(
         return_value=HistoryScope(kind="agent", scope_id=bot.agent_name),
     )
@@ -102,6 +106,7 @@ def _knowledge_access_support() -> SimpleNamespace:
     return SimpleNamespace(
         for_agent=MagicMock(return_value=None),
         resolve_for_agent=MagicMock(return_value=_KnowledgeResolution(knowledge=None)),
+        resolve_for_agent_async=AsyncMock(return_value=_KnowledgeResolution(knowledge=None)),
     )
 
 
@@ -110,6 +115,18 @@ def _empty_storage_factory() -> MagicMock:
     storage = MagicMock()
     storage.get_session.return_value = None
     return storage
+
+
+def _empty_scope_context() -> ScopeSessionContext:
+    """Supply the complete conversation owner used by cancellation response tests."""
+    return ScopeSessionContext(
+        scope=HistoryScope("agent", "test_agent"),
+        storage=MagicMock(),
+        storage_factory=_empty_storage_factory,
+        session=None,
+        session_id="session-1",
+        session_exists=False,
+    )
 
 
 def _build_response_runner(bot: AgentBot) -> None:
@@ -138,6 +155,10 @@ def _response_request(
 ) -> ResponseRequest:
     """Build one response request for direct bot seam tests."""
     return ResponseRequest(
+        sources=ResponseSources(
+            pending_event_ids=(reply_to_event_id,),
+            logical_source_event_ids=(reply_to_event_id,),
+        ),
         thread_history=(),
         prompt=prompt,
         response_envelope=request_envelope(
@@ -370,13 +391,7 @@ class TestAIErrorDisplay:
         with (
             patch(
                 "mindroom.ai.open_resolved_scope_session_context",
-                new=lambda **_kwargs: nullcontext(
-                    SimpleNamespace(
-                        storage=MagicMock(),
-                        storage_factory=_empty_storage_factory,
-                        session=None,
-                    ),
-                ),
+                new=lambda **_kwargs: nullcontext(_empty_scope_context()),
             ),
             patch("mindroom.ai._prepare_agent_and_prompt", new=AsyncMock(return_value=_prepared_run(mock_agent))),
             patch("mindroom.ai.ai_runtime.cached_agent_run", new=AsyncMock(side_effect=fake_cached_run)),
@@ -437,13 +452,7 @@ class TestAIErrorDisplay:
         with (
             patch(
                 "mindroom.ai.open_resolved_scope_session_context",
-                new=lambda **_kwargs: nullcontext(
-                    SimpleNamespace(
-                        storage=MagicMock(),
-                        storage_factory=_empty_storage_factory,
-                        session=None,
-                    ),
-                ),
+                new=lambda **_kwargs: nullcontext(_empty_scope_context()),
             ),
             patch("mindroom.ai._prepare_agent_and_prompt", new=AsyncMock(return_value=_prepared_run(mock_agent))),
             patch(
@@ -503,13 +512,7 @@ class TestAIErrorDisplay:
         with (
             patch(
                 "mindroom.ai.open_resolved_scope_session_context",
-                new=lambda **_kwargs: nullcontext(
-                    SimpleNamespace(
-                        storage=MagicMock(),
-                        storage_factory=_empty_storage_factory,
-                        session=None,
-                    ),
-                ),
+                new=lambda **_kwargs: nullcontext(_empty_scope_context()),
             ),
             patch("mindroom.ai._prepare_agent_and_prompt", new=AsyncMock(return_value=_prepared_run(mock_agent))),
             patch("mindroom.streaming.edit_message_result", new=AsyncMock(side_effect=mock_stream_edit_message)),

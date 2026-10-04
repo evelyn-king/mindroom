@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from mindroom.attachments import parse_attachment_ids_from_event_source
@@ -38,6 +38,7 @@ from mindroom.matrix.message_content import resolve_event_source_content
 from mindroom.matrix.thread_diagnostics import is_thread_history_degraded
 from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.matrix.thread_membership import (
+    RelatedEventUnavailableError,
     ThreadMembershipAccess,
     ThreadMembershipLookupError,
     ThreadResolution,
@@ -47,6 +48,7 @@ from mindroom.matrix.thread_membership import (
     thread_messages_thread_membership_access,
 )
 from mindroom.message_target import MessageTarget
+from mindroom.requester_identity import resolve_human_requester_alias
 from mindroom.runtime_protocols import SupportsClientConfig  # noqa: TC001
 from mindroom.thread_utils import check_agent_mentioned
 from mindroom.turn_origin import TurnOrigin, classify_turn_origin
@@ -228,6 +230,15 @@ class DispatchContextResult:
 
 
 @dataclass(frozen=True)
+class _PreHydrationPolicyFacts:
+    """Policy facts available without resolving thread history."""
+
+    origin: TurnOrigin
+    am_i_mentioned: bool
+    mentioned_agents: tuple[MatrixID, ...]
+
+
+@dataclass(frozen=True)
 class ConversationResolverDeps:
     """Explicit collaborators for conversation resolution."""
 
@@ -255,6 +266,31 @@ class ConversationResolver:
 
     def _matrix_id(self) -> MatrixID:
         return self.deps.matrix_id
+
+    def _mention_facts(
+        self,
+        event_source: dict[str, Any],
+        *,
+        room: nio.MatrixRoom,
+    ) -> tuple[list[MatrixID], bool, bool]:
+        """Return mention facts from one already-normalized event source."""
+        if _should_skip_mentions(event_source):
+            return [], False, False
+        return check_agent_mentioned(
+            event_source,
+            self._matrix_id(),
+            self.deps.runtime.config,
+            self.deps.runtime_paths,
+            room=room,
+        )
+
+    def _mentioned_agent_names(self, mentioned_agents: Sequence[MatrixID]) -> tuple[str, ...]:
+        """Return canonical entity names for mentioned managed users."""
+        registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
+        return tuple(
+            registry.current_entity_name_for_user_id(agent_id.full_id) or agent_id.username
+            for agent_id in mentioned_agents
+        )
 
     def _envelope_ingress_metadata(  # noqa: C901
         self,
@@ -324,6 +360,39 @@ class ConversationResolver:
             source_kind=source_kind,
             original_sender=original_sender,
             trusted_user_relay=trusted_human_relay,
+        )
+
+    def pre_hydration_policy_facts(
+        self,
+        *,
+        room: nio.MatrixRoom,
+        event: DispatchEvent,
+        requester_user_id: str,
+        payload_metadata: DispatchPayloadMetadata | None = None,
+        source_kind: str | None = None,
+        original_sender: str | None = None,
+        trusted_user_relay: bool = False,
+    ) -> _PreHydrationPolicyFacts:
+        """Classify mention and origin policy without reading conversation history."""
+        event_source = _source_with_payload_metadata(event.source, payload_metadata)
+        mentioned_agents, am_i_mentioned, _has_non_agent_mentions = self._mention_facts(
+            event_source,
+            room=room,
+        )
+        resolved_source_kind, _hook_source, _message_received_depth = self._envelope_ingress_metadata(
+            event=event,
+            source_kind=source_kind,
+        )
+        return _PreHydrationPolicyFacts(
+            origin=self._turn_origin_for_event(
+                event=event,
+                requester_user_id=requester_user_id,
+                source_kind=resolved_source_kind,
+                original_sender=original_sender,
+                trusted_user_relay=trusted_user_relay,
+            ),
+            am_i_mentioned=am_i_mentioned,
+            mentioned_agents=tuple(mentioned_agents),
         )
 
     def _sender_is_managed_entity(self, user_id: str) -> bool:
@@ -437,39 +506,20 @@ class ConversationResolver:
         trusted_user_relay: bool = False,
     ) -> MessageEnvelope:
         """Build the normalized inbound envelope consumed by message hooks."""
-        from mindroom.hooks import MessageEnvelope  # noqa: PLC0415
-
-        config = self.deps.runtime.config
-        resolved_source_kind, hook_source, message_received_depth = self._envelope_ingress_metadata(
+        return self._build_envelope(
             event=event,
-            source_kind=source_kind,
-            hook_source=hook_source,
-            message_received_depth=message_received_depth,
-        )
-        registry = entity_identity_registry(config, self.deps.runtime_paths)
-
-        return MessageEnvelope(
-            source_event_id=event.event_id,
+            requester_user_id=requester_user_id,
             target=target,
-            body=body or event.body,
-            attachment_ids=tuple(
-                attachment_ids if attachment_ids is not None else parse_attachment_ids_from_event_source(event.source),
-            ),
-            mentioned_agents=tuple(
-                registry.current_entity_name_for_user_id(agent_id.full_id) or agent_id.username
-                for agent_id in context.mentioned_agents
-            ),
-            agent_name=agent_name or self.deps.agent_name,
+            attachment_ids=attachment_ids,
+            agent_name=agent_name,
+            body=body,
+            source_kind=source_kind,
+            dispatch_policy_source_kind=dispatch_policy_source_kind,
             hook_source=hook_source,
             message_received_depth=message_received_depth,
-            dispatch_policy_source_kind=dispatch_policy_source_kind,
-            origin=self._turn_origin_for_event(
-                event=event,
-                requester_user_id=requester_user_id,
-                source_kind=resolved_source_kind,
-                original_sender=original_sender,
-                trusted_user_relay=trusted_user_relay,
-            ),
+            mentioned_agents=context.mentioned_agents,
+            original_sender=original_sender,
+            trusted_user_relay=trusted_user_relay,
         )
 
     def build_ingress_envelope(
@@ -485,10 +535,45 @@ class ConversationResolver:
         dispatch_policy_source_kind: str | None = None,
         hook_source: str | None = None,
         message_received_depth: int | None = None,
+        mentioned_agents: Sequence[MatrixID] = (),
         original_sender: str | None = None,
         trusted_user_relay: bool = False,
     ) -> MessageEnvelope:
         """Build one lightweight ingress envelope without extracting thread context."""
+        return self._build_envelope(
+            event=event,
+            requester_user_id=requester_user_id,
+            target=target,
+            attachment_ids=attachment_ids,
+            agent_name=agent_name,
+            body=body,
+            source_kind=source_kind,
+            dispatch_policy_source_kind=dispatch_policy_source_kind,
+            hook_source=hook_source,
+            message_received_depth=message_received_depth,
+            mentioned_agents=mentioned_agents,
+            original_sender=original_sender,
+            trusted_user_relay=trusted_user_relay,
+        )
+
+    def _build_envelope(
+        self,
+        *,
+        event: DispatchEvent,
+        requester_user_id: str,
+        target: MessageTarget,
+        attachment_ids: list[str] | None,
+        agent_name: str | None,
+        body: str | None,
+        source_kind: str | None,
+        dispatch_policy_source_kind: str | None,
+        hook_source: str | None,
+        message_received_depth: int | None,
+        mentioned_agents: Sequence[MatrixID],
+        original_sender: str | None,
+        trusted_user_relay: bool,
+    ) -> MessageEnvelope:
+        """Construct the shared envelope after callers choose their mention inputs."""
         from mindroom.hooks import MessageEnvelope  # noqa: PLC0415
 
         resolved_source_kind, hook_source, message_received_depth = self._envelope_ingress_metadata(
@@ -504,7 +589,7 @@ class ConversationResolver:
             attachment_ids=tuple(
                 attachment_ids if attachment_ids is not None else parse_attachment_ids_from_event_source(event.source),
             ),
-            mentioned_agents=(),
+            mentioned_agents=self._mentioned_agent_names(mentioned_agents),
             agent_name=agent_name or self.deps.agent_name,
             hook_source=hook_source,
             message_received_depth=message_received_depth,
@@ -523,7 +608,12 @@ class ConversationResolver:
         room: nio.MatrixRoom,
         event: DispatchEvent | MatrixMediaEvent,
     ) -> str | None:
-        """Return the coalescing thread scope for one inbound event."""
+        """Return the coalescing thread scope for one inbound event.
+
+        Raises ``RelatedEventUnavailableError`` when the event's relation
+        target is one the homeserver will not serve, and
+        ``ThreadMembershipLookupError`` when the scope is unknown for now.
+        """
         config = self.deps.runtime.config
         event_info = EventInfo.from_event(event.source)
         if (
@@ -565,6 +655,10 @@ class ConversationResolver:
         if resolution.state is ThreadResolutionState.ROOM_LEVEL:
             return None
         msg = f"Could not resolve canonical coalescing thread for {event.event_id}"
+        if isinstance(resolution.error, RelatedEventUnavailableError):
+            # The event names a relation target the homeserver will not serve,
+            # so no retry can place it either.
+            raise RelatedEventUnavailableError(msg) from resolution.error
         if resolution.error is not None:
             raise ThreadMembershipLookupError(msg) from resolution.error
         raise ThreadMembershipLookupError(msg)
@@ -578,6 +672,7 @@ class ConversationResolver:
         mode: ThreadReadMode,
     ) -> ThreadResolution:
         """Resolve one event's coalescing membership under one read mode."""
+        msg = f"Could not resolve canonical coalescing thread for {event.event_id}"
         try:
             return await resolve_event_thread_membership(
                 room.room_id,
@@ -588,8 +683,9 @@ class ConversationResolver:
                     requires_complete_history=True,
                 ),
             )
+        except RelatedEventUnavailableError as exc:
+            raise RelatedEventUnavailableError(msg) from exc
         except Exception as exc:
-            msg = f"Could not resolve canonical coalescing thread for {event.event_id}"
             raise ThreadMembershipLookupError(msg) from exc
 
     async def _explicit_thread_id_for_event(
@@ -835,17 +931,10 @@ class ConversationResolver:
         resolved_event_source = _source_with_payload_metadata(resolved_event_source, payload_metadata)
         config = self.deps.runtime.config
 
-        if _should_skip_mentions(resolved_event_source):
-            mentioned_agents: list[MatrixID] = []
-            am_i_mentioned = False
-            has_non_agent_mentions = False
-        else:
-            mentioned_agents, am_i_mentioned, has_non_agent_mentions = check_agent_mentioned(
-                resolved_event_source,
-                self._matrix_id(),
-                config,
-                self.deps.runtime_paths,
-            )
+        mentioned_agents, am_i_mentioned, has_non_agent_mentions = self._mention_facts(
+            resolved_event_source,
+            room=room,
+        )
 
         if am_i_mentioned:
             self.deps.logger.info("Mentioned", event_id=event.event_id, room_id=room.room_id)
@@ -909,17 +998,10 @@ class ConversationResolver:
         resolved_event_source = _source_with_payload_metadata(resolved_event_source, payload_metadata)
         config = self.deps.runtime.config
 
-        if _should_skip_mentions(resolved_event_source):
-            mentioned_agents: list[MatrixID] = []
-            am_i_mentioned = False
-            has_non_agent_mentions = False
-        else:
-            mentioned_agents, am_i_mentioned, has_non_agent_mentions = check_agent_mentioned(
-                resolved_event_source,
-                self._matrix_id(),
-                config,
-                self.deps.runtime_paths,
-            )
+        mentioned_agents, am_i_mentioned, has_non_agent_mentions = self._mention_facts(
+            resolved_event_source,
+            room=room,
+        )
 
         if am_i_mentioned:
             self.deps.logger.info("Mentioned", event_id=event.event_id, room_id=room.room_id)
@@ -1029,3 +1111,63 @@ class ConversationResolver:
             thread_id,
             mode=ThreadReadMode.STRICT,
         )
+
+    async def consecutive_agent_messages(self, room_id: str, thread_id: str | None, *, limit: int) -> int:
+        """Count the newest messages in one conversation that agents or teams wrote, looking back at most ``limit``.
+
+        Any other sender, the router included, ends the run: it writes only for a person.
+        """
+        page = await self.deps.conversation_reader.read(room_id=room_id, thread_id=thread_id, limit=limit)
+        registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
+        count = 0
+        for message in reversed(page.messages):
+            if registry.current_entity_name_for_user_id(message.sender, include_router=False) is None:
+                break
+            count += 1
+        return count
+
+    def canonical_source_requester(self, message: ResolvedVisibleMessage) -> str:
+        """Resolve the authenticated physical sender through configured human aliases."""
+        return resolve_human_requester_alias(message.sender, self.deps.runtime.config, self.deps.runtime_paths)
+
+    async def resolve_exact_source(
+        self,
+        *,
+        target: MessageTarget,
+        source_event_id: str,
+        requester_id: str,
+    ) -> ResolvedVisibleMessage | None:
+        """Prove an exact physical source and revision, paging beyond prompt windows."""
+        reader = self.deps.conversation_reader
+        if await reader.is_event_redacted(room_id=target.room_id, event_id=source_event_id):
+            return None
+        before = None
+        while True:
+            page = await reader.read_strict(
+                room_id=target.room_id,
+                thread_id=target.resolved_thread_id,
+                limit=HYDRATED_PROMPT_WINDOW_MESSAGES,
+                before=before,
+            )
+            for message in projected_thread_history(page, complete=True):
+                if message.event_id != source_event_id:
+                    continue
+                if self.canonical_source_requester(message) != requester_id:
+                    msg = "Canonical source requester does not match the recorded owner"
+                    raise ThreadMembershipLookupError(msg)
+                resolved = await resolve_event_source_content(
+                    {"content": dict(message.content)},
+                    self._client(),
+                )
+                content = resolved["content"]
+                body = content.get("body")
+                if not isinstance(body, str):
+                    msg = "Canonical source has no resolved text body"
+                    raise ThreadMembershipLookupError(msg)
+                return replace(message, body=body, content=content)
+            if page.next_cursor is None:
+                if await reader.is_event_redacted(room_id=target.room_id, event_id=source_event_id):
+                    return None
+                msg = "Exact canonical source is unavailable in the strict conversation projection"
+                raise ThreadMembershipLookupError(msg)
+            before = page.next_cursor

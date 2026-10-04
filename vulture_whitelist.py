@@ -1,8 +1,28 @@
 # ruff: noqa: D100, B018, F821
 # Generated Vulture baseline for dynamic/framework entry points.
+_.validate_personal_rooms  # Pydantic model validator (src/mindroom/config/main.py)
+_.validate_template  # Pydantic field validator (src/mindroom/config/personal_rooms.py)
+_.validate_commands  # Pydantic field validator (src/mindroom/config/personal_rooms.py)
+_.unique_services  # Pydantic field validator (src/mindroom/tool_system/google_workspaces.py)
+_.normalize_domains  # Pydantic field validator (src/mindroom/tool_system/google_workspaces.py)
+_.canonical_site_url  # Pydantic field validator (src/mindroom/tool_system/atlassian_connections.py)
+_.canonical_cloud_id  # Pydantic field validator (src/mindroom/tool_system/atlassian_connections.py)
+_.unique_products  # Pydantic field validator (src/mindroom/tool_system/atlassian_connections.py)
+_.pinned_site  # Pydantic model validator (src/mindroom/tool_system/atlassian_connections.py)
+desktop_native_app  # Typer dispatches the native desktop helper command (src/mindroom/cli/desktop.py)
+_.fetch_response  # Trafilatura spider download binding replaced by the server-fetch guard (src/mindroom/tools/agno_compat_trafilatura.py)
+_.fetch_images  # Newspaper4k Article.parse step overridden to skip image downloads (src/mindroom/tools/agno_compat_newspaper4k.py)
+_._save_file_to_disk  # FileGenerationTools save step overridden to write inside the workspace (src/mindroom/tools/agno_compat_file_generation.py)
 # Regenerate with:
 #   uv run vulture --make-whitelist src/mindroom --min-confidence 60 --sort-by-size | perl -pe 's/\.py:\d+/.py/g' > vulture_whitelist.py
 dashboard_credentials_supported  # unused variable (src/mindroom/agent_policy.py)
+is_shared  # JSON response field consumed by connections portal (src/mindroom/api/connections.py)
+can_use  # JSON response field consumed by connections portal (src/mindroom/api/connections.py)
+avatar  # FastAPI route (src/mindroom/api/connections.py)
+can_connect  # JSON response field consumed by personal portal (src/mindroom/api/connections.py)
+account_label  # JSON response field consumed by personal portal (src/mindroom/api/connections.py)
+localhostProfile  # Kubernetes wire TypedDict key (src/mindroom/workers/backends/kubernetes_config.py)
+connection_url  # TypedDict field consumed by gateway clients (src/mindroom/mcp_gateway/types.py)
 has_credentials  # unused variable (src/mindroom/api/credentials.py)
 key_names  # unused variable (src/mindroom/api/credentials.py)
 location_name  # unused variable (src/mindroom/api/homeassistant_integration.py)
@@ -44,9 +64,9 @@ _.thinking  # unused attribute (src/mindroom/history/summary_call.py)
 start_new_session  # unused variable (src/mindroom/knowledge/refresh_runner.py)
 _.check_hostname  # unused attribute (src/mindroom/matrix/client_session.py)
 _.row_factory  # sqlite row-name access (src/mindroom/event_journal/sqlite_backend.py)
+_.protocol_version  # validated by Pydantic before worker launch (src/mindroom/api/sandbox_runner_scripts.py)
 _.uploaded_key_count  # consumed by nio after assignment (src/mindroom/matrix/client_session.py)
 _.verify_mode  # unused attribute (src/mindroom/matrix/client_session.py)
-_.uploaded_key_count  # nio's Olm machine state (src/mindroom/matrix/client_session.py)
 _.FAILSAFE  # configured on the optional PyAutoGUI module (src/mindroom/desktop/provider.py)
 _.PAUSE  # configured on the optional PyAutoGUI module (src/mindroom/desktop/provider.py)
 _.embedding_model  # mem0's runtime embedding adapter (src/mindroom/memory/config.py)
@@ -93,12 +113,15 @@ _.handle_decl  # unused method (src/mindroom/matrix/message_builder.py)
 _.handle_pi  # unused method (src/mindroom/matrix/message_builder.py)
 _.unknown_decl  # unused method (src/mindroom/matrix/message_builder.py)
 _.do_GET  # HTTPServer dispatches request handlers by method name (src/mindroom/desktop/sso.py)
+_.address_family  # socketserver reads it when creating the listening socket (src/mindroom/cli/pairing_probes.py)
+_.rollback_runtime_status  # JSON receipt field emitted through asdict (src/mindroom/cli/config_bundle.py)
 get_agents  # unused function (src/mindroom/api/main.py)
 get_teams  # unused function (src/mindroom/api/main.py)
 healthz  # unused function (src/mindroom/api/sandbox_runner_app.py)
 is_kubernetes_worker_backend_config_env_name  # unused function (src/mindroom/workers/backends/kubernetes_config.py)
 _.serialize  # unused method (src/mindroom/config/models.py)
 _.decline  # unused method (src/mindroom/hooks/context.py)
+_.is_active  # plugin hooks inspect whether their registry snapshot is still live
 _.get_embedding_and_usage  # unused method (src/mindroom/knowledge/manager.py)
 _.async_get_embedding  # unused method (src/mindroom/knowledge/manager.py)
 _.async_get_embedding_and_usage  # unused method (src/mindroom/knowledge/manager.py)
@@ -117,20 +140,26 @@ _.serialize_datetime  # unused method (src/mindroom/matrix/state.py)
 clear_auth_session  # unused function (src/mindroom/api/auth.py)
 _.validate_unique_tools  # unused method (src/mindroom/config/agent.py)
 _.validate_context_files  # unused method (src/mindroom/config/agent.py)
+_.validate_credential_managers  # Pydantic field validator (src/mindroom/config/agent.py)
+_.normalize_thread_exports  # Pydantic field validator (src/mindroom/config/agent.py)
+_.validate_unique_access_entries  # Pydantic field validator (src/mindroom/config/agent.py)
 _.validate_raw_root_config  # unused method (src/mindroom/config/main.py)
 _.validate_defaults_fit_caps  # unused method (src/mindroom/config/external_trigger_policy.py)
 _.validate_required_text  # unused method (src/mindroom/external_triggers/store.py)
 _.validate_thread_id  # unused method (src/mindroom/external_triggers/store.py)
 _.validate_thread_placement  # unused method (src/mindroom/external_triggers/store.py)
 _.validate_owner_user_id  # unused method (src/mindroom/external_triggers/store.py)
+_.validate_event_id  # Pydantic field validator (src/mindroom/external_triggers/models.py)
 _.validate_required_record_text  # unused method (src/mindroom/external_triggers/store.py)
 _.normalize_allowed_kinds  # unused method (src/mindroom/external_triggers/store.py)
 _.validate_record_keys  # unused method (src/mindroom/external_triggers/store.py)
 _.validate_kind  # unused method (src/mindroom/external_triggers/models.py)
 _.validate_message  # unused method (src/mindroom/external_triggers/models.py)
+_.validate_thread_key  # Pydantic field validator (src/mindroom/external_triggers/models.py)
 _.validate_auth  # unused method (src/mindroom/external_triggers/store.py)
 post_external_trigger  # unused function (src/mindroom/api/external_triggers.py)
 _.validate_team_agents  # unused method (src/mindroom/config/main.py)
+_.validate_agent_helper_models  # Pydantic model validator (src/mindroom/config/main.py)
 _.handle_endtag  # unused method (src/mindroom/matrix/message_builder.py)
 _._normalize_set_at  # unused method (src/mindroom/thread_tags.py)
 _._normalize_data  # unused method (src/mindroom/thread_tags.py)
@@ -151,6 +180,14 @@ _.normalize_shorthand  # unused method (src/mindroom/config/memory.py)
 _.validate_include_patterns  # unused method (src/mindroom/config/memory.py)
 _._check_history_config  # unused method (src/mindroom/config/models.py)
 _._validate_credentials_service  # Pydantic field validator (src/mindroom/config/models.py)
+_._normalize_blank_host  # Pydantic field validator (src/mindroom/config/models.py)
+_._normalize_display_name  # Pydantic field validator (src/mindroom/config/models.py)
+_._normalize_icon  # Pydantic field validator (src/mindroom/config/models.py)
+_._validate_api_provider  # Pydantic model validator (src/mindroom/config/models.py)
+_._normalize_api_key  # Pydantic field validator (src/mindroom/config/models.py)
+_._normalize_extra_kwargs_api_key  # Pydantic field validator (src/mindroom/config/models.py)
+_._validate_single_api_key  # Pydantic model validator (src/mindroom/config/models.py)
+_._using_reasoning_model  # Agno Responses continuation hook (src/mindroom/openai_models.py)
 _.handle_starttag  # unused method (src/mindroom/matrix/message_builder.py)
 _.validate_history_settings  # unused method (src/mindroom/config/agent.py)
 _.normalize_display_name  # unused method (src/mindroom/config/agent.py)
@@ -181,6 +218,7 @@ _.validate_agent_reply_permissions  # unused method (src/mindroom/config/main.py
 _.validate_unique_entries  # unused method (src/mindroom/config/matrix.py)
 standalone_login  # unused function (src/mindroom/api/auth.py)
 get_raw_config_source  # unused function (src/mindroom/api/main.py)
+get_config_schema  # FastAPI route (src/mindroom/api/config_schema.py)
 default_style  # TypedDict key (src/mindroom/yaml_io.py)
 default_flow_style  # TypedDict key (src/mindroom/yaml_io.py)
 allow_unicode  # TypedDict key (src/mindroom/yaml_io.py)
@@ -192,8 +230,12 @@ _.validate_private_root  # unused method (src/mindroom/config/agent.py)
 _.validate_template_dir  # unused method (src/mindroom/config/agent.py)
 get_available_rooms  # unused function (src/mindroom/api/main.py)
 config_path_cmd  # unused function (src/mindroom/cli/config.py)
+config_explain_access  # Typer command (src/mindroom/cli/config.py)
 service_status  # unused function (src/mindroom/cli/service.py)
 _.validate_delegate_to  # unused method (src/mindroom/config/main.py)
+_.validate_administrators  # Pydantic field validator (src/mindroom/config/main.py)
+_.validate_membership_access_room_references  # Pydantic model validator (src/mindroom/config/main.py)
+_.validate_membership_access_compatibility  # Pydantic model validator (src/mindroom/config/main.py)
 _.handle_startendtag  # unused method (src/mindroom/matrix/message_builder.py)
 list_skills  # unused function (src/mindroom/api/skills.py)
 _.normalize_extensions  # unused method (src/mindroom/config/knowledge.py)
@@ -206,16 +248,18 @@ _reset_credentials_manager_cache  # unused function (src/mindroom/credentials.py
 _reset_handled_turn_ledger_runtime  # unused function (src/mindroom/handled_turns.py)
 _reset_primary_worker_manager  # unused function (src/mindroom/workers/runtime.py)
 _reset_visible_voice_echo_barriers  # unused function (src/mindroom/visible_voice_echo.py)
+_._reconcile_classic_sync_cursor_after_loop_exit  # retained until Task 6 removes fork recovery
 _.read_file_chunk  # unused method (src/mindroom/tools/file.py)
 _.download_file  # unused method (src/mindroom/custom_tools/google_drive.py)
 _._batch_get  # inherited Gmail tools call this override dynamically (src/mindroom/custom_tools/gmail.py)
 _._build_service  # Agno Google auth decorator calls this override dynamically (src/mindroom/custom_tools/google_drive.py)
 _.reject_legacy_defaults_fields  # unused method (src/mindroom/config/models.py)
 _.normalize_tool_filters  # unused method (src/mindroom/mcp/config.py)
-_.normalize_description  # unused method (src/mindroom/mcp/config.py)
+_.normalize_display_metadata  # unused method (src/mindroom/mcp/config.py)
 _.validate_provider_id  # unused method (src/mindroom/mcp/config.py)
 _.normalize_scopes  # unused method (src/mindroom/mcp/config.py)
 _.handle_exit  # unused method (src/mindroom/orchestrator.py)
+_.capture_signals  # Uvicorn Server hook overridden so the gateway listener leaves signals to the primary server (src/mindroom/api/script_gateway.py)
 _.delete_file  # unused method (src/mindroom/tools/file.py)
 _.normalize_plugins  # unused method (src/mindroom/config/main.py)
 _.validate_toolkit_references  # unused method (src/mindroom/config/main.py)
@@ -241,6 +285,7 @@ update_team  # unused function (src/mindroom/api/main.py)
 update_skill  # unused function (src/mindroom/api/skills.py)
 _.validate_private_knowledge  # unused method (src/mindroom/config/main.py)
 create_auth_session  # unused function (src/mindroom/api/auth.py)
+complete_platform_sso  # unused function (src/mindroom/api/auth.py)
 get_agent_policies  # unused function (src/mindroom/api/main.py)
 get_skill  # unused function (src/mindroom/api/skills.py)
 avatars_generate  # unused function (src/mindroom/cli/main.py)
@@ -249,6 +294,8 @@ _journal_adopt_command  # unused function (src/mindroom/cli/main.py)
 update_model  # unused function (src/mindroom/api/main.py)
 get_all_agents_rooms  # unused function (src/mindroom/api/matrix_operations.py)
 get_agent_rooms  # unused function (src/mindroom/api/matrix_operations.py)
+get_agent_avatar  # unused function (src/mindroom/api/matrix_operations.py)
+get_room_avatar  # unused function (src/mindroom/api/matrix_operations.py)
 authorize  # unused function (src/mindroom/api/oauth.py)
 confirm_reset  # FastAPI route dispatch (src/mindroom/api/oauth.py)
 reset_and_authorize  # FastAPI route dispatch (src/mindroom/api/oauth.py)
@@ -287,9 +334,9 @@ get_plugin_state_root  # unused function (src/mindroom/tool_system/runtime_conte
 emit_custom_event  # unused function (src/mindroom/tool_system/runtime_context.py)
 config_edit  # unused function (src/mindroom/cli/config.py)
 _.search_files  # unused method (src/mindroom/tools/file.py)
+_.search_content  # unused method (src/mindroom/tools/file.py)
 config_validate  # unused function (src/mindroom/cli/config.py)
 config_resolve  # unused function (src/mindroom/cli/config.py)
-_.validate_culture_assignments  # unused method (src/mindroom/config/main.py)
 update_schedule  # unused function (src/mindroom/api/schedules.py)
 get_registered_tools  # unused function (src/mindroom/api/tools.py)
 list_knowledge_bases  # unused function (src/mindroom/api/knowledge.py)
@@ -303,6 +350,8 @@ reindex_knowledge  # unused function (src/mindroom/api/knowledge.py)
 spotify_callback  # unused function (src/mindroom/api/integrations.py)
 list_models  # unused function (src/mindroom/api/openai_compat.py)
 execute_tool_call  # unused function (src/mindroom/api/sandbox_runner.py)
+cancel_tool_call  # unused function (src/mindroom/api/sandbox_runner.py)
+view_file_in_worker  # FastAPI route (src/mindroom/api/sandbox_runner.py)
 config_init  # unused function (src/mindroom/cli/config.py)
 chat_completions  # unused function (src/mindroom/api/openai_compat.py)
 AgentVaultAccessTools  # unused class (src/mindroom/custom_tools/agent_vault_access.py)
@@ -315,8 +364,11 @@ ThreadExportTarget  # plugin-facing API class (src/mindroom/thread_export/models
 export_threads_to_targets_once  # plugin-facing API function (src/mindroom/thread_export/service.py)
 _._naive_execute_at_is_utc  # unused method (src/mindroom/scheduling.py)
 _.turn_count  # read in tests/test_matrix_rtc_transcript.py (src/mindroom/matrix_rtc/transcript.py)
+_.load_or_create_ingestion_consumer  # inactive checkpoint contract (src/mindroom/event_journal/store.py)
+_.bind_ingestion_stream  # inactive checkpoint contract (src/mindroom/event_journal/store.py)
 AudioInput  # type-only SDK interface for the custom MatrixRTC audio stream
 _.on_attached  # LiveKit AgentInput callback (src/mindroom/matrix_rtc/voice_agent.py)
+_.on_enter  # LiveKit Agent lifecycle callback (src/mindroom/matrix_rtc/live_voice_agent.py)
 _.on_detached  # LiveKit AgentInput callback (src/mindroom/matrix_rtc/voice_agent.py)
 _.validate_extra_kwargs  # Pydantic validator (src/mindroom/config/voice.py)
 _.validate_host  # Pydantic validator (src/mindroom/config/voice.py)
@@ -329,3 +381,73 @@ FINAL  # unused variable (src/mindroom/event_journal/models.py)
 # Named only inside a `cast("_RoomIdEvent", event)` string literal, which
 # vulture does not resolve.
 _RoomIdEvent  # unused class (src/mindroom/matrix/journal_ingress.py)
+
+# Agno 3 adapter overrides: agno reads the run-object cache attribute and calls drop_session itself.
+_.flush_in_flight_messages_on_error  # Agno terminal cleanup (src/mindroom/agno_compat_run_messages.py)
+_.flush_in_flight_messages_on_error_team  # Agno terminal cleanup (src/mindroom/agno_compat_run_messages.py)
+_.external_execution_silent  # Agno suppresses the internal delegation wait message (src/mindroom/agents.py)
+_.external_execution_required  # Agno reads the retained tool pause flags (src/mindroom/delegation/execution.py)
+_._run_object_cache  # agno SqliteDb attribute replaced by the adapter (src/mindroom/agent_storage.py)
+_.drop_session  # agno SqliteDb calls it on the run-object cache (src/mindroom/agent_storage.py)
+_.runs_from_rows  # agno SqliteDb calls it on the run-object cache (src/mindroom/agent_storage.py)
+_enable_foreign_keys  # SQLAlchemy connect listener (src/mindroom/agent_storage.py)
+
+export_threads  # FastAPI endpoint (src/mindroom/api/thread_exports.py)
+
+# MCP SDK OAuthAuthorizationServerProvider callbacks invoked by SDK HTTP handlers.
+_.register_client
+_.load_authorization_code
+_.load_refresh_token
+_.exchange_authorization_code
+_.exchange_refresh_token
+_.revoke_token
+
+_.image_to_image  # FalTools registers this override as an image-editing tool (src/mindroom/custom_tools/fal.py)
+_.generate_media  # FalTools registers this override as a media-generation tool (src/mindroom/custom_tools/fal.py)
+_.download_file_from_sandbox  # E2BTools registers this override as a file-transfer tool (src/mindroom/custom_tools/e2b.py)
+_.upload_file  # E2BTools registers this override as a file-transfer tool (src/mindroom/custom_tools/e2b.py)
+_.download_chart_data  # E2BTools registers this override as a chart-export tool (src/mindroom/custom_tools/e2b.py)
+_.transcribe_audio  # OpenAITools and GroqTools register these file_access overrides (src/mindroom/tools/agno_compat_openai.py, src/mindroom/tools/agno_compat_groq.py)
+_.translate_audio  # GroqTools registers this file_access override (src/mindroom/tools/agno_compat_groq.py)
+_.extract_audio  # MoviePyVideoTools registers this file_access override (src/mindroom/custom_tools/agno_compat_moviepy.py)
+_.create_srt  # MoviePyVideoTools registers this file_access override (src/mindroom/custom_tools/agno_compat_moviepy.py)
+_.save_dag_file  # AirflowTools registers this file_access override (src/mindroom/tools/agno_compat_airflow.py)
+_.read_dag_file  # AirflowTools registers this file_access override (src/mindroom/tools/agno_compat_airflow.py)
+
+_collections_to_query  # Agno calls this hook to resolve the exact published read collection.
+
+response_activity  # FastAPI endpoint (src/mindroom/api/response_activity.py)
+detailed_response_activity  # FastAPI endpoint (src/mindroom/api/response_activity.py)
+
+icon_url  # ModelCatalogEntry optional Matrix wire field, accessed through JSON dictionary keys.
+
+_.controller_session_id  # serialized TypedDict field (src/mindroom/worker_computer/protocol.py)
+control  # FastAPI endpoint (src/mindroom/api/worker_computer.py)
+
+# Provider setup routes are invoked by FastAPI.
+get_provider_setup_status  # FastAPI endpoint
+connect_provider  # FastAPI endpoint
+
+# Computer routes are invoked by FastAPI; dataclass equality binds config identity.
+create_session  # FastAPI Computer endpoint
+session_status  # FastAPI Computer endpoint
+stream_ticket  # FastAPI Computer endpoint
+delete_session  # FastAPI Computer endpoint
+_.config_identity  # ComputerTarget dataclass equality field
+_.require_adoption_room_id  # Pydantic model validator for explicit personal-room adoption
+_.validate_additional_user_ids  # Pydantic field validator for imported room membership attestations
+
+# Agent CLI wire fields and Pydantic validators.
+_._validate_bounded_json  # Pydantic model validator
+
+_.current_protocol  # Pydantic field validator
+_.control_origins  # Pydantic field validator
+install_cli_runtime  # FastAPI worker route
+invoke_cli_shell  # FastAPI worker route
+
+_.embed_captions  # MoviePyVideoTools registers this caption-style override dynamically.
+# AgentQL and Agno invoke these owner-local overrides through inherited SDK methods.
+_.scrape_website
+_.custom_scrape_website
+_._execute_query
+_.membership_ts  # _SharedWith dataclass equality field (src/mindroom/matrix_rtc/frame_keys.py)

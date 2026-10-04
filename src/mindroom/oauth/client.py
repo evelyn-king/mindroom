@@ -10,12 +10,13 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
-from functools import partial, wraps
-from typing import TYPE_CHECKING, Any, NoReturn, Protocol
+from functools import partial
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from google.auth.exceptions import GoogleAuthError, RefreshError
 from google.auth.transport import requests as google_requests
 
+from mindroom.oauth.agno_compat_google_auth import AgnoGoogleAuthBindingMixin
 from mindroom.oauth.credential_lifecycle import (
     OAuthCredentialConflictError,
     OAuthCredentialContext,
@@ -53,7 +54,7 @@ if TYPE_CHECKING:
     from google.oauth2.credentials import Credentials as GoogleOAuthCredentials
     from structlog.stdlib import BoundLogger
 
-    from mindroom.config.auth import AuthorizationConfig
+    from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.credentials import CredentialsManager
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
@@ -74,21 +75,21 @@ def active_oauth_credential_context(
     credentials_manager: CredentialsManager,
     worker_target: ResolvedWorkerTarget | None,
     *,
-    authorization: AuthorizationConfig | None,
+    config: Config | None,
 ) -> OAuthCredentialContext:
     """Resolve OAuth storage from the active tool call and its configured fallback."""
     execution_identity = active_tool_execution_identity(None)
     if execution_identity is None and worker_target is not None:
         execution_identity = worker_target.execution_identity
     runtime_context = get_tool_runtime_context()
-    resolved_authorization = runtime_context.config.authorization if runtime_context is not None else authorization
+    resolved_config = runtime_context.current_config if runtime_context is not None else config
     return resolve_oauth_credential_context(
         provider,
         runtime_paths,
         credentials_manager,
         worker_target,
         execution_identity=execution_identity,
-        authorization=resolved_authorization,
+        config=resolved_config,
     )
 
 
@@ -140,14 +141,7 @@ class _OAuthClientThreadState(threading.local):
         self.entrypoint_depth = 0
 
 
-class _AuthDescriptor(Protocol):
-    """Descriptor contract for unbound tool auth methods."""
-
-    def __get__(self, instance: object, owner: type[object] | None = None) -> Callable[[], None]:
-        """Bind the auth method to one tool instance."""
-
-
-class ScopedOAuthClientMixin:
+class ScopedOAuthClientMixin(AgnoGoogleAuthBindingMixin):
     """Shared scoped credential loading and refresh logic for OAuth-backed tools."""
 
     _oauth_provider: OAuthProvider
@@ -156,14 +150,14 @@ class ScopedOAuthClientMixin:
     _runtime_paths: RuntimePaths
     _creds_manager: CredentialsManager
     _worker_target: ResolvedWorkerTarget | None
-    _authorization: AuthorizationConfig | None
+    _config: Config | None
     _provided_creds: bool
     _provided_credentials: GoogleOAuthCredentials | None
     _provided_credentials_lock: threading.RLock
     _oauth_quota_project_id: str | None
     _defer_to_original_auth: bool
     _original_auth_completed: bool
-    _original_auth: Callable[[], None]
+    _original_auth: Callable[[], Any]
     _oauth_call_state: _OAuthClientThreadState
     creds: Any | None
     service: Any | None
@@ -189,7 +183,7 @@ class ScopedOAuthClientMixin:
         self,
         *,
         worker_target: ResolvedWorkerTarget | None,
-        authorization: AuthorizationConfig | None,
+        config: Config | None,
         provided_creds: Any,  # noqa: ANN401
         logger: BoundLogger,
         defer_to_original_auth: bool = False,
@@ -197,7 +191,7 @@ class ScopedOAuthClientMixin:
     ) -> Any:  # noqa: ANN401
         """Prepare OAuth state and initial credentials for the tool."""
         self._worker_target = worker_target
-        self._authorization = authorization
+        self._config = config
         self._provided_creds = provided_creds is not None
         self._provided_credentials_lock = threading.RLock()
         self._oauth_quota_project_id = quota_project_id
@@ -215,31 +209,6 @@ class ScopedOAuthClientMixin:
             return None
         return self._load_stored_credentials()
 
-    def _set_original_auth(self, auth_method: _AuthDescriptor) -> None:
-        """Store the bound parent auth callable for fallback."""
-        self._original_auth = auth_method.__get__(self, type(self))
-
-    def _wrap_oauth_function_entrypoints(self) -> None:
-        """Return structured OAuth prompts from every registered toolkit function."""
-        for function in self.functions.values():
-            entrypoint = function.entrypoint
-            if entrypoint is None:
-                continue
-
-            @wraps(entrypoint)
-            def oauth_entrypoint(
-                *args: object,
-                _entrypoint: Callable[..., object] = entrypoint,
-                **kwargs: object,
-            ) -> object:
-                if self._provided_creds:
-                    with self._provided_credentials_lock:
-                        return self._run_oauth_entrypoint(_entrypoint, args, kwargs)
-                return self._run_oauth_entrypoint(_entrypoint, args, kwargs)
-
-            function.entrypoint = oauth_entrypoint
-            setattr(self, function.name, oauth_entrypoint)
-
     def _run_oauth_entrypoint(
         self,
         entrypoint: Callable[..., object],
@@ -247,6 +216,18 @@ class ScopedOAuthClientMixin:
         kwargs: dict[str, object],
     ) -> object:
         """Run one wrapped call while retaining its thread-local auth outcome."""
+        if self._provided_creds:
+            with self._provided_credentials_lock:
+                return self._run_oauth_entrypoint_with_scope(entrypoint, args, kwargs)
+        return self._run_oauth_entrypoint_with_scope(entrypoint, args, kwargs)
+
+    def _run_oauth_entrypoint_with_scope(
+        self,
+        entrypoint: Callable[..., object],
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> object:
+        """Apply owner-managed auth state to one serialized toolkit call."""
         with self._oauth_entrypoint_scope() as outermost:
             return self._run_scoped_oauth_entrypoint(entrypoint, args, kwargs, outermost=outermost)
 
@@ -398,7 +379,7 @@ class ScopedOAuthClientMixin:
             self._runtime_paths,
             self._creds_manager,
             self._worker_target,
-            authorization=self._authorization,
+            config=self._config,
         )
 
     def _connection_required(self, *, reason: str | None = None) -> OAuthConnectionRequired:
@@ -725,10 +706,10 @@ class ScopedOAuthClientMixin:
             self.creds = None
             self.service = None
             raise self._connection_required(reason=OAUTH_RESET_REQUIRED_REASON) from exc
-        except OAuthProviderError as exc:
+        except OAuthProviderError:
             self.creds = None
             self.service = None
-            raise self._connection_required() from exc
+            raise _SanitizedGoogleRefreshError(_SANITIZED_GOOGLE_REFRESH_ERROR_MESSAGE) from None
         if self._google_credential_key != revision:
             self.creds = None
             self.service = None
@@ -739,7 +720,7 @@ class ScopedOAuthClientMixin:
         if self._original_auth_completed and self.creds and self.creds.valid:
             return
         self.creds = None
-        self._original_auth()
+        self.creds = self._original_auth()
         self._original_auth_completed = True
 
     def _auth_with_stored_oauth(self) -> None:
@@ -794,8 +775,12 @@ class ScopedOAuthClientMixin:
             )
             raise self._connection_required() from exc
 
-    def _auth(self) -> None:
-        """Authenticate using the selected MindRoom or wrapped-tool credential source."""
+    def _authenticate(self) -> None:
+        """Authenticate using the selected MindRoom or wrapped-tool credential source.
+
+        Not named ``_auth``: Agno's Google toolkits store their ``AuthConfig`` on
+        ``self._auth``, and an instance attribute would shadow a mixin method.
+        """
         auth_source = self._select_auth_source()
         if auth_source in {_OAuthAuthSource.PROVIDED_CREDENTIALS, _OAuthAuthSource.VALID_CREDENTIALS}:
             return

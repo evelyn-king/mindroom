@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import ChainMap
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from html import escape as html_escape
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
+from uuid import NAMESPACE_URL, uuid5
 from weakref import WeakValueDictionary
 
 import nio
 from nio.exceptions import SendRetryError
 
 from mindroom import constants, interactive
-from mindroom.constants import DURABLE_FINAL_OUTCOME_KEY, DURABLE_FINAL_OUTCOME_VERSION, SKIP_MENTIONS_KEY
+from mindroom.constants import ACTING_REQUESTER_KEY, SKIP_MENTIONS_KEY
 from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
 from mindroom.event_journal import (
     MatrixDelivery,
@@ -25,6 +28,7 @@ from mindroom.event_journal import (
     replacement_target,
     thread_root,
 )
+from mindroom.event_journal.models import UnreadableMatrixDelivery
 from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.handled_turns import TurnRecord, TurnRecordCodec
 from mindroom.hooks import (
@@ -45,6 +49,7 @@ from mindroom.hooks import (
     emit_final_response_transform,
     emit_transform,
 )
+from mindroom.legacy_delivery_payloads import add_legacy_final_outcome_marker
 from mindroom.matrix.client_delivery import (
     DeliveredMatrixEvent,
     MatrixDeliveryFailure,
@@ -56,13 +61,16 @@ from mindroom.matrix.client_delivery import (
     resolve_room_encryption_outcome,
     send_message_outcome,
     send_message_result,
+    send_room_event_result,
 )
 from mindroom.matrix.large_messages import MatrixEventTooLargeError, prepare_large_message
 from mindroom.matrix.mentions import format_message_with_mentions
-from mindroom.matrix.message_builder import build_message_content
+from mindroom.matrix.message_builder import build_message_content, build_reaction_content
 from mindroom.matrix.room_history_reads import (
     find_outbox_delivery_event_id_via_room_messages,
+    missing_outbox_delivery_copy_indices_via_room_messages,
 )
+from mindroom.matrix.segmented_messages import segment_matrix_content
 from mindroom.matrix_delivery import (
     DeliveryStage,
     MatrixDeliveryWorker,
@@ -71,6 +79,9 @@ from mindroom.matrix_delivery import (
     SendDelivery,
     TurnHandoff,
 )
+from mindroom.requester_identity import is_access_checked_requester_id
+from mindroom.response_shutdown_diagnostics import ResponseShutdownPhase, response_shutdown_phase
+from mindroom.response_sources import ResponseAttempt, ResponseSources
 from mindroom.runtime_protocols import SupportsClientConfig  # noqa: TC001
 from mindroom.scheduled_run_records import record_silent_schedule_result_if_needed
 from mindroom.streaming import (
@@ -83,13 +94,18 @@ from mindroom.streaming import (
     cancel_failure_reason,
     cancel_source_from_failure_reason,
     classify_cancel_source,
+    current_task_is_process_shutdown,
+    format_stream_error_note,
     interactive_response_for_visible_body,
     send_streaming_response,
+    stream_progress_edits,
     strip_matching_visible_tool_markers,
 )
+from mindroom.turn_record import canonicalize_turn_record
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+    from contextlib import AbstractAsyncContextManager
 
     import structlog
 
@@ -103,7 +119,8 @@ if TYPE_CHECKING:
     )
     from mindroom.hooks import MessageEnvelope
     from mindroom.message_target import MessageTarget
-    from mindroom.streaming import StreamInputChunk
+    from mindroom.response_delivery_recovery import ResponseDeliveryRecovery
+    from mindroom.streaming import ProgressPublisher, StreamInputChunk, UnfinishedStreamedReply
     from mindroom.timing import DispatchPipelineTiming
     from mindroom.tool_system.events import ToolTraceEntry
 
@@ -116,6 +133,39 @@ _PLACEHOLDER_DELIVERY_FAILURE_REASONS = frozenset(
         "terminal_update_failed",
     },
 )
+_SEGMENT_PAYLOADS_RESULT_KEY = "io.mindroom.matrix_segment_payloads"
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedWirePayload:
+    """One frozen primary event plus any lossless continuation events."""
+
+    content: dict[str, Any]
+    continuation_payloads: tuple[dict[str, Any], ...] = ()
+
+
+def _result_with_segment_payloads(
+    result: dict[str, object] | None,
+    prepared: _PreparedWirePayload | MatrixDeliveryFailure,
+) -> dict[str, object] | None:
+    """Store continuation payloads in local outbox state, never on Matrix."""
+    if isinstance(prepared, MatrixDeliveryFailure) or not prepared.continuation_payloads:
+        return result
+    return {**(result or {}), _SEGMENT_PAYLOADS_RESULT_KEY: list(prepared.continuation_payloads)}
+
+
+def _continuation_payloads(result: Mapping[str, object] | None) -> tuple[dict[str, Any], ...]:
+    """Read the frozen continuation list from an outbox result, if present."""
+    if result is None:
+        return ()
+    raw_payloads = result.get(_SEGMENT_PAYLOADS_RESULT_KEY, [])
+    assert isinstance(raw_payloads, list), f"corrupt outbox result: {_SEGMENT_PAYLOADS_RESULT_KEY} is not a list"
+    return tuple(dict(cast("dict[str, Any]", payload)) for payload in raw_payloads)
+
+
+def _segment_transaction_id(base_transaction_id: str, index: int) -> str:
+    """Derive a stable Matrix transaction ID for one continuation event."""
+    return str(uuid5(NAMESPACE_URL, f"mindroom-matrix-segment:{base_transaction_id}:{index}"))
 
 
 def _is_placeholder_delivery_failure(failure_reason: str) -> bool:
@@ -140,6 +190,7 @@ class ResponseIdentity:
     response_kind: str
     response_envelope: MessageEnvelope
     correlation_id: str
+    sources: ResponseSources
     participating_agent_names: tuple[str, ...] = ()
 
 
@@ -178,6 +229,8 @@ class ResponseHookService:
         identity: ResponseIdentity,
         response_text: str,
     ) -> FinalResponseDraft:
+        if current_task_is_process_shutdown():
+            raise asyncio.CancelledError
         draft = FinalResponseDraft(
             response_text=response_text,
             response_kind=identity.response_kind,
@@ -189,11 +242,14 @@ class ResponseHookService:
             **self.hook_context.base_kwargs(EVENT_MESSAGE_FINAL_RESPONSE_TRANSFORM, identity.correlation_id),
             draft=draft,
         )
-        return await emit_final_response_transform(
+        draft = await emit_final_response_transform(
             self.hook_context.registry,
             EVENT_MESSAGE_FINAL_RESPONSE_TRANSFORM,
             context,
         )
+        if current_task_is_process_shutdown():
+            raise asyncio.CancelledError
+        return draft
 
     async def emit_after_response(  # noqa: D102
         self,
@@ -266,6 +322,7 @@ class SendTextRequest:  # noqa: D101
     delivery_stage: DeliveryStage = DeliveryStage.FINAL
     defer_source_handoff: bool = False
     delivery_result: dict[str, object] | None = None
+    response_attempt: ResponseAttempt | None = None
 
 
 @dataclass(frozen=True)
@@ -282,6 +339,7 @@ class EditTextRequest:  # noqa: D101
     delivery_turn_id: str | None = None
     defer_source_handoff: bool = False
     delivery_result: dict[str, object] | None = None
+    response_attempt: ResponseAttempt | None = None
 
 
 @dataclass(frozen=True)
@@ -295,6 +353,7 @@ class FinalDeliveryRequest:  # noqa: D101
     existing_event_is_placeholder: bool = False
     skip_mentions: bool = False
     defer_source_handoff: bool = False
+    prepared_edit_record: TurnRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -372,14 +431,18 @@ class StreamingDeliveryRequest:
     identity: ResponseIdentity
     existing_event_id: str | None = None
     adopt_existing_placeholder: bool = False
-    header: str | None = None
+    # What a stopped attempt at ``existing_event_id`` showed; the stream continues below it.
+    resumed: UnfinishedStreamedReply | None = None
     show_tool_calls: bool = False
     extra_content: dict[str, Any] | None = None
     tool_trace_collector: list[ToolTraceEntry] | None = None
     streaming_cls: type[StreamingResponse] = StreamingResponse
     pipeline_timing: DispatchPipelineTiming | None = None
     visible_event_id_callback: Callable[[str], None] | None = None
+    visible_progress_callback: Callable[[str], None] | None = None
     preserve_existing_visible_on_empty_terminal: bool = False
+    completed_edit_record: Callable[[], TurnRecord | None] | None = None
+    allow_new_terminal_message: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -413,7 +476,8 @@ class DeliveryGatewayDeps:
     # wrote is re-asserted through the ledger's own write ordering. Skipping
     # that leaves the row open to a mutation that derived before the commit and
     # lands after it, which erases the event the answer is stored under.
-    terminal_turn_committed: Callable[[str, str], Awaitable[None]] | None = None
+    terminal_turn_committed: Callable[[str, str, TurnRecord | None], Awaitable[None]] | None = None
+    response_recovery: ResponseDeliveryRecovery | None = None
 
 
 _MATRIX_DELIVERY_FAILURE_REASONS: dict[MatrixDeliveryFailureKind, str] = {
@@ -444,6 +508,10 @@ class FinalizeStreamedResponseRequest:
     extra_content: dict[str, Any] | None
     existing_event_id: str | None = None
     existing_event_is_placeholder: bool = False
+    prepared_edit_record: TurnRecord | None = None
+    # What a stopped attempt at ``existing_event_id`` showed, for a continuation
+    # that may end before streaming anything below it.
+    resumed: UnfinishedStreamedReply | None = None
 
 
 @dataclass(frozen=True)
@@ -465,6 +533,34 @@ class DeliveryGateway:
             msg = "Matrix client is not ready for response delivery"
             raise RuntimeError(msg)
         return client
+
+    async def send_judgment_reaction(
+        self,
+        *,
+        identity: ResponseIdentity,
+        room_id: str,
+        event_id: str,
+        key: str,
+        kind: Literal["participation_decline", "mid_turn_defer"],
+    ) -> None:
+        """Best-effort acknowledgement of a deliberate judgment, stable across replays."""
+        if not await self._visible_notice_is_current(identity, room_id):
+            return
+        client = self._client()
+        # Exclude the emoji so a config reload cannot duplicate a replayed reaction.
+        transaction_id = str(
+            uuid5(NAMESPACE_URL, json.dumps([f"mindroom-{kind.replace('_', '-')}", client.user_id, room_id, event_id])),
+        )
+        result = await send_room_event_result(
+            client,
+            room_id,
+            "m.reaction",
+            build_reaction_content(event_id, key),
+            transaction_id=transaction_id,
+            operation=f"{kind}_reaction",
+        )
+        if not isinstance(result, nio.RoomSendResponse):
+            self.deps.logger.warning("Judgment reaction failed", kind=kind, room_id=room_id, event_id=event_id)
 
     @staticmethod
     def _cancelled_error_failure_reason(error: asyncio.CancelledError) -> str:
@@ -600,7 +696,40 @@ class DeliveryGateway:
         self,
         request: _PlaceholderFailureUpdateRequest,
     ) -> FinalDeliveryOutcome:
-        """Best-effort terminal error edit for a visible placeholder."""
+        """Order fallback eligibility and transport with FINAL and INITIAL cleanup."""
+        turn_id = request.identity.response_envelope.source_event_id
+        worker = self._recovery_worker()
+        async with worker._delivery_lock(turn_id):
+            final = await self.deps.outbox.load_matrix_delivery(delivery_id=turn_id, stage=DeliveryStage.FINAL)
+            if final is not None and (
+                final.acknowledged_event_id is not None or not (final.retired or final.permanently_failed)
+            ):
+                return FinalDeliveryOutcome(
+                    terminal_status="suspended",
+                    event_id=None,
+                    failure_reason=request.failure_reason,
+                )
+            recovery = self.deps.response_recovery
+            if recovery is not None:
+                initial = await recovery.principal.load_matrix_delivery(
+                    delivery_id=turn_id,
+                    stage=DeliveryStage.INITIAL,
+                )
+                if initial is not None and recovery.deleted(await recovery.state(initial)):
+                    await recovery.cleanup(worker, turn_id)
+                    return FinalDeliveryOutcome(
+                        terminal_status="cancelled",
+                        event_id=None,
+                        suppressed=True,
+                        failure_reason="source_deleted",
+                    )
+            return await self._edit_placeholder_delivery_failure(request)
+
+    async def _edit_placeholder_delivery_failure(
+        self,
+        request: _PlaceholderFailureUpdateRequest,
+    ) -> FinalDeliveryOutcome:
+        """Apply the eligible direct fallback while its delivery lock remains held."""
         failure_extra_content = dict(request.extra_content or {})
         failure_extra_content[constants.STREAM_STATUS_KEY] = constants.STREAM_STATUS_ERROR
         edited = await self._visible_notice_is_current(
@@ -665,6 +794,7 @@ class DeliveryGateway:
                     extra_content=failure_extra_content,
                     retry_sync_recovery=True,
                     delivery_turn_id=turn_id,
+                    response_attempt=ResponseAttempt(self.deps.agent_name, request.identity.sources),
                     defer_source_handoff=request.defer_source_handoff,
                 ),
             )
@@ -697,6 +827,7 @@ class DeliveryGateway:
                 extra_content=failure_extra_content,
                 retry_sync_recovery=True,
                 delivery_turn_id=turn_id,
+                response_attempt=ResponseAttempt(self.deps.agent_name, request.identity.sources),
                 defer_source_handoff=request.defer_source_handoff,
             ),
         )
@@ -742,29 +873,61 @@ class DeliveryGateway:
         claimed: MatrixDelivery,
         *,
         retry_sync_recovery: bool,
+        operation: str = "send_message",
     ) -> DeliveredMatrixEvent:
-        """Send one claimed delivery exactly as it was frozen.
+        """Send one claimed delivery exactly as it was frozen, continuations included.
 
-        The payload comes from the row, never from whatever the caller happens
-        to be holding. A turn that ran twice sends what its first attempt
-        froze: content regenerated after a claim would go out under a
-        transaction ID the homeserver has already seen, be dropped as a
+        The payload is the stored envelope, not something rebuilt from the
+        request, and the transaction ID is the one the row already holds. A
+        retry that rebuilt either would let the homeserver accept the resend
+        as a new event instead of collapsing it onto the earlier one, mint a
         duplicate, and leave the durable result and the room disagreeing
-        forever.
+        forever. Continuations get deterministic transaction IDs derived from
+        the row's, so their retries collapse the same way.
         """
+        outcome = await self._send_frozen(
+            claimed,
+            dict(claimed.payload),
+            transaction_id=claimed.transaction_id,
+            what="delivery",
+            operation=operation,
+            retry_sync_recovery=retry_sync_recovery,
+        )
+        for index, continuation in enumerate(_continuation_payloads(claimed.result), start=1):
+            await self._send_frozen(
+                claimed,
+                continuation,
+                transaction_id=_segment_transaction_id(claimed.transaction_id, index),
+                what=f"continuation {index}",
+                retry_sync_recovery=retry_sync_recovery,
+            )
+        return outcome
+
+    async def _send_frozen(
+        self,
+        claimed: MatrixDelivery,
+        content: dict[str, Any],
+        *,
+        transaction_id: str,
+        what: str,
+        operation: str = "send_message",
+        retry_sync_recovery: bool,
+    ) -> DeliveredMatrixEvent:
+        """Send one frozen event of a claimed delivery, mapping refusals to exceptions."""
         outcome = await send_message_outcome(
             self._client(),
             claimed.room_id,
-            dict(claimed.payload),
+            content,
+            operation=operation,
             retry_sync_recovery=retry_sync_recovery,
-            transaction_id=claimed.transaction_id,
+            transaction_id=transaction_id,
             content_is_prepared=True,
         )
         if isinstance(outcome, MatrixDeliveryFailure):
             detail = _matrix_delivery_failure_reason(outcome)
             if outcome.kind is MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
                 raise PermanentDeliveryError(detail)
-            msg = f"Matrix refused delivery for turn {claimed.delivery_id!r} stage {claimed.stage.value!r}: {detail}"
+            msg = f"Matrix refused {what} for turn {claimed.delivery_id!r} stage {claimed.stage.value!r}: {detail}"
             raise _DeliveryRefusedError(msg)
         return outcome
 
@@ -858,20 +1021,127 @@ class DeliveryGateway:
             resolve_delivered=self._delivered_under_a_previous_device,
             handoff=handoff,
             terminal_turn_for=self._terminal_turn_write,
-            terminal_turn_committed=self.deps.terminal_turn_committed,
+            terminal_turn_committed=self._publish_terminal_turn,
+            process_shutdown_requested=current_task_is_process_shutdown,
             delivery_locks=self._delivery_turn_locks,
+            cleanup_deleted_initial=(
+                self.deps.response_recovery.cleanup if self.deps.response_recovery is not None else None
+            ),
         )
 
-    def _terminal_turn_write(self, turn_id: str, event_id: str) -> TerminalTurnWrite | None:
+    @asynccontextmanager
+    async def response_recovery_scope(self, room_id: str, event_id: str) -> AsyncIterator[bool]:
+        """Keep startup decision and visible effect under normal FINAL delivery ownership."""
+        recovery = self.deps.response_recovery
+        if recovery is None:
+            yield False
+            return
+        turn_id = await recovery.principal.response_delivery_id(room_id=room_id, event_id=event_id)
+        if turn_id is None:
+            yield False
+            return
+        worker = self._recovery_worker()
+        async with worker._delivery_lock(turn_id):
+            initial = await recovery.principal.load_matrix_delivery(delivery_id=turn_id, stage=DeliveryStage.INITIAL)
+            if (
+                initial is None
+                or initial.retired
+                or not await recovery.principal.owns_matrix_response(
+                    room_id=room_id,
+                    event_id=event_id,
+                )
+            ):
+                yield False
+                return
+            await recovery.cleanup(worker, turn_id)
+            yield await recovery.permits_continuation(initial)
+
+    def _recovery_worker(self) -> MatrixDeliveryWorker:
+        """Use the same writer and exact locks for recovery and normal delivery."""
+
+        async def send(claimed: MatrixDelivery) -> str:
+            delivered = await self._send_claimed(claimed, retry_sync_recovery=True)
+            return delivered.event_id
+
+        return self._response_delivery(send, handoff=None)
+
+    @asynccontextmanager
+    async def supersession_scope(self, turn_id: str, room_id: str) -> AsyncIterator[bool]:
+        """Keep existing INITIAL debt with canonical replay until it reaches FINAL."""
+        recovery = self.deps.response_recovery
+        if recovery is None:
+            yield True
+            return
+        async with self._recovery_worker()._delivery_lock(turn_id):
+            initial = await recovery.principal.load_matrix_delivery(
+                delivery_id=turn_id,
+                stage=DeliveryStage.INITIAL,
+            )
+            yield (
+                initial is None
+                or initial.room_id != room_id
+                or initial.retired
+                or initial.permanently_failed
+                or initial.membership_epoch != await recovery.principal.membership_epoch(room_id)
+                or await recovery.permits_supersession(initial)
+            )
+
+    async def cleanup_deleted_response(self, turn_id: str) -> bool:
+        """Suppress deleted-source notices while retaining retryable INITIAL cleanup debt."""
+        recovery = self.deps.response_recovery
+        if recovery is None:
+            return False
+        worker = self._recovery_worker()
+        async with worker._delivery_lock(turn_id):
+            initial = await recovery.principal.load_matrix_delivery(delivery_id=turn_id, stage=DeliveryStage.INITIAL)
+            if initial is None:
+                return recovery.turn_store().is_revision_redacted(turn_id)
+            if not recovery.deleted(await recovery.state(initial)):
+                return False
+            try:
+                await recovery.cleanup(worker, turn_id)
+            except Exception:
+                self.deps.logger.exception("Deleted response cleanup remains owed", delivery_id=turn_id)
+            return True
+
+    async def _publish_terminal_turn(self, turn_id: str, event_id: str, committed: TerminalTurnWrite | None) -> None:
+        """Publish the transaction's exact proof through the ledger's conflict owner."""
+        if self.deps.terminal_turn_committed is None:
+            return
+        record = (
+            None
+            if committed is None
+            else TurnRecordCodec._from_ledger_record(
+                committed.index_event_ids[0],
+                json.loads(committed.record_json),
+            )
+        )
+        await self.deps.terminal_turn_committed(turn_id, event_id, record)
+
+    def _terminal_turn_write(self, delivery: MatrixDelivery, event_id: str) -> TerminalTurnWrite | None:
         """Turn the terminal record for one delivered answer into a journal row.
 
         The turn store produces the record and stops at its own boundary; this
         layer already owns the journal's types, so the conversion belongs here
         rather than reaching across.
         """
-        if self.deps.terminal_turn_for is None:
-            return None
-        record = self.deps.terminal_turn_for(turn_id, event_id)
+        prepared = (delivery.result or {}).get("prepared_edit_record")
+        if prepared is not None:
+            assert isinstance(prepared, dict), "Corrupt prepared edit record"
+            prepared = cast("dict[str, object]", prepared)
+            sources = prepared.get("source_event_ids")
+            assert isinstance(sources, list), "Corrupt prepared edit sources"
+            assert sources, "Empty prepared edit sources"
+            assert isinstance(sources[0], str), "Corrupt prepared edit source"
+            record = TurnRecordCodec._from_ledger_record(sources[0], prepared)
+            assert record is not None, "Corrupt prepared edit record"
+            record = canonicalize_turn_record(record, response_event_id=event_id, completed=True)
+        else:
+            record = (
+                None
+                if self.deps.terminal_turn_for is None
+                else self.deps.terminal_turn_for(delivery.delivery_id, event_id)
+            )
         if record is None or record.anchor_event_id is None:
             return None
         return TerminalTurnWrite(
@@ -887,7 +1157,7 @@ class DeliveryGateway:
         response_sender = client.user_id
         if not response_sender:
             return None
-        return await find_outbox_delivery_event_id_via_room_messages(
+        event_id = await find_outbox_delivery_event_id_via_room_messages(
             client,
             claimed.room_id,
             delivery_sender=response_sender,
@@ -895,6 +1165,53 @@ class DeliveryGateway:
             delivery_content=claimed.payload,
             delivery_event_type=claimed.event_type,
         )
+        if event_id is not None:
+            await self._deliver_missing_continuations(claimed)
+        return event_id
+
+    async def _deliver_missing_continuations(self, claimed: MatrixDelivery) -> None:
+        """Send the continuation events an earlier device never got into the room.
+
+        Adopting a segmented delivery keys on the primary event alone, so a
+        crash between the primary and its continuations would acknowledge the
+        row with most of the answer never sent. Reconciliation counts copies
+        rather than checking existence: long homogeneous responses can repeat
+        a byte-identical continuation payload, and one observed event must not
+        satisfy several positions. Found copies are consumed as credits across
+        the expected positions, so exactly the missing ones are sent -- a
+        blind resend from this device would duplicate them, because
+        transaction IDs are scoped to the device that used them. A failed
+        lookup or send raises, leaving the row unacknowledged so the next
+        recovery pass resumes exactly here.
+        """
+        continuations = _continuation_payloads(claimed.result)
+        if not continuations:
+            return
+        client = self._client()
+        response_sender = client.user_id
+        assert response_sender, "continuation reconciliation requires a logged-in client"
+        missing_indices = await missing_outbox_delivery_copy_indices_via_room_messages(
+            client,
+            claimed.room_id,
+            delivery_sender=response_sender,
+            delivery_contents=continuations,
+            delivery_event_type=claimed.event_type,
+        )
+        for index in missing_indices:
+            await self._send_frozen(
+                claimed,
+                continuations[index],
+                transaction_id=_segment_transaction_id(claimed.transaction_id, index + 1),
+                what=f"continuation {index + 1}",
+                retry_sync_recovery=True,
+            )
+        if missing_indices:
+            self.deps.logger.info(
+                "Recovered segmented Matrix response continuations",
+                delivery_id=claimed.delivery_id,
+                stage=claimed.stage.value,
+                continuation_count=len(missing_indices),
+            )
 
     async def recover_deliveries(self) -> RecoveryOutcome:
         """Resend every delivery whose Matrix outcome this process cannot know.
@@ -911,12 +1228,30 @@ class DeliveryGateway:
         the returned outcome, which is how the caller knows to come back.
         Nothing escapes here.
         """
-
-        async def send(claimed: MatrixDelivery) -> str:
-            delivered = await self._send_claimed(claimed, retry_sync_recovery=True)
-            return delivered.event_id
-
-        return await self._response_delivery(send, handoff=None).recover()
+        worker = self._recovery_worker()
+        failed: set[tuple[str, DeliveryStage]] = set()
+        recovery = self.deps.response_recovery
+        if recovery is not None:
+            cursor: tuple[int, str] | None = None
+            while batch := await recovery.principal.deleted_initial_deliveries(
+                agent_name=self.deps.agent_name,
+                after=cursor,
+            ):
+                cursor = (batch[-1].created_at_ns, batch[-1].delivery_id)
+                for initial in batch:
+                    if isinstance(initial, UnreadableMatrixDelivery):
+                        failed.add((initial.delivery_id, DeliveryStage.INITIAL))
+                        self.deps.logger.error("Deleted INITIAL is unreadable", delivery_id=initial.delivery_id)
+                        continue
+                    try:
+                        async with worker._delivery_lock(initial.delivery_id):
+                            await recovery.cleanup(worker, initial.delivery_id)
+                    except Exception:
+                        failed.add((initial.delivery_id, DeliveryStage.INITIAL))
+                        self.deps.logger.exception("Deleted INITIAL cleanup failed", delivery_id=initial.delivery_id)
+        outcome = await worker.recover()
+        failed.update(outcome.failed_deliveries)
+        return RecoveryOutcome(recovered=outcome.recovered, failed=len(failed), failed_deliveries=frozenset(failed))
 
     async def _send_content(
         self,
@@ -961,6 +1296,8 @@ class DeliveryGateway:
             content,
             turn_id=request.delivery_turn_id,
             stage=request.delivery_stage,
+            continuation_thread_id=request.target.resolved_thread_id,
+            continuation_reply_to_event_id=request.target.reply_to_event_id,
         )
         if isinstance(prepared, MatrixDeliveryFailure):
             if prepared.kind is not MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
@@ -968,7 +1305,8 @@ class DeliveryGateway:
             preparation_failure: MatrixDeliveryFailure | None = prepared
         else:
             preparation_failure = None
-            content = prepared
+            content = prepared.content
+        delivery_result = _result_with_segment_payloads(request.delivery_result, prepared)
 
         try:
             handoff = None if request.defer_source_handoff else self.deps.turn_handoff
@@ -978,7 +1316,8 @@ class DeliveryGateway:
                 room_id=room_id,
                 thread_id=request.target.resolved_thread_id,
                 payload=content,
-                result=request.delivery_result,
+                result=delivery_result,
+                response_attempt=request.response_attempt,
                 permanent_failure_reason=(
                     _matrix_delivery_failure_reason(preparation_failure) if preparation_failure is not None else None
                 ),
@@ -1091,23 +1430,12 @@ class DeliveryGateway:
             # attempt landed, visible while the durable row says otherwise if it did
             # not. The stored envelope already is what that helper would build.
             nonlocal delivered
-            outcome = await send_message_outcome(
-                client,
-                claimed.room_id,
-                dict(claimed.payload),
-                operation="edit_message",
+            delivered = await self._send_claimed(
+                claimed,
                 retry_sync_recovery=request.retry_sync_recovery,
-                transaction_id=claimed.transaction_id,
-                content_is_prepared=True,
+                operation="edit_message",
             )
-            if isinstance(outcome, MatrixDeliveryFailure):
-                detail = _matrix_delivery_failure_reason(outcome)
-                if outcome.kind is MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
-                    raise PermanentDeliveryError(detail)
-                msg = f"Matrix refused the final edit for turn {claimed.delivery_id!r}: {detail}"
-                raise _DeliveryRefusedError(msg)
-            delivered = outcome
-            return outcome.event_id
+            return delivered.event_id
 
         # What is stored is the finished wire event, not the text it was built
         # from. Recovery sends the row exactly as frozen and has no request to
@@ -1132,6 +1460,8 @@ class DeliveryGateway:
             envelope,
             turn_id=request.delivery_turn_id,
             stage=DeliveryStage.FINAL,
+            continuation_thread_id=request.target.resolved_thread_id,
+            continuation_reply_to_event_id=request.event_id,
         )
         if isinstance(prepared, MatrixDeliveryFailure):
             if prepared.kind is not MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
@@ -1139,7 +1469,8 @@ class DeliveryGateway:
             preparation_failure = prepared
         else:
             preparation_failure = None
-            envelope = prepared
+            envelope = prepared.content
+        delivery_result = _result_with_segment_payloads(request.delivery_result, prepared)
 
         try:
             handoff = None if request.defer_source_handoff else self.deps.turn_handoff
@@ -1149,7 +1480,8 @@ class DeliveryGateway:
                 room_id=room_id,
                 thread_id=request.target.resolved_thread_id,
                 payload=envelope,
-                result=request.delivery_result,
+                result=delivery_result,
+                response_attempt=request.response_attempt,
                 edits_event_id=request.event_id,
                 permanent_failure_reason=(
                     _matrix_delivery_failure_reason(preparation_failure) if preparation_failure is not None else None
@@ -1201,7 +1533,15 @@ class DeliveryGateway:
         )
         return False
 
-    async def deliver_final(  # noqa: C901, PLR0911, PLR0912
+    async def deliver_final(
+        self,
+        request: FinalDeliveryRequest,
+    ) -> FinalDeliveryOutcome:
+        """Run final delivery under the fixed shutdown diagnostic boundary."""
+        with response_shutdown_phase(ResponseShutdownPhase.FINAL_DELIVERY):
+            return await self._deliver_final(request)
+
+    async def _deliver_final(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self,
         request: FinalDeliveryRequest,
     ) -> FinalDeliveryOutcome:
@@ -1216,6 +1556,8 @@ class DeliveryGateway:
         except asyncio.CancelledError as error:
             failure_reason = self._cancelled_error_failure_reason(error)
             cancel_source = classify_cancel_source(error)
+            if current_task_is_process_shutdown():
+                raise
             if request.existing_event_id is not None and request.existing_event_is_placeholder:
                 cleanup_failure = await self._redact_visible_response_event(
                     room_id=request.target.room_id,
@@ -1355,7 +1697,7 @@ class DeliveryGateway:
 
         interactive_response = interactive.parse_and_format_interactive(draft.response_text, extract_mapping=True)
         display_text = interactive_response.formatted_text
-        delivery_extra_content = dict(draft.extra_content or {})
+        delivery_extra_content = dict(draft.extra_content or {}) | self._acting_requester_content(request.identity)
         if interactive_response.interactive_metadata is not None:
             delivery_extra_content.update(
                 interactive.build_prompt_content(
@@ -1365,18 +1707,20 @@ class DeliveryGateway:
                 ),
             )
         delivery_result: dict[str, object] | None = None
+        if request.prepared_edit_record is not None:
+            delivery_result = {"prepared_edit_record": TurnRecordCodec._to_ledger_record(request.prepared_edit_record)}
         if request.defer_source_handoff:
             metadata = interactive_response.interactive_metadata
-            # Older readers recognize any mapping here as a successful FINAL.
-            # Keep that rolling-read signal bounded; the complete result is
-            # local outbox state and cannot make the Matrix event impossible.
-            delivery_extra_content[DURABLE_FINAL_OUTCOME_KEY] = {"version": DURABLE_FINAL_OUTCOME_VERSION}
+            add_legacy_final_outcome_marker(delivery_extra_content)
             delivery_result = {
+                **(delivery_result or {}),
                 "body": display_text,
                 "interactive": metadata.to_metadata() if metadata is not None else None,
             }
 
         if request.existing_event_id is not None:
+            # The answer replaces an earlier visible message, so mark it finished as a streamed final does.
+            delivery_extra_content[constants.STREAM_STATUS_KEY] = constants.STREAM_STATUS_COMPLETED
             edited = await self.edit_text(
                 EditTextRequest(
                     target=request.target,
@@ -1385,6 +1729,7 @@ class DeliveryGateway:
                     tool_trace=draft.tool_trace,
                     extra_content=delivery_extra_content,
                     delivery_turn_id=request.identity.response_envelope.source_event_id,
+                    response_attempt=ResponseAttempt(self.deps.agent_name, request.identity.sources),
                     retry_sync_recovery=True,
                     defer_source_handoff=request.defer_source_handoff,
                     delivery_result=delivery_result,
@@ -1433,6 +1778,7 @@ class DeliveryGateway:
                 # ledger already keys on it, and it re-derives to the same
                 # value after a restart, which a generated ID would not.
                 delivery_turn_id=request.identity.response_envelope.source_event_id,
+                response_attempt=ResponseAttempt(self.deps.agent_name, request.identity.sources),
                 defer_source_handoff=request.defer_source_handoff,
                 delivery_result=delivery_result,
             ),
@@ -1464,6 +1810,14 @@ class DeliveryGateway:
         cancelled_text, stream_status = build_cancelled_response_update("", cancel_source=request.cancel_source)
         extra_content = {constants.STREAM_STATUS_KEY: stream_status}
         failure_reason = cancel_failure_reason(request.cancel_source)
+        if current_task_is_process_shutdown():
+            return FinalDeliveryOutcome(
+                terminal_status="cancelled",
+                event_id=request.event_id,
+                cancel_source=request.cancel_source,
+                failure_reason=failure_reason,
+                extra_content=extra_content,
+            )
         # A cancellation note is transport, not a turn's answer, so it never
         # reaches the outbox and nothing else would keep it out of a room this
         # bot has left.
@@ -1522,6 +1876,25 @@ class DeliveryGateway:
             failure_reason=failure_reason,
             extra_content=extra_content,
         )
+
+    @asynccontextmanager
+    async def user_stop_scope(self, event_id: str) -> AsyncIterator[str | None]:
+        """Order STOP intent and delivery with cleanup, yielding exact removed-response proof."""
+        recovery = self.deps.response_recovery
+        turn_id = None if recovery is None else await recovery.principal.initial_response_delivery_id(event_id)
+        if recovery is None or turn_id is None:
+            yield None
+            return
+        async with self._recovery_worker()._delivery_lock(turn_id):
+            initial = await recovery.principal.load_matrix_delivery(delivery_id=turn_id, stage=DeliveryStage.INITIAL)
+            yield (
+                turn_id
+                if initial is not None
+                and initial.acknowledged_event_id == event_id
+                and initial.retired
+                and recovery.deleted(await recovery.state(initial))
+                else None
+            )
 
     async def finalize_user_stopped_response(self, target: MessageTarget, event_id: str) -> bool:
         """Edit a recovered in-flight response into its terminal user-stop state."""
@@ -1674,6 +2047,21 @@ class DeliveryGateway:
         self,
         request: StreamingDeliveryRequest,
     ) -> StreamTransportOutcome:
+        """Run streaming transport under the fixed shutdown diagnostic boundary."""
+        with response_shutdown_phase(ResponseShutdownPhase.STREAMING_RESPONSE):
+            return await self._deliver_stream(request)
+
+    def _acting_requester_content(self, identity: ResponseIdentity) -> dict[str, str]:
+        """Name a human or bot-account requester on the reply, so entities it mentions act for that requester."""
+        requester_id = identity.response_envelope.requester_id
+        if not is_access_checked_requester_id(requester_id, self.deps.runtime.config, self.deps.runtime_paths):
+            return {}
+        return {ACTING_REQUESTER_KEY: requester_id}
+
+    async def _deliver_stream(
+        self,
+        request: StreamingDeliveryRequest,
+    ) -> StreamTransportOutcome:
         """Send one streaming Matrix response."""
         client = self._client()
         config = self.deps.runtime.config
@@ -1694,25 +2082,67 @@ class DeliveryGateway:
             self.deps.runtime_paths,
             request.response_stream,
             streaming_cls=request.streaming_cls,
-            header=request.header,
             show_tool_calls=request.show_tool_calls,
             existing_event_id=request.existing_event_id,
             adopt_existing_placeholder=request.adopt_existing_placeholder,
-            extra_content=request.extra_content,
+            # A live view, because the caller keeps adding run metadata to its dict while the stream runs.
+            extra_content=ChainMap(
+                self._acting_requester_content(request.identity),
+                request.extra_content if request.extra_content is not None else {},
+            ),
             tool_trace_collector=request.tool_trace_collector,
             pipeline_timing=request.pipeline_timing,
             visible_event_id_callback=request.visible_event_id_callback,
+            visible_progress_callback=request.visible_progress_callback,
             latest_thread_event_id=latest_thread_event_id,
             preserve_existing_visible_on_empty_terminal=(
                 request.preserve_existing_visible_on_empty_terminal
                 or (request.existing_event_id is not None and not request.adopt_existing_placeholder)
             ),
-            terminal_edit=self._durable_terminal_edit(delivery_turn_id, request.target),
-            terminal_send=self._durable_terminal_send(delivery_turn_id, request.target),
+            terminal_edit=self._durable_terminal_edit(
+                delivery_turn_id,
+                request.target,
+                ResponseAttempt(self.deps.agent_name, request.identity.sources),
+                request.completed_edit_record,
+            ),
+            terminal_send=self._durable_terminal_send(
+                delivery_turn_id,
+                request.target,
+                ResponseAttempt(self.deps.agent_name, request.identity.sources),
+                request.completed_edit_record,
+            ),
             final_text_transform=self._final_text_transform(request.identity),
             transport_is_current=self._stream_transport_gate(delivery_turn_id, request.target.room_id),
             interactive_creator_agent=self.deps.agent_name,
             interactive_source_event_id=delivery_turn_id,
+            allow_new_terminal_message=request.allow_new_terminal_message,
+            resumed=request.resumed,
+        )
+
+    def stream_progress(
+        self,
+        *,
+        target: MessageTarget,
+        event_id: str,
+        identity: ResponseIdentity,
+        show_tool_calls: bool,
+        extra_content: dict[str, Any] | None = None,
+        visible_progress_callback: Callable[[str], None] | None = None,
+    ) -> AbstractAsyncContextManager[ProgressPublisher]:
+        """Stream live progress into an existing reply whose terminal delivery the caller owns."""
+        return stream_progress_edits(
+            self._client(),
+            target,
+            self.deps.runtime.config,
+            self.deps.runtime_paths,
+            event_id=event_id,
+            show_tool_calls=show_tool_calls,
+            extra_content=extra_content,
+            visible_progress_callback=visible_progress_callback,
+            transport_is_current=self._stream_transport_gate(
+                identity.response_envelope.source_event_id,
+                target.room_id,
+            ),
         )
 
     def _stream_transport_gate(
@@ -1733,7 +2163,13 @@ class DeliveryGateway:
 
         return transport_is_current
 
-    def _durable_terminal_send(self, turn_id: str, target: MessageTarget) -> TerminalSend:
+    def _durable_terminal_send(
+        self,
+        turn_id: str,
+        target: MessageTarget,
+        response_attempt: ResponseAttempt,
+        completed_edit_record: Callable[[], TurnRecord | None] | None = None,
+    ) -> TerminalSend:
         """Return a sender that records a stream's terminal *send* before making it.
 
         A stream normally edits a placeholder, but there is not always one to
@@ -1767,8 +2203,10 @@ class DeliveryGateway:
                 SendTextRequest(
                     target=target,
                     response_text="",
+                    delivery_result=self._prepared_edit_result(completed_edit_record, content),
                     retry_sync_recovery=retry_sync_recovery,
                     delivery_turn_id=turn_id,
+                    response_attempt=response_attempt,
                     delivery_stage=DeliveryStage.FINAL,
                 ),
                 target.room_id,
@@ -1785,7 +2223,9 @@ class DeliveryGateway:
         *,
         turn_id: str,
         stage: DeliveryStage,
-    ) -> dict[str, Any] | MatrixDeliveryFailure:
+        continuation_thread_id: str | None = None,
+        continuation_reply_to_event_id: str | None = None,
+    ) -> _PreparedWirePayload | MatrixDeliveryFailure:
         """Prepare a payload for the wire, unless a frozen one already exists.
 
         Preparation can upload a sidecar, so it must not run for a turn whose
@@ -1802,7 +2242,7 @@ class DeliveryGateway:
         """
         existing = await self.deps.outbox.load_matrix_delivery(delivery_id=turn_id, stage=stage)
         if existing is not None and existing.attempted:
-            return content
+            return _PreparedWirePayload(content=content)
         client = self._client()
         encryption_outcome = await resolve_room_encryption_outcome(
             client,
@@ -1817,14 +2257,34 @@ class DeliveryGateway:
             stage,
             content,
         )
+        segmented = (
+            segment_matrix_content(
+                wire_content,
+                room_encrypted=encryption_outcome,
+                continuation_thread_id=continuation_thread_id,
+                continuation_reply_to_event_id=continuation_reply_to_event_id,
+            )
+            if self.deps.runtime.config.defaults.large_message_strategy == "split"
+            else None
+        )
+        if segmented is not None:
+            # Segments already carry the durable identity copied from wire_content.
+            self.deps.logger.info(
+                "Prepared lossless Matrix response segmentation",
+                delivery_id=turn_id,
+                stage=stage.value,
+                continuation_count=len(segmented.continuations),
+            )
+            return _PreparedWirePayload(content=segmented.first, continuation_payloads=segmented.continuations)
         try:
-            return await prepare_large_message(
+            prepared = await prepare_large_message(
                 client,
                 room_id,
                 wire_content,
                 room_encrypted=encryption_outcome,
                 prepare_for_encrypted_delivery=True,
             )
+            return _PreparedWirePayload(content=prepared)
         except MatrixEventTooLargeError as error:
             return MatrixDeliveryFailure(MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE, str(error))
 
@@ -1845,7 +2305,26 @@ class DeliveryGateway:
 
         return transform
 
-    def _durable_terminal_edit(self, turn_id: str, target: MessageTarget) -> TerminalEdit:
+    @staticmethod
+    def _prepared_edit_result(
+        completed_record: Callable[[], TurnRecord | None] | None,
+        content: dict[str, Any],
+    ) -> dict[str, object] | None:
+        """Only a completed stream may attach its selected edit snapshot."""
+        if completed_record is None or content.get(constants.STREAM_STATUS_KEY) != constants.STREAM_STATUS_COMPLETED:
+            return None
+        record = completed_record()
+        if record is None:
+            return None
+        return {"prepared_edit_record": TurnRecordCodec._to_ledger_record(record)}
+
+    def _durable_terminal_edit(
+        self,
+        turn_id: str,
+        target: MessageTarget,
+        response_attempt: ResponseAttempt,
+        completed_edit_record: Callable[[], TurnRecord | None] | None = None,
+    ) -> TerminalEdit:
         """Return a sender that records a stream's terminal edit before making it.
 
         Nothing extra is sent. The edit the stream was going to make anyway is
@@ -1883,8 +2362,10 @@ class DeliveryGateway:
                     target=target,
                     event_id=event_id,
                     new_text=display_text,
+                    delivery_result=self._prepared_edit_result(completed_edit_record, content),
                     retry_sync_recovery=retry_sync_recovery,
                     delivery_turn_id=turn_id,
+                    response_attempt=response_attempt,
                 ),
                 target.room_id,
                 content,
@@ -1932,17 +2413,96 @@ class DeliveryGateway:
             extra_content=request.extra_content,
         )
 
-    async def finalize_streamed_response(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    async def _end_resumed_reply_before_continuation(
+        self,
+        request: FinalizeStreamedResponseRequest,
+        *,
+        event_id: str,
+        resumed: UnfinishedStreamedReply,
+    ) -> FinalDeliveryOutcome:
+        """Put the terminal note below a stopped attempt whose continuation ended before streaming anything.
+
+        The reply still shows that attempt as in progress, so leaving it
+        untouched would leave it looking unfinished.
+        """
+        stream_outcome = request.stream_transport_outcome
+        failure_reason = stream_outcome.failure_reason or "interrupted"
+        cancel_source = None
+        if stream_outcome.terminal_status == "cancelled":
+            cancel_source = cancel_source_from_failure_reason(failure_reason)
+            terminal_text, stream_status = build_cancelled_response_update(
+                resumed.visible_text,
+                cancel_source=cancel_source,
+            )
+        else:
+            terminal_text = f"{resumed.visible_text.rstrip()}\n\n{format_stream_error_note(failure_reason)}"
+            stream_status = constants.STREAM_STATUS_ERROR
+        extra_content = {**(request.extra_content or {}), constants.STREAM_STATUS_KEY: stream_status}
+        tool_trace = list(resumed.tool_trace)
+        edited = await self._visible_notice_is_current(
+            request.identity,
+            request.target.room_id,
+        ) and await self.edit_text(
+            EditTextRequest(
+                target=request.target,
+                event_id=event_id,
+                new_text=terminal_text,
+                tool_trace=tool_trace,
+                extra_content=extra_content,
+            ),
+        )
+        return FinalDeliveryOutcome(
+            terminal_status=stream_outcome.terminal_status,
+            event_id=event_id,
+            is_visible_response=True,
+            final_visible_body=terminal_text if edited else None,
+            delivery_kind="edited" if edited else None,
+            cancel_source=cancel_source,
+            failure_reason=failure_reason,
+            tool_trace=tuple(tool_trace),
+            extra_content=extra_content,
+        )
+
+    async def finalize_streamed_response(
+        self,
+        request: FinalizeStreamedResponseRequest,
+    ) -> FinalDeliveryOutcome:
+        """Run streamed finalization under the fixed shutdown diagnostic boundary."""
+        with response_shutdown_phase(ResponseShutdownPhase.FINAL_DELIVERY):
+            return await self._finalize_streamed_response(request)
+
+    async def _finalize_streamed_response(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self,
         request: FinalizeStreamedResponseRequest,
     ) -> FinalDeliveryOutcome:
         """Apply hooks and any final edit needed after streamed delivery completes."""
         stream_outcome = request.stream_transport_outcome
+        if current_task_is_process_shutdown() and stream_outcome.terminal_status == "cancelled":
+            failure_reason = stream_outcome.failure_reason or "interrupted"
+            return FinalDeliveryOutcome(
+                terminal_status="cancelled",
+                event_id=stream_outcome.last_physical_stream_event_id or request.existing_event_id,
+                cancel_source=cancel_source_from_failure_reason(failure_reason),
+                failure_reason=failure_reason,
+                tool_trace=tuple(request.tool_trace or ()),
+                extra_content=request.extra_content,
+            )
         try:
             streamed_event_id = stream_outcome.last_physical_stream_event_id
             visible_stream_event_id = stream_outcome.visible_event_id
             streamed_text = stream_outcome.visible_body_text
             final_body_candidate = stream_outcome.canonical_final_body_candidate or streamed_text
+            if (
+                request.resumed is not None
+                and request.existing_event_id is not None
+                and stream_outcome.terminal_status in {"cancelled", "error"}
+                and stream_outcome.visible_body_state == "none"
+            ):
+                return await self._end_resumed_reply_before_continuation(
+                    request,
+                    event_id=request.existing_event_id,
+                    resumed=request.resumed,
+                )
             if stream_outcome.terminal_status == "cancelled":
                 failure_reason = stream_outcome.failure_reason or "stream_finalize_cancelled"
                 cancel_source = cancel_source_from_failure_reason(failure_reason)
@@ -2083,6 +2643,7 @@ class DeliveryGateway:
                         existing_event_id=existing_event_id,
                         existing_event_is_placeholder=existing_event_is_placeholder,
                         response_text=stream_outcome.canonical_final_body_candidate,
+                        prepared_edit_record=request.prepared_edit_record,
                         identity=request.identity,
                         tool_trace=request.tool_trace,
                         extra_content=request.extra_content,

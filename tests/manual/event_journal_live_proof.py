@@ -45,7 +45,7 @@ from mindroom.event_journal import (
     EventKind,
 )
 from mindroom.matrix.conversation_hydration import ConversationHydrator
-from mindroom.matrix.journal_ingress import inbound_event, projected_event
+from mindroom.matrix.journal_ingress import _inbound_event, _projected_event
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -347,7 +347,7 @@ async def prove_edit_redaction(
 
     request = next(r for r in page.refresh_pending if r.logical_event_id == original)
     installed = await hydrator.refresh(request)
-    findings.record("the point refetch installs a server revision", installed)
+    findings.record("the point refetch installs a server revision", bool(installed))
 
     page = await store.read_conversation(room_id=room_id, thread_id=None, limit=50)
     bodies = [str(message.content.get("body")) for message in page.messages]
@@ -576,8 +576,8 @@ async def _admit_from_server(
     event = fetched.event
     kind = EventKind.REDACTION if isinstance(event, nio.RedactionEvent) else EventKind.MESSAGE
     await store.admit(
-        inbound_event(room_id, event, kind, EventClass.ACTIONABLE),
-        projected_event(room_id, event, kind, self_sender=client.user_id),
+        _inbound_event(room_id, event, kind, EventClass.ACTIONABLE),
+        _projected_event(room_id, event, kind, self_sender=client.user_id),
     )
     await store.settle(event_id)
 

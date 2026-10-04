@@ -13,6 +13,7 @@ import pytest
 from mindroom.config.main import Config
 from mindroom.constants import (
     COMPACTION_NOTICE_CONTENT_KEY,
+    SKILL_REVIEW_NOTICE_CONTENT_KEY,
     STREAM_STATUS_CANCELLED,
     STREAM_STATUS_COMPLETED,
     STREAM_STATUS_ERROR,
@@ -48,6 +49,7 @@ from mindroom.streaming import (
 from tests.conftest import (
     bind_runtime_paths,
     delivered_matrix_event,
+    push_stream_chunk,
     runtime_paths_for,
     test_runtime_paths,
 )
@@ -61,7 +63,7 @@ def _make_config() -> Config:
     config = Config.model_validate(
         {
             "agents": {"helper": {"display_name": "Helper", "role": "test"}},
-            "models": {"default": {"provider": "openai", "id": "gpt-4"}},
+            "models": {"default": {"provider": "openai", "id": "gpt-6-astra"}},
         },
     )
     return bind_runtime_paths(config, test_runtime_paths(Path(tempfile.mkdtemp())))
@@ -255,6 +257,30 @@ class TestClassifyPartialReply:
             is None
         )
 
+    @pytest.mark.parametrize("body", ["Finished text [cancelled]", "Finished text [error]"])
+    @pytest.mark.parametrize(
+        ("stream_status", "expected"),
+        [
+            (STREAM_STATUS_COMPLETED, None),
+            (STREAM_STATUS_PENDING, _PartialReplyKind.IN_PROGRESS),
+            (STREAM_STATUS_STREAMING, _PartialReplyKind.IN_PROGRESS),
+        ],
+    )
+    def test_recognized_stream_status_wins_over_legacy_terminal_suffix(
+        self,
+        body: str,
+        stream_status: str,
+        expected: _PartialReplyKind | None,
+    ) -> None:
+        """Honor current metadata when an old terminal suffix contradicts it."""
+        assert (
+            _classify_partial_reply(
+                _make_visible_message(event_id="e_active", body=body, stream_status=stream_status),
+                active_event_ids={"e_active"},
+            )
+            is expected
+        )
+
     def test_trailing_marker_without_metadata_is_not_partial(self) -> None:
         """Messages without stream_status metadata are not classified as partial."""
         assert (
@@ -419,6 +445,12 @@ class TestUnseenMessagesPartialReplies:
                     sender=agent_id,
                     body="Compacting...",
                     content={COMPACTION_NOTICE_CONTENT_KEY: True},
+                ),
+                _make_visible_message(
+                    event_id="e1b",
+                    sender=agent_id,
+                    body="💾 Skill review: created `deploy-checks`",
+                    content={SKILL_REVIEW_NOTICE_CONTENT_KEY: {"changes": {"deploy-checks": "created"}}},
                 ),
                 _make_visible_message(
                     event_id="e2",
@@ -704,7 +736,7 @@ class TestStreamingFinalizeStatuses:
                 runtime_paths=runtime_paths,
             )
 
-            await streaming.update_content("Partial answer", client)
+            await push_stream_chunk(streaming, "Partial answer", client)
             await streaming.finalize(client)
 
         initial_content = mock_send_message.await_args.args[2]
@@ -732,7 +764,7 @@ class TestStreamingFinalizeStatuses:
                 runtime_paths=runtime_paths,
             )
 
-            await streaming.update_content("Partial answer", client)
+            await push_stream_chunk(streaming, "Partial answer", client)
             await streaming.finalize(client, cancelled=True)
 
         final_content = mock_edit_message.await_args.args[3]
@@ -758,7 +790,7 @@ class TestStreamingFinalizeStatuses:
                 runtime_paths=runtime_paths,
             )
 
-            await streaming.update_content("Partial answer", client)
+            await push_stream_chunk(streaming, "Partial answer", client)
             await streaming.finalize(client, error=RuntimeError("boom"))
 
         final_content = mock_edit_message.await_args.args[3]
@@ -784,7 +816,7 @@ class TestStreamingFinalizeStatuses:
                 runtime_paths=runtime_paths,
             )
 
-            await streaming.update_content("Partial answer", client)
+            await push_stream_chunk(streaming, "Partial answer", client)
             await streaming.finalize(client, cancelled=True)
 
         assert mock_edit_message.await_count == 2
@@ -811,7 +843,7 @@ class TestStreamingFinalizeStatuses:
                 runtime_paths=runtime_paths,
             )
 
-            await streaming.update_content("Partial answer", client)
+            await push_stream_chunk(streaming, "Partial answer", client)
             await streaming.finalize(client, cancelled=True)
 
         assert mock_edit_message.await_count == 2

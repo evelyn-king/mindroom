@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextvars import Context
+from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,8 +13,8 @@ import pytest
 from agno.agent import Agent as AgnoAgent
 from agno.db.sqlite import SqliteDb
 from agno.media import File
+from agno.metrics import RunMetrics
 from agno.models.message import Message
-from agno.models.metrics import Metrics
 from agno.models.response import ModelResponse, ToolExecution
 from agno.models.vertexai.claude import Claude as VertexAIClaude
 from agno.run.agent import (
@@ -34,17 +35,21 @@ from structlog.testing import capture_logs
 
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
 from mindroom.ai import (
-    _collect_streamed_response_content,
     _compose_current_turn_prompt,
     _prepare_agent_and_prompt,
-    _run_error_event_text,
     _stream_completed_without_visible_output,
     _StreamingAttemptState,
+    _track_model_request_metrics,
     ai_response,
     build_matrix_run_metadata,
+    collect_streamed_response_content,
     stream_agent_response,
 )
-from mindroom.ai_run_metadata import _serialize_metrics, build_ai_run_metadata_content
+from mindroom.ai_run_metadata import (
+    _serialize_metrics,
+    build_ai_run_metadata_content,
+    build_model_request_metrics_fallback,
+)
 from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
@@ -56,9 +61,10 @@ from mindroom.constants import (
     MATRIX_SOURCE_EVENT_IDS_METADATA_KEY,
     MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY,
     MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY,
+    RuntimePaths,
 )
 from mindroom.dynamic_tool_continuation import DYNAMIC_TOOL_CONTINUATION_LIMIT
-from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE
+from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE, run_error_event_text
 from mindroom.execution_preparation import _PreparedExecutionContext
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import PreparedHistoryState
@@ -73,11 +79,13 @@ from mindroom.response_runner import (
     _paused_with_committed_presentation,
     prepare_memory_and_model_context,
 )
-from mindroom.response_turn import PausedAttempt, ResponsePausedForApproval
+from mindroom.response_turn import CompletedAttempt, PausedAttempt, ResponsePausedForApproval
 from mindroom.synthetic_model import SyntheticModel
 from mindroom.tool_system.events import CollectedStreamPresentation
 from mindroom.tool_system.runtime_context import (
     LiveToolDispatchContext,
+    ToolRuntimeContext,
+    ToolRuntimeModelBinding,
     get_tool_runtime_context,
     tool_runtime_context,
 )
@@ -118,9 +126,69 @@ if TYPE_CHECKING:
     from mindroom.final_delivery import StreamTransportOutcome
 
 
+def _model_runtime_context(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    *,
+    active_model_name: str,
+) -> ToolRuntimeContext:
+    """Build an ambient tool context for model-transition integration tests."""
+    return ToolRuntimeContext(
+        agent_name="general",
+        target=MessageTarget.resolve("!test:localhost", None, "$user-message", room_mode=True),
+        requester_id="@user:localhost",
+        client=AsyncMock(),
+        config=config,
+        runtime_paths=runtime_paths,
+        conversation_reader=MagicMock(),
+        relations=MagicMock(),
+        active_model_name=active_model_name,
+    )
+
+
+@pytest.mark.parametrize(
+    ("output_tokens", "expected_total", "expected_payload"),
+    [
+        (None, 0, None),
+        (0, 0, {"output_tokens": 0}),
+        (False, 0, {"output_tokens": 0}),
+        (True, 1, {"output_tokens": 1}),
+        (1.5, 0, None),
+        ("3", 0, None),
+    ],
+)
+def test_stream_request_metrics_preserve_zero_initialized_totals(
+    output_tokens: int | None,
+    expected_total: int,
+    expected_payload: dict[str, int] | None,
+) -> None:
+    """Unknown counters stay zero internally while only observed integers reach metadata."""
+    state = _StreamingAttemptState()
+
+    _track_model_request_metrics(state, ModelRequestCompletedEvent(output_tokens=output_tokens))
+    _track_model_request_metrics(state, ModelRequestCompletedEvent())
+
+    assert state.request_metric_totals == {
+        "input_tokens": 0,
+        "output_tokens": expected_total,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+    assert (
+        build_model_request_metrics_fallback(
+            state.request_metric_totals,
+            state.first_token_latency,
+            state.observed_request_metric_fields,
+        )
+        == expected_payload
+    )
+
+
 def test_serialize_metrics_preserves_zero_usage_fields_from_metrics() -> None:
-    """Metrics serialization should preserve only the provider payload Agno exposes."""
-    payload = _serialize_metrics(Metrics(input_tokens=6, output_tokens=0, cache_read_tokens=46449))
+    """RunMetrics serialization should preserve only the provider payload Agno exposes."""
+    payload = _serialize_metrics(RunMetrics(input_tokens=6, output_tokens=0, cache_read_tokens=46449))
 
     assert payload == {
         "input_tokens": 6,
@@ -131,12 +199,12 @@ def test_serialize_metrics_preserves_zero_usage_fields_from_metrics() -> None:
 def test_ai_run_metadata_prefers_provider_counters_over_estimate_for_cache_token_providers() -> None:
     """Cache-token providers report context as raw input plus cache read/write, not the estimate."""
     metadata = build_ai_run_metadata_content(
-        config=_metadata_config("vertexai_claude", "claude-sonnet-4-6"),
+        config=_metadata_config("vertexai_claude", "claude-sonnet-5"),
         model_name="default",
         run_id="run-1",
         session_id="session-1",
         status="completed",
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         model_provider="google",
         context_input_tokens=30_210,
         context_raw_input_tokens=1_200,
@@ -177,12 +245,12 @@ def test_ai_run_metadata_context_uses_raw_input_for_non_cache_token_providers() 
 def test_ai_run_metadata_context_falls_back_to_estimate_without_provider_counters() -> None:
     """Without any provider usage counters, the pre-flight estimate still populates the context block."""
     metadata = build_ai_run_metadata_content(
-        config=_metadata_config("anthropic", "claude-sonnet-4-6"),
+        config=_metadata_config("anthropic", "claude-sonnet-5"),
         model_name="default",
         run_id="run-1",
         session_id="session-1",
         status="completed",
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         model_provider="Anthropic",
         context_input_tokens=30_210,
         prepared_history=PreparedHistoryState(prepared_context_tokens=30_210),
@@ -200,12 +268,12 @@ def test_ai_run_metadata_context_falls_back_to_estimate_without_provider_counter
 def test_ai_run_metadata_context_regression_cached_prefix_sample() -> None:
     """Regression: a 49,886-token cached prefix must not be reported as a 30,210-token context."""
     metadata = build_ai_run_metadata_content(
-        config=_metadata_config("vertexai_claude", "claude-sonnet-4-6"),
+        config=_metadata_config("vertexai_claude", "claude-sonnet-5"),
         model_name="default",
         run_id="run-1",
         session_id="session-1",
         status="completed",
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         model_provider="google",
         metrics={"input_tokens": 3_277, "cache_read_tokens": 99_772, "cache_write_tokens": 49_886},
         context_input_tokens=30_210,
@@ -859,6 +927,41 @@ class TestUserIdPassthrough:
         assert mock_prepare_execution.await_args.kwargs["current_sender_id"] == expected_sender
 
     @pytest.mark.asyncio
+    async def test_prepare_agent_and_prompt_labels_an_agent_reply_with_its_author(self, tmp_path: Path) -> None:
+        """A reply an agent wrote for a human stays that agent's words while the human is the requester."""
+        mock_agent = MagicMock()
+        prepared_execution = _PreparedExecutionContext(
+            messages=(Message(role="user", content="prepared prompt"),),
+            unseen_event_ids=[],
+            prepared_history=PreparedHistoryState(),
+        )
+
+        with (
+            patch(
+                "mindroom.ai.build_memory_prompt_parts",
+                new_callable=AsyncMock,
+                return_value=MemoryPromptParts(),
+            ),
+            patch("mindroom.ai.create_agent", return_value=mock_agent),
+            patch(
+                "mindroom.ai.prepare_agent_execution_context",
+                new=AsyncMock(return_value=prepared_execution),
+            ) as mock_prepare_execution,
+        ):
+            await _prepare_agent_and_prompt(
+                replace(
+                    make_turn_context("general", requester_id="@alice:example.com"),
+                    current_sender_id="@mindroom_research:example.com",
+                ),
+                prompt="test",
+                runtime_paths=_runtime_paths(tmp_path),
+                config=_config(),
+            )
+
+        assert mock_prepare_execution.await_args is not None
+        assert mock_prepare_execution.await_args.kwargs["current_sender_id"] == "@mindroom_research:example.com"
+
+    @pytest.mark.asyncio
     async def test_ai_response_passes_config_path_to_prepare_agent(self, tmp_path: Path) -> None:
         """Non-streaming replies should build agents against the orchestrator-owned config file."""
         config_path = tmp_path / "custom-config.yaml"
@@ -959,6 +1062,38 @@ class TestUserIdPassthrough:
 
         assert mock_prepare.await_args.kwargs["prompt"] == "raw prompt"
         assert mock_prepare.await_args.kwargs["model_prompt"] == "model metadata"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("content", "status"), [(None, RunStatus.error), ("Answer", RunStatus.completed)])
+    async def test_stream_completion_status_does_not_require_metadata_collector(
+        self,
+        tmp_path: Path,
+        content: str | None,
+        status: RunStatus,
+    ) -> None:
+        """A typed terminal callback classifies empty output even without wire metadata."""
+        agent = MagicMock()
+        completed: list[CompletedAttempt] = []
+
+        async def events(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+            yield RunCompletedEvent(content=content, run_id="run-final", session_id="session1")
+
+        agent.arun = MagicMock(side_effect=events)
+        with patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as prepare:
+            prepare.return_value = _prepared_prompt_result(agent)
+            await collect_streamed_response_content(
+                stream_agent_response(
+                    make_turn_context("general", session_id="session1"),
+                    prompt="test",
+                    runtime_paths=_runtime_paths(tmp_path),
+                    config=_config(),
+                    on_completed=completed.append,
+                ),
+                presentation=CollectedStreamPresentation(show_tool_calls=False),
+            )
+        assert len(completed) == 1
+        assert completed[0].status is status
+        assert completed[0].metadata_content is None
 
     @pytest.mark.asyncio
     async def test_stream_agent_response_passes_config_path_to_prepare_agent(self, tmp_path: Path) -> None:
@@ -1549,7 +1684,7 @@ class TestUserIdPassthrough:
     async def test_ai_response_passes_all_files_for_vertex_claude(self, tmp_path: Path) -> None:
         """Vertex Claude path should not silently drop non-PDF file media."""
         mock_agent = MagicMock()
-        mock_agent.model = VertexAIClaude(id="claude-sonnet-4@20250514")
+        mock_agent.model = VertexAIClaude(id="claude-sonnet-5")
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
@@ -1580,7 +1715,7 @@ class TestUserIdPassthrough:
     async def test_stream_agent_response_passes_all_files_for_vertex_claude(self, tmp_path: Path) -> None:
         """Streaming path should not silently drop non-PDF files for Vertex Claude."""
         mock_agent = MagicMock()
-        mock_agent.model = VertexAIClaude(id="claude-sonnet-4@20250514")
+        mock_agent.model = VertexAIClaude(id="claude-sonnet-5")
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
@@ -1619,7 +1754,7 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
         mock_agent.arun = AsyncMock(
@@ -1656,7 +1791,7 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
@@ -1818,7 +1953,7 @@ class TestUserIdPassthrough:
         expected: str,
     ) -> None:
         """Run errors should surface nested provider payloads before static fallback."""
-        assert _run_error_event_text(event) == expected
+        assert run_error_event_text(event) == expected
 
     @pytest.mark.asyncio
     async def test_stream_agent_response_uses_run_error_event_metadata_when_content_empty(
@@ -1997,6 +2132,156 @@ class TestUserIdPassthrough:
         assert first_agent.arun.await_args.kwargs["run_id"] == "run-1"
         assert second_agent.arun.await_args.kwargs["run_id"] == run_ids[1]
         assert len(tool_trace) == 1
+
+    @pytest.mark.asyncio
+    async def test_ai_response_rebuilds_with_after_toolcall_model(self, tmp_path: Path) -> None:
+        """Passing the original turn context into preparation would silently rebuild the old model."""
+        observed_tool_models: list[str | None] = []
+        first_agent = MagicMock()
+        first_agent.model = MagicMock()
+        first_agent.model.__class__.__name__ = "OpenAIChat"
+        first_agent.model.id = "default-model"
+        first_agent.name = "GeneralAgent"
+        first_agent.add_history_to_context = False
+
+        second_agent = MagicMock()
+        second_agent.model = MagicMock()
+        second_agent.model.__class__.__name__ = "OpenAIChat"
+        second_agent.model.id = "large-model"
+        second_agent.name = "GeneralAgent"
+        second_agent.add_history_to_context = False
+
+        switch_execution = ToolExecution(
+            tool_call_id="call-switch-model",
+            tool_name="switch_thread_model",
+            tool_args={"model_name": "large", "when": "after-toolcall"},
+            result=json.dumps(
+                {
+                    "action": "switch",
+                    "model": "large",
+                    "status": "ok",
+                    "tool": "thread_model",
+                    "when": "after-toolcall",
+                },
+            ),
+            stop_after_tool_call=True,
+        )
+        first_run_output = MagicMock(content="", status=RunStatus.completed, tools=[switch_execution])
+
+        async def first_arun(*_args: object, **_kwargs: object) -> object:
+            context = get_tool_runtime_context()
+            observed_tool_models.append(context.active_model_name if context is not None else None)
+            return first_run_output
+
+        first_agent.arun = AsyncMock(side_effect=first_arun)
+        second_run_output = MagicMock(content="Finished.", status=RunStatus.completed, tools=[])
+
+        async def second_arun(*_args: object, **_kwargs: object) -> object:
+            context = get_tool_runtime_context()
+            observed_tool_models.append(context.active_model_name if context is not None else None)
+            return second_run_output
+
+        second_agent.arun = AsyncMock(side_effect=second_arun)
+
+        config = _config()
+        runtime_paths = _runtime_paths(tmp_path)
+        with patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare:
+            mock_prepare.side_effect = [
+                _prepared_prompt_result(first_agent, runtime_model_name="default"),
+                _prepared_prompt_result(second_agent, runtime_model_name="large"),
+            ]
+            with tool_runtime_context(
+                _model_runtime_context(config, runtime_paths, active_model_name="default"),
+            ):
+                response = await ai_response(
+                    make_turn_context("general", session_id="session1", run_id="run-1"),
+                    prompt="test",
+                    runtime_paths=runtime_paths,
+                    config=config,
+                    show_tool_calls=False,
+                    attempt_model_runtime=ToolRuntimeModelBinding(),
+                )
+
+        assert response == "Finished."
+        assert mock_prepare.await_count == 2
+        assert mock_prepare.await_args_list[1].args[0].active_model_name == "large"
+        assert observed_tool_models == ["default", "large"]
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_response_rebuilds_with_after_toolcall_model(self, tmp_path: Path) -> None:
+        """Streaming continuation must pass the requested alias into the rebuilt agent context."""
+        observed_tool_models: list[str | None] = []
+        first_agent = MagicMock()
+        first_agent.model = MagicMock()
+        first_agent.model.__class__.__name__ = "OpenAIChat"
+        first_agent.model.id = "default-model"
+        first_agent.name = "GeneralAgent"
+        first_agent.add_history_to_context = False
+
+        second_agent = MagicMock()
+        second_agent.model = MagicMock()
+        second_agent.model.__class__.__name__ = "OpenAIChat"
+        second_agent.model.id = "large-model"
+        second_agent.name = "GeneralAgent"
+        second_agent.add_history_to_context = False
+
+        switch_execution = ToolExecution(
+            tool_call_id="call-switch-model",
+            tool_name="switch_thread_model",
+            tool_args={"model_name": "large", "when": "after-toolcall"},
+            result=json.dumps(
+                {
+                    "action": "switch",
+                    "model": "large",
+                    "status": "ok",
+                    "tool": "thread_model",
+                    "when": "after-toolcall",
+                },
+            ),
+            stop_after_tool_call=True,
+        )
+
+        async def first_stream() -> AsyncIterator[object]:
+            context = get_tool_runtime_context()
+            observed_tool_models.append(context.active_model_name if context is not None else None)
+            yield ToolCallCompletedEvent(tool=switch_execution)
+            yield RunCompletedEvent(content=None)
+
+        async def second_stream() -> AsyncIterator[object]:
+            context = get_tool_runtime_context()
+            observed_tool_models.append(context.active_model_name if context is not None else None)
+            yield RunContentEvent(content="Finished.")
+            yield RunCompletedEvent(content="Finished.")
+
+        first_agent.arun = MagicMock(return_value=first_stream())
+        second_agent.arun = MagicMock(return_value=second_stream())
+
+        config = _config()
+        runtime_paths = _runtime_paths(tmp_path)
+        with patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare:
+            mock_prepare.side_effect = [
+                _prepared_prompt_result(first_agent, runtime_model_name="default"),
+                _prepared_prompt_result(second_agent, runtime_model_name="large"),
+            ]
+            with tool_runtime_context(
+                _model_runtime_context(config, runtime_paths, active_model_name="default"),
+            ):
+                chunks = [
+                    chunk
+                    async for chunk in stream_agent_response(
+                        make_turn_context("general", session_id="session1", run_id="run-1"),
+                        prompt="test",
+                        runtime_paths=runtime_paths,
+                        config=config,
+                        show_tool_calls=False,
+                        attempt_model_runtime=ToolRuntimeModelBinding(),
+                    )
+                ]
+
+        assert [chunk.content for chunk in chunks if isinstance(chunk, RunContentEvent)] == ["Finished."]
+        assert mock_prepare.await_count == 2
+        assert mock_prepare.await_args_list[1].args[0].active_model_name == "large"
+        assert observed_tool_models == ["default", "large"]
 
     @pytest.mark.asyncio
     async def test_ai_response_continuation_cancelled_run_preserves_dynamic_tool_trace(self, tmp_path: Path) -> None:
@@ -2346,7 +2631,7 @@ class TestUserIdPassthrough:
         mock_run_output.status = RunStatus.completed
         mock_run_output.model = "test-model"
         mock_run_output.model_provider = "openai"
-        mock_run_output.metrics = Metrics(
+        mock_run_output.metrics = RunMetrics(
             input_tokens=800,
             output_tokens=120,
             total_tokens=920,
@@ -2409,7 +2694,7 @@ class TestUserIdPassthrough:
         mock_run_output.status = RunStatus.completed
         mock_run_output.model = "test-model"
         mock_run_output.model_provider = "openai"
-        mock_run_output.metrics = Metrics(input_tokens=800, output_tokens=120, total_tokens=920)
+        mock_run_output.metrics = RunMetrics(input_tokens=800, output_tokens=120, total_tokens=920)
         recorder = TurnRecorder(user_message="test")
 
         with (
@@ -2445,7 +2730,7 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
@@ -2455,9 +2740,9 @@ class TestUserIdPassthrough:
         mock_run_output.run_id = "run-1"
         mock_run_output.session_id = "session1"
         mock_run_output.status = RunStatus.completed
-        mock_run_output.model = "claude-sonnet-4-6"
+        mock_run_output.model = "claude-sonnet-5"
         mock_run_output.model_provider = "Anthropic"
-        mock_run_output.metrics = Metrics(
+        mock_run_output.metrics = RunMetrics(
             input_tokens=3000,
             output_tokens=120,
             total_tokens=3120,
@@ -2468,7 +2753,7 @@ class TestUserIdPassthrough:
 
         config = Config(
             agents={"general": AgentConfig(display_name="General")},
-            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-4-6", context_window=200_000)},
+            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5", context_window=200_000)},
         )
 
         with patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare:
@@ -2573,7 +2858,7 @@ class TestUserIdPassthrough:
             yield RunCompletedEvent(
                 run_id="run-2",
                 session_id="session1",
-                metrics=Metrics(
+                metrics=RunMetrics(
                     input_tokens=500,
                     output_tokens=60,
                     total_tokens=560,
@@ -2743,7 +3028,7 @@ class TestUserIdPassthrough:
         mock_run_output.status = RunStatus.completed
         mock_run_output.model = "large-model"
         mock_run_output.model_provider = "openai"
-        mock_run_output.metrics = Metrics(input_tokens=800, output_tokens=50, total_tokens=850, duration=1.2)
+        mock_run_output.metrics = RunMetrics(input_tokens=800, output_tokens=50, total_tokens=850, duration=1.2)
         mock_run_output.tools = None
         mock_run_output.content = "Response"
 
@@ -2802,7 +3087,7 @@ class TestUserIdPassthrough:
             yield RunCompletedEvent(
                 run_id="run-room-stream",
                 session_id="session1",
-                metrics=Metrics(
+                metrics=RunMetrics(
                     input_tokens=500,
                     output_tokens=60,
                     total_tokens=560,
@@ -3007,14 +3292,14 @@ class TestUserIdPassthrough:
         ):
             mock_prepare.return_value = _prepared_prompt_result(mock_agent)
             with pytest.raises(ResponsePausedForApproval) as raised:
-                await _collect_streamed_response_content(
+                await collect_streamed_response_content(
                     stream_agent_response(
                         make_turn_context("general", session_id="session1", reply_to_event_id="$source"),
                         prompt="Run the action",
                         runtime_paths=_runtime_paths(tmp_path),
                         config=_config(),
                     ),
-                    show_tool_calls=True,
+                    presentation=CollectedStreamPresentation(show_tool_calls=True),
                 )
 
         assert raised.value.paused.run_id == "run-paused"
@@ -3059,7 +3344,7 @@ class TestUserIdPassthrough:
         ):
             mock_prepare.return_value = _prepared_prompt_result(mock_agent)
             with pytest.raises(ResponsePausedForApproval) as raised:
-                await _collect_streamed_response_content(
+                await collect_streamed_response_content(
                     stream_agent_response(
                         make_turn_context("general", session_id="session1", reply_to_event_id="$source"),
                         prompt="Run the action",
@@ -3067,7 +3352,7 @@ class TestUserIdPassthrough:
                         config=_config(),
                         show_tool_calls=False,
                     ),
-                    show_tool_calls=False,
+                    presentation=CollectedStreamPresentation(show_tool_calls=False),
                 )
 
         paused = _paused_with_committed_presentation(raised.value, show_tool_calls=False)
@@ -3161,6 +3446,7 @@ class TestUserIdPassthrough:
                 session_id="session-1",
                 run_id="run-paused",
                 tools=(tool,),
+                toolkit_owners={("general", "inspect"): "test_toolkit"},
             ),
         )
 
@@ -3170,7 +3456,10 @@ class TestUserIdPassthrough:
             raise pause
 
         with pytest.raises(ResponsePausedForApproval) as raised:
-            await _collect_streamed_response_content(paused_stream(), show_tool_calls=True)
+            await collect_streamed_response_content(
+                paused_stream(),
+                presentation=CollectedStreamPresentation(show_tool_calls=True),
+            )
 
         assert raised.value is pause
         assert pause.presentation is not None
@@ -3411,6 +3700,7 @@ class TestUserIdPassthrough:
 
         async def fake_arun_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
             yield RunContentEvent(content="ok")
+            yield ModelRequestCompletedEvent(model="earlier-model", model_provider="earlier-provider")
             yield ModelRequestCompletedEvent(
                 model="test-model",
                 model_provider="openai",
@@ -3418,6 +3708,7 @@ class TestUserIdPassthrough:
                 output_tokens=3,
                 time_to_first_token=0.12,
             )
+            yield ModelRequestCompletedEvent(model="", model_provider="", time_to_first_token=0.8)
 
         mock_agent.arun = MagicMock(return_value=fake_arun_stream())
 
@@ -3444,6 +3735,8 @@ class TestUserIdPassthrough:
         assert payload["usage"]["output_tokens"] == 3
         assert payload["usage"]["total_tokens"] == 15
         assert payload["usage"]["time_to_first_token"] == format(0.12, ".12g")
+        assert payload["model"]["id"] == "test-model"
+        assert payload["model"]["provider"] == "openai"
         assert payload["context"]["input_tokens"] == 12
         assert payload["context"]["window_tokens"] == 100
         assert "utilization_pct" not in payload["context"]
@@ -3563,10 +3856,13 @@ class TestUserIdPassthrough:
         assert payload["context"]["window_tokens"] == 1000
         assert payload["prepared_context"] == {"tokens": 900}
 
+    @pytest.mark.parametrize(("latest_input_tokens", "expected_context_tokens"), [(120, 120), (None, 700)])
     @pytest.mark.asyncio
     async def test_stream_agent_response_does_not_backfill_latest_context_cache_from_usage(
         self,
         tmp_path: Path,
+        latest_input_tokens: int | None,
+        expected_context_tokens: int,
     ) -> None:
         """Missing latest-request cache counters should stay unknown, not use cumulative totals."""
         mock_agent = MagicMock()
@@ -3585,12 +3881,13 @@ class TestUserIdPassthrough:
                 output_tokens=50,
                 total_tokens=750,
                 cache_read_tokens=512,
+                cache_write_tokens=32,
             )
             yield RunContentEvent(content="step two")
             yield ModelRequestCompletedEvent(
                 model="test-model",
                 model_provider="openai",
-                input_tokens=120,
+                input_tokens=latest_input_tokens,
                 output_tokens=20,
                 total_tokens=140,
             )
@@ -3616,7 +3913,8 @@ class TestUserIdPassthrough:
 
         payload = run_metadata["io.mindroom.ai_run"]
         assert payload["usage"]["cache_read_tokens"] == 512
-        assert payload["context"]["input_tokens"] == 120
+        assert payload["usage"]["cache_write_tokens"] == 32
+        assert payload["context"]["input_tokens"] == expected_context_tokens
         assert "cache_read_input_tokens" not in payload["context"]
         assert "cache_write_input_tokens" not in payload["context"]
         assert "uncached_input_tokens" not in payload["context"]
@@ -3655,7 +3953,7 @@ class TestUserIdPassthrough:
             yield RunCompletedEvent(
                 run_id="run-2",
                 session_id="session1",
-                metrics=Metrics(
+                metrics=RunMetrics(
                     input_tokens=120,
                     output_tokens=20,
                     total_tokens=140,
@@ -3695,14 +3993,14 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
         async def fake_arun_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
             yield RunContentEvent(content="step one")
             yield ModelRequestCompletedEvent(
-                model="claude-sonnet-4-6",
+                model="claude-sonnet-5",
                 model_provider="Anthropic",
                 input_tokens=3000,
                 output_tokens=50,
@@ -3712,7 +4010,7 @@ class TestUserIdPassthrough:
             )
             yield RunContentEvent(content="step two")
             yield ModelRequestCompletedEvent(
-                model="claude-sonnet-4-6",
+                model="claude-sonnet-5",
                 model_provider="Anthropic",
                 input_tokens=120,
                 output_tokens=20,
@@ -3725,7 +4023,7 @@ class TestUserIdPassthrough:
 
         config = Config(
             agents={"general": AgentConfig(display_name="General")},
-            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-4-6", context_window=200_000)},
+            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5", context_window=200_000)},
         )
 
         with patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare:
@@ -3760,14 +4058,14 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
         async def fake_arun_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
             yield RunContentEvent(content="step one")
             yield ModelRequestCompletedEvent(
-                model="claude-sonnet-4-6",
+                model="claude-sonnet-5",
                 model_provider="google",
                 input_tokens=120,
                 output_tokens=20,
@@ -3783,7 +4081,7 @@ class TestUserIdPassthrough:
             models={
                 "default": ModelConfig(
                     provider="vertexai_claude",
-                    id="claude-sonnet-4-6",
+                    id="claude-sonnet-5",
                     context_window=200_000,
                 ),
             },

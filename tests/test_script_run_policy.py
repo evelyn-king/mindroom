@@ -132,6 +132,23 @@ def test_launch_grants_exclude_stateful_browser_toolkit(tmp_path: Path) -> None:
     assert all(grant.toolkit_name != "browser" for grant in grants)
 
 
+def test_launch_grants_exclude_skill_manage(tmp_path: Path) -> None:
+    """Like self_config, skill_manage stays with the agent's chat even when the agent lists it."""
+    context = _context_for_config(
+        tmp_path,
+        Config(
+            agents={"general": AgentConfig(display_name="General Agent", tools=["calculator", "skill_manage"])},
+            defaults=DefaultsConfig(tools=[]),
+            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5-5")},
+        ),
+    )
+
+    grants = resolve_script_launch_grants(context)
+
+    assert ScriptToolGrant("calculator", "add") in grants
+    assert all(grant.toolkit_name != "skill_manage" for grant in grants)
+
+
 def test_requested_toolkit_is_revoked_when_the_agent_is_removed(tmp_path: Path) -> None:
     """Hot reload removals revoke grants without consulting the launch config again."""
     context = _context_for_config(
@@ -219,7 +236,7 @@ def test_background_approval_overlay_never_preapproves_system_mutation() -> None
         config,
         function_owners=function_owners,
         preapproved_toolkits=frozenset({"*"}),
-        never_preapprove_toolkits=frozenset({"config_manager", "scheduler", "subagents", "claude_agent"}),
+        never_preapprove_toolkits=frozenset({"claude_agent", "config_manager", "scheduler"}),
     )
 
     read_rule = _matching_tool_approval_rule(resolved, "read_url")

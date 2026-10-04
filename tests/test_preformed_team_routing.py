@@ -16,7 +16,6 @@ import nio
 import pytest
 
 from mindroom.config.agent import AgentConfig, TeamConfig
-from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import RouterConfig
 from mindroom.constants import STREAM_STATUS_KEY
@@ -24,7 +23,9 @@ from mindroom.matrix.client import DeliveredMatrixEvent
 from mindroom.matrix.thread_history_result import thread_history_result
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.response_runner import ResponseRequest
+from mindroom.response_sources import ResponseSources
 from mindroom.tool_system.worker_routing import get_tool_execution_identity
+from tests.access_schema_support import with_current_room_member_access
 from tests.bot_helpers import make_test_agent_bot, make_test_team_bot
 from tests.conftest import (
     bind_runtime_paths,
@@ -38,6 +39,7 @@ from tests.conftest import (
     test_runtime_paths,
 )
 from tests.identity_helpers import entity_ids
+from tests.response_attempt_helpers import install_direct_response_admission
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -69,22 +71,23 @@ def _make_matrix_client_mock() -> AsyncMock:
 @pytest.fixture
 def config_with_team() -> Config:
     """Minimal config with two agents and one predefined team in a room."""
-    return Config(
-        agents={
-            "a1": AgentConfig(display_name="Agent One", role="", rooms=["room_x"]),
-            "a2": AgentConfig(display_name="Agent Two", role="", rooms=["room_x"]),
-        },
-        teams={
-            "t1": TeamConfig(
-                display_name="Team One",
-                role="Test preformed team",
-                agents=["a1", "a2"],
-                rooms=["room_x"],
-                mode="coordinate",
-            ),
-        },
-        router=RouterConfig(model="default"),
-        authorization=AuthorizationConfig(default_room_access=True),
+    return with_current_room_member_access(
+        Config(
+            agents={
+                "a1": AgentConfig(display_name="Agent One", role="", rooms=["room_x"]),
+                "a2": AgentConfig(display_name="Agent Two", role="", rooms=["room_x"]),
+            },
+            teams={
+                "t1": TeamConfig(
+                    display_name="Team One",
+                    role="Test preformed team",
+                    agents=["a1", "a2"],
+                    rooms=["room_x"],
+                    mode="coordinate",
+                ),
+            },
+            router=RouterConfig(model="default"),
+        ),
     )
 
 
@@ -92,7 +95,7 @@ def _mock_room(room_id: str, member_ids: list[str]) -> MagicMock:
     room = MagicMock()
     room.room_id = room_id
     room.name = room_id
-    room.users = member_ids
+    room.users = {user_id: nio.MatrixUser(user_id) for user_id in member_ids}
     return room
 
 
@@ -170,6 +173,7 @@ async def test_preformed_team_bot_responds_when_mentioned(config_with_team: Conf
         team_mode="coordinate",
         enable_streaming=False,
     )
+    install_direct_response_admission(bot)
     bot.client = _make_matrix_client_mock()
     install_runtime_journal_support(bot)
 
@@ -273,6 +277,10 @@ async def test_preformed_team_bot_schedules_memory_save_for_all_file_members(
         ]
         await bot._run_regenerated_response(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$evt1",),
+                    logical_source_event_ids=("$evt1",),
+                ),
                 prompt="@team remember this",
                 thread_history=thread_history,
                 user_id="@user:localhost",
@@ -317,6 +325,7 @@ async def test_preformed_team_rejection_edits_existing_message(config_with_team:
         team_mode="coordinate",
         enable_streaming=False,
     )
+    install_direct_response_admission(bot)
     bot.client = _make_matrix_client_mock()
     install_runtime_journal_support(bot)
     bot.orchestrator = MagicMock()
@@ -333,6 +342,10 @@ async def test_preformed_team_rejection_edits_existing_message(config_with_team:
     ) as mock_edit:
         resolution = await bot._run_regenerated_response(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$evt1",),
+                    logical_source_event_ids=("$evt1",),
+                ),
                 prompt="@t1 please retry",
                 thread_history=[],
                 existing_event_id="$existing_response",

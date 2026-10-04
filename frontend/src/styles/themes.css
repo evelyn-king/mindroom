@@ -19,14 +19,7 @@
     --border: 39 24.1% 65.9%;
     --input: 43 58.8% 81%;
     --ring: 190 89% 24.9%;
-    --theme-gradient-from: 48 86.7% 88.2%;
-    --theme-gradient-via: 53 73.9% 91%;
-    --theme-gradient-to: 46 67.5% 84.3%;
-    --theme-overlay-from: 37 80.1% 39.4%;
-    --theme-overlay-to: 19 96.6% 34.9%;
-    --theme-mesh-primary: 37 80.1% 39.4%;
     --theme-mesh-secondary: 143 30.2% 37.1%;
-    --theme-mesh-tertiary: 323 38.8% 40.4%;
   }
 
   :root[data-theme="catppuccin-latte"] {
@@ -49,14 +42,7 @@
     --border: 227 12.2% 71%;
     --input: 223 15.9% 82.7%;
     --ring: 266 85% 58%;
-    --theme-gradient-from: 220 23.1% 94.9%;
-    --theme-gradient-via: 220 22% 92%;
-    --theme-gradient-to: 220 20.7% 88.6%;
-    --theme-overlay-from: 266 85% 58%;
-    --theme-overlay-to: 316 73.4% 69%;
-    --theme-mesh-primary: 266 85% 58%;
     --theme-mesh-secondary: 197 96.6% 45.7%;
-    --theme-mesh-tertiary: 347 86.7% 44.1%;
   }
 
   :root[data-theme="tokyo-night-day"] {
@@ -79,14 +65,7 @@
     --border: 227 24.1% 69%;
     --input: 229 22.9% 81.2%;
     --ring: 215 81% 54.7%;
-    --theme-gradient-from: 230 11.1% 89.4%;
-    --theme-gradient-via: 224 25.3% 85.3%;
-    --theme-gradient-to: 229 22.9% 81.2%;
-    --theme-overlay-from: 215 81% 54.7%;
-    --theme-overlay-to: 266 84.9% 63.7%;
-    --theme-mesh-primary: 215 81% 54.7%;
     --theme-mesh-secondary: 195 100% 29.6%;
-    --theme-mesh-tertiary: 266 84.9% 63.7%;
   }
 
   :root[data-theme="nord-light"] {
@@ -109,14 +88,7 @@
     --border: 216 18.2% 73.1%;
     --input: 219 27.9% 88%;
     --ring: 211 34.3% 41.8%;
-    --theme-gradient-from: 218 26.7% 94.1%;
-    --theme-gradient-via: 218 26.8% 92%;
-    --theme-gradient-to: 219 27.9% 88%;
-    --theme-overlay-from: 193 43.4% 67.5%;
-    --theme-overlay-to: 213 32% 52.2%;
-    --theme-mesh-primary: 193 43.4% 67.5%;
     --theme-mesh-secondary: 179 25.1% 64.9%;
-    --theme-mesh-tertiary: 210 34% 63.1%;
   }
 
   .dark[data-theme="gruvbox"] {
@@ -139,14 +111,7 @@
     --border: 27 9.7% 36.5%;
     --input: 22 7.4% 29.2%;
     --ring: 42 95.3% 58.2%;
-    --theme-gradient-from: 0 0% 15.7%;
-    --theme-gradient-via: 20 5.3% 22.4%;
-    --theme-gradient-to: 20 9.8% 12.2%;
-    --theme-overlay-from: 42 95.3% 58.2%;
-    --theme-overlay-to: 27 99.1% 54.7%;
-    --theme-mesh-primary: 42 95.3% 58.2%;
     --theme-mesh-secondary: 157 15.9% 58%;
-    --theme-mesh-tertiary: 104 35.1% 62%;
   }
 
   .dark[data-theme="catppuccin"] {
@@ -169,14 +134,7 @@
     --border: 234 13.2% 31.2%;
     --input: 237 16.2% 22.9%;
     --ring: 267 83.5% 81%;
-    --theme-gradient-from: 240 21.1% 14.9%;
-    --theme-gradient-via: 240 21.3% 12%;
-    --theme-gradient-to: 240 22.7% 8.6%;
-    --theme-overlay-from: 267 83.5% 81%;
-    --theme-overlay-to: 316 71.8% 86.1%;
-    --theme-mesh-primary: 267 83.5% 81%;
     --theme-mesh-secondary: 189 71% 72.9%;
-    --theme-mesh-tertiary: 343 81.3% 74.9%;
   }
 
   .dark[data-theme="tokyo-night"] {
@@ -199,14 +157,7 @@
     --border: 229 24.4% 30.6%;
     --input: 228 23.4% 21%;
     --ring: 221 88.7% 72.4%;
-    --theme-gradient-from: 235 18.8% 12.5%;
-    --theme-gradient-via: 240 15.4% 10.2%;
-    --theme-gradient-to: 230 24.2% 18.6%;
-    --theme-overlay-from: 221 88.7% 72.4%;
-    --theme-overlay-to: 261 85.3% 78.6%;
-    --theme-mesh-primary: 221 88.7% 72.4%;
     --theme-mesh-secondary: 202 100% 74.5%;
-    --theme-mesh-tertiary: 261 85.3% 78.6%;
   }
 
   .dark[data-theme="nord"] {
@@ -229,13 +180,6 @@
     --border: 220 16.5% 35.7%;
     --input: 220 16.8% 31.6%;
     --ring: 193 43.4% 67.5%;
-    --theme-gradient-from: 220 16.4% 21.6%;
-    --theme-gradient-via: 222 16.3% 27.6%;
-    --theme-gradient-to: 220 16.8% 31.6%;
-    --theme-overlay-from: 193 43.4% 67.5%;
-    --theme-overlay-to: 210 34% 63.1%;
-    --theme-mesh-primary: 193 43.4% 67.5%;
     --theme-mesh-secondary: 179 25.1% 64.9%;
-    --theme-mesh-tertiary: 210 34% 63.1%;
   }
 }

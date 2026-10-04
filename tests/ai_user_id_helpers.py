@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock
 import nio
 from agno.db.base import SessionType
 from agno.models.message import Message
+from agno.run.agent import RunOutput
+from agno.run.team import TeamRunOutput
 
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.ai import (
@@ -19,7 +21,6 @@ from mindroom.ai import (
 )
 from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig, TeamConfig
-from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.config.plugin import PluginEntryConfig
@@ -31,7 +32,7 @@ from mindroom.delivery_gateway import DeliveryGateway, DeliveryGatewayDeps, Resp
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.event_journal import PrincipalStore
 from mindroom.final_delivery import StreamTransportOutcome
-from mindroom.history.runtime import ScopeSessionContext
+from mindroom.history.session_context import ScopeSessionContext
 from mindroom.history.types import HistoryScope, PreparedHistoryState
 from mindroom.hooks import (
     HookContextSupport,
@@ -48,10 +49,12 @@ from mindroom.response_runner import (
     ResponseRunner,
     ResponseRunnerDeps,
 )
+from mindroom.response_sources import ResponseSources
 from mindroom.team_scope import ad_hoc_team_scope_id
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeSupport,
 )
+from tests.access_schema_support import with_current_room_member_access
 from tests.conftest import bind_runtime_paths as _bind_runtime_paths
 from tests.conftest import (
     ignore_final_delivery_handoff,
@@ -64,7 +67,7 @@ from tests.conftest import (
 from tests.identity_helpers import persist_entity_accounts
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable
+    from collections.abc import Awaitable, Callable, Generator, Iterable
     from pathlib import Path
 
     from agno.knowledge.knowledge import Knowledge
@@ -103,60 +106,64 @@ def _entity_alias_for_test(config: Config, runtime_paths: RuntimePaths, matrix_i
 
 
 def _config() -> Config:
-    return Config(
-        agents={"general": AgentConfig(display_name="General")},
-        models={"default": ModelConfig(provider="openai", id="test-model")},
-        authorization=AuthorizationConfig(default_room_access=True),
+    return with_current_room_member_access(
+        Config(
+            agents={"general": AgentConfig(display_name="General")},
+            models={"default": ModelConfig(provider="openai", id="test-model")},
+        ),
     )
 
 
 def _config_with_matrix_message() -> Config:
-    return Config(
-        agents={
-            "general": AgentConfig(
-                display_name="General",
-                tools=["matrix_message"],
-            ),
-        },
-        models={"default": ModelConfig(provider="openai", id="test-model")},
-        authorization=AuthorizationConfig(default_room_access=True),
+    return with_current_room_member_access(
+        Config(
+            agents={
+                "general": AgentConfig(
+                    display_name="General",
+                    tools=["matrix_message"],
+                ),
+            },
+            models={"default": ModelConfig(provider="openai", id="test-model")},
+        ),
     )
 
 
 def _config_with_team() -> Config:
-    return Config(
-        agents={"general": AgentConfig(display_name="General")},
-        teams={
-            "ultimate": TeamConfig(
-                display_name="Ultimate",
-                role="Coordinate the team",
-                agents=["general"],
-                mode="coordinate",
-            ),
-        },
-        models={"default": ModelConfig(provider="openai", id="test-model")},
-        authorization=AuthorizationConfig(default_room_access=True),
+    return with_current_room_member_access(
+        Config(
+            agents={"general": AgentConfig(display_name="General")},
+            teams={
+                "ultimate": TeamConfig(
+                    display_name="Ultimate",
+                    role="Coordinate the team",
+                    agents=["general"],
+                    mode="coordinate",
+                ),
+            },
+            models={"default": ModelConfig(provider="openai", id="test-model")},
+        ),
     )
 
 
 def _config_with_team_matrix_message() -> Config:
-    return Config(
-        agents={
-            "general": AgentConfig(
-                display_name="General",
-                tools=["matrix_message"],
-            ),
-        },
-        teams={
-            "ultimate": TeamConfig(
-                display_name="Ultimate",
-                role="Coordinate the team",
-                agents=["general"],
-                mode="coordinate",
-            ),
-        },
-        models={"default": ModelConfig(provider="openai", id="test-model")},
-        authorization=AuthorizationConfig(default_room_access=True),
+    return with_current_room_member_access(
+        Config(
+            agents={
+                "general": AgentConfig(
+                    display_name="General",
+                    tools=["matrix_message"],
+                ),
+            },
+            teams={
+                "ultimate": TeamConfig(
+                    display_name="Ultimate",
+                    role="Coordinate the team",
+                    agents=["general"],
+                    mode="coordinate",
+                ),
+            },
+            models={"default": ModelConfig(provider="openai", id="test-model")},
+        ),
     )
 
 
@@ -213,6 +220,30 @@ class _SessionStorageView:
 
     def upsert_session(self, session: AgentSession | TeamSession) -> None:
         self._store.session = session
+
+    def upsert_run(
+        self,
+        run: object,
+        session_id: str,
+        user_id: str | None = None,
+        run_index: int | None = None,
+    ) -> None:
+        """Store the run as its own row: replace by run_id or append, like agno's runs table."""
+        del user_id, run_index
+        stored = self._store.session
+        if stored is None or stored.session_id != session_id:
+            return
+        assert isinstance(run, RunOutput | TeamRunOutput)
+        runs = [existing for existing in stored.runs or [] if existing.run_id != run.run_id]
+        stored.runs = [*runs, run]
+        self._store.session = stored
+
+    def delete_runs(self, run_ids: list[str]) -> None:
+        stored = self._store.session
+        if stored is None:
+            return
+        stored.runs = [run for run in stored.runs or [] if run.run_id not in run_ids]
+        self._store.session = stored
 
     def close(self) -> None:
         return None
@@ -298,6 +329,12 @@ def _knowledge_access_support(
                 unavailable=unavailable or {},
             ),
         ),
+        resolve_for_agent_async=AsyncMock(
+            return_value=_KnowledgeResolution(
+                knowledge=cast("Knowledge | None", knowledge),
+                unavailable=unavailable or {},
+            ),
+        ),
     )
 
 
@@ -362,7 +399,7 @@ def _build_response_runner(
             else history_storage,
         ),
     )
-    bot._conversation_state_writer.persist_response_event_id_in_session_run = MagicMock()
+    bot._conversation_state_writer.apersist_response_event_id_in_session_run = AsyncMock()
     bot._conversation_state_writer.history_scope = MagicMock(
         return_value=HistoryScope(
             kind="team" if bot.agent_name in config.teams else "agent",
@@ -493,7 +530,7 @@ def _build_response_runner(
                 logger=bot.logger,
             ),
             approval_store=approval_store,
-            retry_approval_sources=lambda _source_event_ids: None,
+            retry_approval_sources=lambda _room_id, _source_event_ids: None,
             approval_runtime_generation="test-runtime",
         ),
     )
@@ -512,6 +549,10 @@ def _response_request(
 ) -> ResponseRequest:
     """Build one response request for direct bot seam tests."""
     return ResponseRequest(
+        sources=ResponseSources(
+            pending_event_ids=(reply_to_event_id,),
+            logical_source_event_ids=(reply_to_event_id,),
+        ),
         thread_history=(),
         prompt=prompt,
         response_envelope=request_envelope(
@@ -532,8 +573,8 @@ class _InertPostResponseEffects(PostResponseEffectsSupport):
     """Post-response support whose per-response deps carry no side effects.
 
     The real ``apply_post_response_effects`` still runs; every effect it guards
-    on (interactive registration, memory persistence, run-metadata linkage,
-    thread summaries) is absent from the built deps, so tests exercise the
+    on (interactive registration, memory persistence, skill review, run-metadata
+    linkage, thread summaries) is absent from the built deps, so tests exercise the
     lifecycle without patching the module function.
     """
 
@@ -543,9 +584,10 @@ class _InertPostResponseEffects(PostResponseEffectsSupport):
         room_id: str,
         membership_turn_id: str,
         queue_memory_persistence: Callable[[], None] | None = None,
-        persist_response_event_id: Callable[[str, str], None] | None = None,
+        queue_skill_review: Callable[[str], Awaitable[None]] | None = None,
+        persist_response_event_id: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> PostResponseEffectsDeps:
-        del room_id, membership_turn_id, queue_memory_persistence, persist_response_event_id
+        del room_id, membership_turn_id, queue_memory_persistence, queue_skill_review, persist_response_event_id
         return PostResponseEffectsDeps(logger=self.logger)
 
 

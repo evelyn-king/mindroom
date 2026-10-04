@@ -50,7 +50,7 @@ async def _export_threads_for_client(
     rooms: Sequence[_ThreadExportRoom],
     output_dir: Path,
     max_thread_roots: int = 2000,
-    required_member_user_id: str | None = None,
+    required_member_user_ids: tuple[str, ...] = (),
 ) -> ThreadExportStats:
     """Adapt the multi-target execution seam for single-target test cases."""
     accumulators = await _export_threads_for_targets_for_client(
@@ -62,12 +62,22 @@ async def _export_threads_for_client(
         targets=(
             ThreadExportTarget(
                 output_dir=output_dir,
-                required_member_user_id=required_member_user_id,
+                required_member_user_ids=required_member_user_ids,
             ),
         ),
         max_thread_roots=max_thread_roots,
     )
     return accumulators[0].stats()
+
+
+def test_thread_export_target_rejects_legacy_singular_scope(tmp_path: Path) -> None:
+    """Callers must use the plural membership-scope contract."""
+    legacy_kwargs: dict[str, object] = {
+        "output_dir": tmp_path,
+        "required_member_user_id": "@alice:localhost",
+    }
+    with pytest.raises(TypeError, match="required_member_user_id"):
+        ThreadExportTarget(**legacy_kwargs)
 
 
 @pytest.mark.asyncio
@@ -840,7 +850,7 @@ async def test_definitive_non_member_on_non_aliased_target_removes_room_export(
             runtime_paths=runtime_paths,
             output_dir=tmp_path / "exports",
             rooms=_export_rooms(runtime_paths, None),
-            required_member_user_id="@alice:localhost",
+            required_member_user_ids=("@alice:localhost",),
         )
 
     assert stats.rooms_exported == 1
@@ -903,10 +913,10 @@ async def test_admitted_empty_root_handles_retraction_and_zero_thread_export_wit
 
 
 @pytest.mark.parametrize(
-    ("invited", "required_member_user_id"),
+    ("invited", "required_member_user_ids"),
     [
-        pytest.param(True, None, id="excluded-invited-room"),
-        pytest.param(False, "@alice:localhost", id="definitive-non-member"),
+        pytest.param(True, (), id="excluded-invited-room"),
+        pytest.param(False, ("@alice:localhost",), id="definitive-non-member"),
     ],
 )
 @pytest.mark.asyncio
@@ -914,7 +924,7 @@ async def test_room_removal_failure_is_scoped_to_the_rejected_target(
     tmp_path: Path,
     *,
     invited: bool,
-    required_member_user_id: str | None,
+    required_member_user_ids: tuple[str, ...],
 ) -> None:
     """A failed retraction should not prevent another target from exporting the room."""
     config = _config(tmp_path)
@@ -927,13 +937,13 @@ async def test_room_removal_failure_is_scoped_to_the_rejected_target(
         invited=invited,
     )
     client = Mock()
-    if required_member_user_id is not None:
+    if required_member_user_ids:
         client.joined_members = AsyncMock(
             return_value=nio.JoinedMembersResponse(members=[], room_id=room.room_id),
         )
     rejected_target = ThreadExportTarget(
         output_dir=tmp_path / "rejected",
-        required_member_user_id=required_member_user_id,
+        required_member_user_ids=required_member_user_ids,
         include_invited_rooms=not invited,
     )
     healthy_target = ThreadExportTarget(output_dir=tmp_path / "healthy")
@@ -957,7 +967,11 @@ async def test_room_removal_failure_is_scoped_to_the_rejected_target(
             targets=(rejected_target, healthy_target),
         )
 
-    remove_export.assert_called_once_with(rejected_target.output_dir, room)
+    remove_export.assert_called_once_with(
+        rejected_target.output_dir,
+        room,
+        trusted_root=None,
+    )
     enumerate_threads.assert_awaited_once_with(client, room.room_id, max_thread_roots=2000)
     assert accumulators[0].rooms_exported == 0
     assert accumulators[0].failed_items[0].error == "Room removal failed: storage unavailable"
@@ -1012,12 +1026,12 @@ async def test_target_membership_and_invited_room_setting_are_both_enforced(tmp_
     targets = (
         ThreadExportTarget(
             output_dir=tmp_path / "code",
-            required_member_user_id="@mindroom_code:localhost",
+            required_member_user_ids=("@mindroom_code:localhost",),
             include_invited_rooms=True,
         ),
         ThreadExportTarget(
             output_dir=tmp_path / "research",
-            required_member_user_id="@mindroom_research:localhost",
+            required_member_user_ids=("@mindroom_research:localhost",),
             include_invited_rooms=False,
         ),
     )
@@ -1040,6 +1054,62 @@ async def test_target_membership_and_invited_room_setting_are_both_enforced(tmp_
     assert accumulators[1].retained_room_keys == {"dev"}
     assert client.joined_members.await_count == 3
     assert enumerate_threads.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_target_requires_every_configured_room_member(tmp_path: Path) -> None:
+    """A target scoped to multiple members must reject rooms missing either member."""
+    config = _config(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+    rooms = (
+        _ThreadExportRoom("both", "!both:localhost", "#both:localhost", "Both"),
+        _ThreadExportRoom("owner", "!owner:localhost", "#owner:localhost", "Owner"),
+        _ThreadExportRoom("agent", "!agent:localhost", "#agent:localhost", "Agent"),
+    )
+    members_by_room = {
+        "!both:localhost": ["@owner:localhost", "@mindroom_assistant:localhost"],
+        "!owner:localhost": ["@owner:localhost"],
+        "!agent:localhost": ["@mindroom_assistant:localhost"],
+    }
+
+    async def joined_members(room_id: str) -> nio.JoinedMembersResponse:
+        return nio.JoinedMembersResponse(
+            members=[nio.RoomMember(user_id, "", "") for user_id in members_by_room[room_id]],
+            room_id=room_id,
+        )
+
+    client = Mock()
+    client.joined_members = AsyncMock(side_effect=joined_members)
+    enumerate_threads = AsyncMock(return_value=([], False))
+
+    with patch(
+        "mindroom.thread_export.execution.enumerate_room_thread_root_ids",
+        new=enumerate_threads,
+    ):
+        accumulators = await _export_threads_for_targets_for_client(
+            client=client,
+            reader=Mock(),
+            config=config,
+            runtime_paths=runtime_paths,
+            rooms=rooms,
+            targets=(
+                ThreadExportTarget(
+                    output_dir=tmp_path / "private-assistant",
+                    required_member_user_ids=(
+                        "@owner:localhost",
+                        "@mindroom_assistant:localhost",
+                    ),
+                ),
+            ),
+        )
+
+    assert accumulators[0].rooms_exported == 1
+    assert accumulators[0].retained_room_keys == {"both"}
+    enumerate_threads.assert_awaited_once_with(
+        client,
+        "!both:localhost",
+        max_thread_roots=2000,
+    )
 
 
 @pytest.mark.asyncio
@@ -1069,7 +1139,7 @@ async def test_member_filter_lookup_failure_keeps_exports_and_records_failure(tm
             targets=(
                 ThreadExportTarget(
                     output_dir=tmp_path / "exports",
-                    required_member_user_id="@alice:localhost",
+                    required_member_user_ids=("@alice:localhost",),
                 ),
             ),
         )
@@ -1083,6 +1153,58 @@ async def test_member_filter_lookup_failure_keeps_exports_and_records_failure(tm
     enumerate_threads.assert_not_awaited()
     for room_key in ("lobby", "dev"):
         assert (tmp_path / "exports" / room_key / "old.yaml").read_text(encoding="utf-8") == "secret"
+
+
+@pytest.mark.asyncio
+async def test_history_failure_preserves_existing_export_and_diagnostic(tmp_path: Path) -> None:
+    """Unreadable history keeps the previous transcript and its actionable failure."""
+    config = _config(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+    _write_matrix_state(tmp_path)
+    output_dir = tmp_path / "exports"
+    room = _export_rooms(runtime_paths, "lobby")
+    history = [
+        ResolvedVisibleMessage.synthetic(
+            sender="@alice:localhost",
+            body="Saved transcript",
+            event_id="$existing:localhost",
+        ),
+    ]
+    diagnostic = "Unreadable historical events: encrypted_events=2, encrypted_sessions=1"
+
+    with (
+        patch(
+            "mindroom.thread_export.execution.enumerate_room_thread_root_ids",
+            new=AsyncMock(return_value=(["$existing:localhost"], False)),
+        ),
+        patch(
+            "mindroom.thread_export.execution.fetch_projected_thread_history",
+            new=AsyncMock(side_effect=[history, RuntimeError(diagnostic)]),
+        ),
+    ):
+        await _export_threads_for_client(
+            client=Mock(),
+            config=config,
+            runtime_paths=runtime_paths,
+            output_dir=output_dir,
+            rooms=room,
+        )
+        exported_file = next((output_dir / "lobby").glob("*.yaml"))
+        original_bytes = exported_file.read_bytes()
+
+        stats = await _export_threads_for_client(
+            client=Mock(),
+            config=config,
+            runtime_paths=runtime_paths,
+            output_dir=output_dir,
+            rooms=room,
+        )
+
+    assert stats.threads_exported == 0
+    assert stats.failures == 1
+    assert stats.failed_items[0].error == diagnostic
+    assert stats.failed_items[0].thread_id == "$existing:localhost"
+    assert exported_file.read_bytes() == original_bytes
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from mindroom.hooks import EVENT_SCHEDULE_FIRED, HookRegistry, ScheduleFiredCont
 from mindroom.logging_config import setup_logging
 from mindroom.scheduling import (
     CronSchedule,
+    ScheduledTaskRecord,
     ScheduledWorkflow,
     _run_cron_task,
     _run_once_task,
@@ -93,7 +94,7 @@ async def test_schedule_hook_rewrites_message_text(tmp_path: Path) -> None:
     conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
     with patch(
-        "mindroom.scheduling_executor.send_matrix_message",
+        "mindroom.matrix.client_delivery.send_message_outcome",
         new=AsyncMock(side_effect=delivered_matrix_side_effect("$scheduled")),
     ) as mock_send:
         await execute_scheduled_workflow(
@@ -120,7 +121,7 @@ async def test_schedule_hook_can_suppress_synthetic_message(tmp_path: Path) -> N
     set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [suppress])]))
 
     with patch(
-        "mindroom.scheduling_executor.send_matrix_message",
+        "mindroom.matrix.client_delivery.send_message_outcome",
         new=AsyncMock(side_effect=delivered_matrix_side_effect("$scheduled")),
     ) as mock_send:
         await execute_scheduled_workflow(
@@ -153,7 +154,7 @@ async def test_schedule_hook_suppression_log_includes_workflow_thread_context(
     capsys.readouterr()
 
     with patch(
-        "mindroom.scheduling_executor.send_matrix_message",
+        "mindroom.matrix.client_delivery.send_message_outcome",
         new=AsyncMock(side_effect=delivered_matrix_side_effect("$scheduled")),
     ):
         await execute_scheduled_workflow(
@@ -194,13 +195,27 @@ async def test_one_time_task_cancel_log_includes_workflow_thread_context(
     setup_logging(level="INFO", runtime_paths=runtime_paths_for(config))
     capsys.readouterr()
 
-    async def fake_get_pending_task_record(**_: object) -> SimpleNamespace:
-        return SimpleNamespace(workflow=workflow)
+    async def fake_get_pending_task_record(**_: object) -> ScheduledTaskRecord:
+        return ScheduledTaskRecord(
+            task_id="task-1",
+            room_id="!room:localhost",
+            status="pending",
+            created_at=None,
+            workflow=workflow,
+        )
+
+    client = AsyncMock()
+    client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
+        {"membership": "join"},
+        "m.room.member",
+        "@user:localhost",
+        "!room:localhost",
+    )
 
     with patch("mindroom.scheduling._get_pending_task_record", new=fake_get_pending_task_record):
         task = asyncio.create_task(
             _run_once_task(
-                AsyncMock(),
+                client,
                 "task-1",
                 workflow,
                 config,
@@ -241,7 +256,12 @@ async def test_cron_task_cancel_log_includes_workflow_thread_context(
     setup_logging(level="INFO", runtime_paths=runtime_paths_for(config))
     capsys.readouterr()
 
+    pending_read_started = asyncio.Event()
+    release_pending_read = asyncio.Event()
+
     async def fake_get_pending_task_record(**_: object) -> SimpleNamespace:
+        pending_read_started.set()
+        await release_pending_read.wait()
         return SimpleNamespace(workflow=workflow)
 
     with patch("mindroom.scheduling._get_pending_task_record", new=fake_get_pending_task_record):
@@ -256,7 +276,7 @@ async def test_cron_task_cancel_log_includes_workflow_thread_context(
                 _conversation_reader(),
             ),
         )
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(pending_read_started.wait(), timeout=5)
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task

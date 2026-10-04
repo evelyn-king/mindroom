@@ -7,8 +7,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
-from mindroom.config.main import load_config
+from mindroom.config.main import failed_config_source_fingerprint, load_config
 from mindroom.config.yaml_includes import partial_source_files
+from mindroom.config_reload import ConfigReloadStatus
 from mindroom.event_journal_open import describe_event_journal, pending_event_journal_restart
 from mindroom.logging_config import get_logger
 from mindroom.orchestration.config_updates import (
@@ -101,6 +102,7 @@ class ConfigReloadLifecycle:
     load_initial_config: Callable[[Config], Awaitable[bool]]
     apply_update_plan: Callable[[Config, ConfigUpdatePlan, tuple[str, ...]], Awaitable[bool]]
     response_admission_gate: ResponseAdmissionGate
+    before_runtime_replacement: Callable[[], Awaitable[None]]
     # Shared with manual plugin reloads and MCP catalog-change handling so no
     # two publication flows can interleave their read-plan-apply sequences.
     config_update_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -119,6 +121,15 @@ class ConfigReloadLifecycle:
     _fully_applied_config: Config | None = field(default=None, init=False, repr=False)
     # A transition target that may have published only part of its runtime state.
     _incomplete_config: Config | None = field(default=None, init=False, repr=False)
+    status: ConfigReloadStatus = field(default_factory=ConfigReloadStatus, init=False)
+
+    def record_applied(self, config: Config) -> None:
+        """Acknowledge source bytes only after their complete runtime publication."""
+        self._fully_applied_config = config
+        self.status = ConfigReloadStatus(
+            status="restart_required" if pending_event_journal_restart(config, self.runtime_paths) else "applied",
+            fingerprint=config.source_fingerprint,
+        )
 
     def request_reload(self) -> None:
         """Queue a debounced config reload for the running orchestrator."""
@@ -129,6 +140,7 @@ class ConfigReloadLifecycle:
         if self._reload_task is not None and not self._reload_task.done():
             logger.info("Configuration reload already queued; extending debounce window")
             return
+        self.status = ConfigReloadStatus(status="pending")
         logger.info("Queued configuration reload")
         self._reload_task = create_logged_task(
             self._run_reload_loop(),
@@ -142,6 +154,7 @@ class ConfigReloadLifecycle:
         self._reload_task = None
         self._requested_at = None
         await cancel_logged_task(task)
+        self.status = ConfigReloadStatus()
 
     async def _update_config(self) -> bool | None:
         """Reload config, returning whether agents changed or ``None`` when superseded."""
@@ -156,6 +169,7 @@ class ConfigReloadLifecycle:
                     tolerate_plugin_load_errors=True,
                 )
             self.loaded_source_files = new_config.source_files
+            self.status = ConfigReloadStatus(status="pending", fingerprint=new_config.source_fingerprint)
             runtime_config = self.current_config()
             if self._fully_applied_config is None:
                 self._fully_applied_config = runtime_config
@@ -169,7 +183,7 @@ class ConfigReloadLifecycle:
                     nonlocal updated
                     async with self.config_update_lock:
                         updated = await self.load_initial_config(new_config)
-                        self._fully_applied_config = new_config
+                        self.record_applied(new_config)
 
                 applied = await self._apply_after_response_drain(
                     load_initial_config,
@@ -197,6 +211,7 @@ class ConfigReloadLifecycle:
                 and current_authored_config == new_authored_config == runtime_authored_config
             ):
                 logger.info("Configuration content unchanged; skipping publication")
+                self.record_applied(new_config)
                 return False
             repair_config = self._incomplete_config
             if (
@@ -220,6 +235,7 @@ class ConfigReloadLifecycle:
                     requested_config=new_config,
                     repair_config=repair_config,
                 )
+                self.record_applied(new_config)
 
             applied = await self._apply_after_response_drain(
                 apply_update_steps,
@@ -351,6 +367,7 @@ class ConfigReloadLifecycle:
         """
         assert self.response_admission_gate.closed, "admission must be closed before applying"
         try:
+            await self.before_runtime_replacement()
             await operation()
         finally:
             self.response_admission_gate.reopen()
@@ -423,10 +440,15 @@ class ConfigReloadLifecycle:
     async def _apply_queued_config_reload(self) -> None:
         """Apply one queued config reload attempt and log the result."""
         self._requested_at = None
+        self.status = ConfigReloadStatus(status="pending")
         logger.info("Configuration file changed, checking for updates...")
         try:
             updated = await self._update_config()
         except Exception as exc:
+            self.status = ConfigReloadStatus(
+                status="failed",
+                fingerprint=failed_config_source_fingerprint(exc) or self.status.fingerprint,
+            )
             logger.exception("Configuration update failed; will retry if a new change is queued")
             # Keep watching every file the broken load read so fixing a newly
             # added include file (not yet in the last good config) still

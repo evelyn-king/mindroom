@@ -7,26 +7,29 @@ import threading
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import nio
 import pytest
 from agno.agent import Agent as AgnoAgent
-from agno.db.sqlite import SqliteDb
 from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
 from agno.tools.function import Function
 
 from mindroom import approval_manager, approval_transport, interactive
+from mindroom.agent_storage import create_session_storage
 from mindroom.ai import _attach_blocking_pause_presentation
+from mindroom.approval_inbound import maybe_handle_tool_approval_reply
 from mindroom.approval_manager import (
     initialize_approval_store,
 )
+from mindroom.approval_tools import toolkit_owners_for_agents
 from mindroom.coalescing import ReadyPendingEvent
 from mindroom.coalescing_batch import PendingEvent, PreparedTurn, requester_coalescing_key
-from mindroom.config.auth import AgentReplyPermission, AuthorizationConfig
+from mindroom.config.access import ResponderAccessConfig
+from mindroom.config.main import Config
+from mindroom.config.models import ToolConfigEntry
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.dispatch_callback_outcome import TurnDispatchOutcome
 from mindroom.dispatch_handoff import PreparedIngress
@@ -35,6 +38,7 @@ from mindroom.event_journal import (
     AdmissionResult,
     ApprovalContinuation,
     DeliveryStage,
+    DepartureSource,
     EventClass,
     EventKind,
     InboundEvent,
@@ -52,9 +56,10 @@ from mindroom.hooks import (
 from mindroom.matrix.thread_history_result import thread_history_result
 from mindroom.message_target import MessageTarget
 from mindroom.response_runner import ResponseRequest, ResponseRunner, _DeliveryProgress
+from mindroom.response_sources import ResponseSources
 from mindroom.response_turn import paused_attempt_from_response
 from mindroom.room_thread_modes import set_room_thread_mode_override
-from mindroom.runtime_shutdown import SYNC_RESTART_SHUTDOWN
+from mindroom.runtime_shutdown import SYNC_RESTART_SHUTDOWN, RuntimeShutdownIntent
 from mindroom.synthetic_model import SyntheticModel
 from mindroom.tool_approval import (
     POLICY_CONFIRMATION_APPROVAL_TYPE,
@@ -62,6 +67,7 @@ from mindroom.tool_approval import (
     MatrixApprovalAction,
     shutdown_approval_runtime,
 )
+from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.bot_helpers import (
     AgentBotTestBase,
     _hook_plugin,
@@ -82,10 +88,14 @@ from tests.conftest import (
     runtime_paths_for,
     unwrap_extracted_collaborator,
 )
+from tests.journal_helpers import admit_dispatch_event
+from tests.journal_membership_helpers import admit_room_membership
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from pathlib import Path
+
+    from agno.db.base import BaseDb
 
     from mindroom.bot import AgentBot
     from mindroom.matrix.users import AgentMatrixUser
@@ -125,12 +135,16 @@ async def _cancel_dispatch_retry(bot: AgentBot) -> None:
     await bot._journal_dispatcher.stop()
 
 
-def _approval_reply_event(event_id: str = "$approval-reply") -> nio.RoomMessageText:
+def _approval_reply_event(
+    event_id: str = "$approval-reply",
+    *,
+    sender: str = "@user:localhost",
+) -> nio.RoomMessageText:
     event = nio.Event.parse_event(
         {
             "type": "m.room.message",
             "event_id": event_id,
-            "sender": "@user:localhost",
+            "sender": sender,
             "origin_server_ts": 1,
             "content": {
                 "msgtype": "m.text",
@@ -160,12 +174,18 @@ def _approval_action_event(event_id: str, *, status: str) -> nio.UnknownEvent:
     return event
 
 
-def _reaction_event(key: str, event_id: str, *, timestamp: int = 1) -> nio.ReactionEvent:
+def _reaction_event(
+    key: str,
+    event_id: str,
+    *,
+    sender: str = "@user:localhost",
+    timestamp: int = 1,
+) -> nio.ReactionEvent:
     event = nio.Event.parse_event(
         {
             "type": "m.reaction",
             "event_id": event_id,
-            "sender": "@user:localhost",
+            "sender": sender,
             "origin_server_ts": timestamp,
             "content": {
                 "m.relates_to": {
@@ -263,12 +283,16 @@ async def _dispatch_message(bot: AgentBot, room: nio.MatrixRoom, event: nio.Room
     source.setdefault("type", "m.room.message")
     event.source = source
     event.decrypted = False
-    await bot._journal_dispatcher.admit_out_of_band(room, event, EventKind.MESSAGE, EventClass.ACTIONABLE)
+    await admit_dispatch_event(bot._journal_dispatcher, room, event, EventKind.MESSAGE, EventClass.ACTIONABLE)
     await bot._journal_dispatcher.drain_once()
 
 
 def _direct_response_request(target: MessageTarget, prompt: str, source_event_id: str) -> ResponseRequest:
     return ResponseRequest(
+        sources=ResponseSources(
+            pending_event_ids=(source_event_id,),
+            logical_source_event_ids=(source_event_id,),
+        ),
         prompt=prompt,
         thread_history=[],
         user_id="@user:localhost",
@@ -403,19 +427,9 @@ class TestAgentBot(AgentBotTestBase):
         """A generic hook must not run after a reply-policy reload revokes its sender."""
         sender_id = "@user:localhost"
         config = self._config_for_storage(tmp_path)
-        config.authorization = AuthorizationConfig(
-            default_room_access=True,
-            agent_reply_permissions={
-                mock_agent_user.agent_name: AgentReplyPermission(users=[sender_id]),
-            },
-        )
+        config.agents[mock_agent_user.agent_name].access = ResponderAccessConfig(users=[sender_id])
         denied_config = config.model_copy(deep=True)
-        denied_config.authorization = AuthorizationConfig(
-            default_room_access=True,
-            agent_reply_permissions={
-                mock_agent_user.agent_name: AgentReplyPermission(users=[]),
-            },
-        )
+        denied_config.agents[mock_agent_user.agent_name].access = ResponderAccessConfig(users=[])
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = MagicMock()
         seen: list[str] = []
@@ -464,12 +478,7 @@ class TestAgentBot(AgentBotTestBase):
         """A reload cannot overtake a claimed fresh reaction hook."""
         sender_id = "@user:localhost"
         config = self._config_for_storage(tmp_path)
-        config.authorization = AuthorizationConfig(
-            default_room_access=True,
-            agent_reply_permissions={
-                mock_agent_user.agent_name: AgentReplyPermission(users=[sender_id]),
-            },
-        )
+        config.agents[mock_agent_user.agent_name].access = ResponderAccessConfig(users=[sender_id])
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = MagicMock()
         hook_started = asyncio.Event()
@@ -507,19 +516,9 @@ class TestAgentBot(AgentBotTestBase):
         """A transient old-policy denial must not terminally discard a fresh reaction."""
         sender_id = "@user:localhost"
         config = self._config_for_storage(tmp_path)
-        config.authorization = AuthorizationConfig(
-            default_room_access=True,
-            agent_reply_permissions={
-                mock_agent_user.agent_name: AgentReplyPermission(users=[]),
-            },
-        )
+        config.agents[mock_agent_user.agent_name].access = ResponderAccessConfig(users=[])
         allowed_config = config.model_copy(deep=True)
-        allowed_config.authorization = AuthorizationConfig(
-            default_room_access=True,
-            agent_reply_permissions={
-                mock_agent_user.agent_name: AgentReplyPermission(users=[sender_id]),
-            },
-        )
+        allowed_config.agents[mock_agent_user.agent_name].access = ResponderAccessConfig(users=[sender_id])
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = MagicMock()
         seen = _install_reaction_recorder(bot)
@@ -649,8 +648,7 @@ class TestAgentBot(AgentBotTestBase):
         bot.client = MagicMock()
         bot.hook_registry = HookRegistry.from_plugins([_hook_plugin("hooked", [record_reaction])])
         room = MagicMock(room_id="!test:localhost")
-        event = self._make_handler_event("reaction", sender="@user:localhost", event_id="$reaction")
-        event.key = "✅"
+        event = _reaction_event("✅", "$reaction")
 
         with (
             patch.object(
@@ -678,12 +676,7 @@ class TestAgentBot(AgentBotTestBase):
         """An uncommitted config decision must not apply after room access is revoked."""
         sender_id = "@user:localhost"
         config = self._config_for_storage(tmp_path)
-        config.authorization = AuthorizationConfig(
-            default_room_access=True,
-            agent_reply_permissions={
-                ROUTER_AGENT_NAME: AgentReplyPermission(users=[sender_id]),
-            },
-        )
+        config.router.access = ResponderAccessConfig(users=[sender_id])
         router_user = replace(
             mock_agent_user,
             agent_name=ROUTER_AGENT_NAME,
@@ -704,13 +697,7 @@ class TestAgentBot(AgentBotTestBase):
             return pending_change
 
         replacement = config.model_copy(deep=True)
-        replacement.authorization = AuthorizationConfig(
-            default_room_access=False,
-            room_permissions={room.room_id: []},
-            agent_reply_permissions={
-                ROUTER_AGENT_NAME: AgentReplyPermission(users=[sender_id]),
-            },
-        )
+        replacement.router.access = ResponderAccessConfig(users=[])
         handler = AsyncMock()
         gate = bot.admission_gate
         with (
@@ -784,6 +771,14 @@ class TestAgentBot(AgentBotTestBase):
 
             await bot._journal_dispatcher.drain_once()
             await bot._response_runner.drain_inbox_responses()
+            bot._journal_dispatcher.start()
+            try:
+                async with asyncio.timeout(5):
+                    # Journal settlement has no event signal to await.
+                    while event.event_id in await bot._journal_dispatcher.unsettled_event_ids():  # noqa: ASYNC110
+                        await asyncio.sleep(0.01)
+            finally:
+                await bot._journal_dispatcher.stop()
 
         assert event.event_id not in await bot._journal_dispatcher.unsettled_event_ids()
         assert execute.await_count == 2
@@ -830,7 +825,7 @@ class TestAgentBot(AgentBotTestBase):
             await _dispatch_reaction(bot, room, event)
             await bot._response_runner.drain_inbox_responses()
 
-        await bot._membership_fence.fence_local_departure(room.room_id)
+        await admit_room_membership(bot.journal_principal(), room.room_id, "leave", source=DepartureSource.LOCAL)
 
         assert event.event_id not in await bot._journal_dispatcher.unsettled_event_ids()
         rows = await bot._journal_store.backend.read(
@@ -1035,17 +1030,20 @@ class TestAgentBot(AgentBotTestBase):
             "handle_text_event",
             handle_other_thread,
         )
+        bot._journal_dispatcher.release_turn_replay()
         bot._journal_dispatcher.start()
         try:
             with _mock_interactive_claim(bot, selection):
-                await bot._journal_dispatcher.admit_out_of_band(
+                await admit_dispatch_event(
+                    bot._journal_dispatcher,
                     room,
                     reaction,
                     EventKind.REACTION,
                     EventClass.ACTIONABLE,
                 )
                 await asyncio.wait_for(selection_started.wait(), timeout=1.0)
-                await bot._journal_dispatcher.admit_out_of_band(
+                await admit_dispatch_event(
+                    bot._journal_dispatcher,
                     room,
                     message,
                     EventKind.MESSAGE,
@@ -1153,7 +1151,8 @@ class TestAgentBot(AgentBotTestBase):
             prepare_forever,
             response_target=target,
             source_event_id="$reaction",
-            user_id="@user:localhost",
+            transport_sender_id="@user:localhost",
+            requester_user_id="@user:localhost",
             selected_value="Selected",
         )
         await asyncio.wait_for(preparation_started.wait(), timeout=1.0)
@@ -1193,7 +1192,8 @@ class TestAgentBot(AgentBotTestBase):
             response,
             response_target=target,
             source_event_id="$reaction",
-            user_id="@user:localhost",
+            transport_sender_id="@user:localhost",
+            requester_user_id="@user:localhost",
             selected_value="Selected",
         )
         await bot._response_runner.drain_inbox_responses()
@@ -1201,7 +1201,7 @@ class TestAgentBot(AgentBotTestBase):
         assert response_completed.is_set()
         settle_dispatch_sources.assert_awaited_once_with(("$reaction",))
         # The failed settlement must hand the exact journal source back for retry.
-        retry_dispatch_sources.assert_called_once_with(("$reaction",))
+        retry_dispatch_sources.assert_called_once_with(target.room_id, ("$reaction",))
 
     @pytest.mark.asyncio
     async def test_interactive_approval_handoff_skips_fallback_source_settlement(
@@ -1230,7 +1230,8 @@ class TestAgentBot(AgentBotTestBase):
             hand_off_response,
             response_target=target,
             source_event_id="$reaction",
-            user_id="@user:localhost",
+            transport_sender_id="@user:localhost",
+            requester_user_id="@user:localhost",
             selected_value="Selected",
         )
         await bot._response_runner.drain_inbox_responses()
@@ -1265,7 +1266,8 @@ class TestAgentBot(AgentBotTestBase):
             await controller._handle_interactive_selection(
                 room,
                 selection=selection,
-                user_id="@user:localhost",
+                transport_sender_id="@user:localhost",
+                requester_user_id="@user:localhost",
                 source_event_id="$reaction",
                 response_target=target,
             )
@@ -1303,7 +1305,8 @@ class TestAgentBot(AgentBotTestBase):
                 controller._handle_interactive_selection(
                     room,
                     selection=selection,
-                    user_id="@user:localhost",
+                    transport_sender_id="@user:localhost",
+                    requester_user_id="@user:localhost",
                     source_event_id="$reaction",
                     response_target=target,
                 ),
@@ -1350,11 +1353,13 @@ class TestAgentBot(AgentBotTestBase):
             name="test_interactive_claim_owner",
             recovery_proof_ready=lambda: False,
             source_event_ids=("$reaction",),
+            room_id="!room:example.org",
         )
         ordinary_response_task = bot._response_runner.track_inbox_response(
             ordinary_response(),
             name="test_ordinary_response",
             recovery_proof_ready=lambda: False,
+            room_id="!room:example.org",
         )
         await response_started.wait()
         await ordinary_response_started.wait()
@@ -1373,7 +1378,7 @@ class TestAgentBot(AgentBotTestBase):
                 await asyncio.sleep(0)
 
                 assert not stop_task.done()
-                dispatcher_stop.assert_awaited_once_with()
+                dispatcher_stop.assert_awaited_once_with(shutdown_intent=SYNC_RESTART_SHUTDOWN)
 
                 finish_cleanup.set()
                 await asyncio.wait_for(stop_task, timeout=1.0)
@@ -1428,7 +1433,7 @@ class TestAgentBot(AgentBotTestBase):
             thread_id="$thread",
             requester_id="@user:localhost",
             response_event_id="$waiting",
-            source_event_ids=("$source", "$coalesced"),
+            sources=ResponseSources(("$source", "$coalesced"), ("$source", "$coalesced")),
             calls=(),
             state="ready",
         )
@@ -1455,9 +1460,10 @@ class TestAgentBot(AgentBotTestBase):
                 assert bot._response_runner.has_live_inbox_response("$coalesced")
                 deferred = await store.load_event("$source")
                 assert deferred is not None
-                bot._journal_dispatcher._worker._deferred[deferred.event_id] = deferred
+                bot._journal_dispatcher._worker._defer(deferred)
                 assert bot._journal_dispatcher._deferral_is_live(deferred)
-                assert bot._journal_dispatcher._worker._reclaim_lost_deferrals() == {}
+                assert await bot._journal_dispatcher._worker.drain_once() == 0
+                assert bot._journal_dispatcher._worker._deferred[deferred.event_id] == deferred
             finally:
                 release_resume.set()
                 await asyncio.gather(handoff, return_exceptions=True)
@@ -1479,16 +1485,25 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """A fresh bot must execute the persisted tool once after policy or card consent."""
         config = self._config_for_storage(tmp_path)
+        config.agents[mock_agent_user.agent_name].tools = [ToolConfigEntry(name="shell")]
         runtime_paths = runtime_paths_for(config)
-        session_db = tmp_path / "persisted-approval-agent.db"
         executed: list[list[str]] = []
         target = MessageTarget.resolve("!test:localhost", None, "$source")
+        identity = ToolExecutionIdentity(
+            channel="matrix",
+            agent_name=mock_agent_user.agent_name,
+            requester_id="@user:localhost",
+            room_id=target.room_id,
+            thread_id=target.source_thread_id,
+            resolved_thread_id=target.resolved_thread_id,
+            session_id=target.session_id,
+        )
 
         def run_shell_command(args: list[str]) -> str:
             executed.append(args)
             return "ok"
 
-        def new_agent() -> AgnoAgent:
+        def new_agent(history_storage: BaseDb | None = None) -> AgnoAgent:
             return AgnoAgent(
                 id=mock_agent_user.agent_name,
                 model=SyntheticModel(
@@ -1504,9 +1519,12 @@ class TestAgentBot(AgentBotTestBase):
                         name="run_shell_command",
                         entrypoint=run_shell_command,
                         requires_confirmation=True,
+                        owning_toolkit="shell",
                     ),
                 ],
-                db=SqliteDb(db_file=str(session_db), session_table="sessions"),
+                db=history_storage
+                if history_storage is not None
+                else create_session_storage(mock_agent_user.agent_name, config, runtime_paths, identity),
             )
 
         first_agent = new_agent()
@@ -1522,6 +1540,7 @@ class TestAgentBot(AgentBotTestBase):
             paused_response,
             fallback_session_id=target.session_id,
             fallback_run_id=paused_response.run_id,
+            toolkit_owners=toolkit_owners_for_agents([first_agent]),
         )
         assert paused is not None
         paused.tools[0].approval_type = POLICY_CONFIRMATION_APPROVAL_TYPE
@@ -1637,6 +1656,15 @@ class TestAgentBot(AgentBotTestBase):
             )
             assert conversation.messages == ()
             assert await first.approval_store.approval_continuation_for_source("$source") == persisted
+            # Startup delivery recovery must preserve the approval's response,
+            # including when the redaction callback has already settled.
+            await first._delivery_gateway.recover_deliveries()
+            initial = await first.approval_store.load_matrix_delivery(
+                delivery_id="$source",
+                stage=DeliveryStage.INITIAL,
+            )
+            assert initial is not None
+            assert not initial.retired
         if first_agent.db is not None:
             first_agent.db.close()
 
@@ -1650,7 +1678,10 @@ class TestAgentBot(AgentBotTestBase):
             await restarted._response_runner.wait_for_source_owned_inbox_responses()
             await restarted._journal_dispatcher.drain_once()
 
-        with patch("mindroom.approval_execution.create_agent", side_effect=lambda *_args, **_kwargs: new_agent()):
+        with patch(
+            "mindroom.approval_execution.create_agent",
+            side_effect=lambda *_args, **kwargs: new_agent(kwargs["history_storage"]),
+        ):
             if requires_human:
                 manager = initialize_approval_store(
                     runtime_paths,
@@ -1660,7 +1691,10 @@ class TestAgentBot(AgentBotTestBase):
                     cards=restarted._journal_store.principal(router_principal_id),
                     transport_sender=lambda: "@mindroom_router:localhost",
                     sending_device=lambda: "DEVICE",
-                    continuation_ready=lambda _entity_name, source_ids: restarted.retry_approval_sources(source_ids),
+                    continuation_ready=lambda _entity_name, room_id, source_ids: restarted.retry_approval_sources(
+                        room_id,
+                        source_ids,
+                    ),
                 )
                 restarted._journal_dispatcher.release_turn_replay()
                 try:
@@ -1670,9 +1704,9 @@ class TestAgentBot(AgentBotTestBase):
                         card_event_id="$approval",
                         status="approved",
                         reason=None,
+                        authorize_responder=lambda _entity_name: True,
                     )
                     assert resolved.consumed is True
-                    assert resolved.resolved is True
                     await drain_restarted_runtime()
                 finally:
                     await shutdown_approval_runtime()
@@ -1701,13 +1735,15 @@ class TestAgentBot(AgentBotTestBase):
             response_started.set()
             await finish_response.wait()
 
-        async def stop_dispatcher() -> None:
+        async def stop_dispatcher(*, shutdown_intent: RuntimeShutdownIntent) -> None:
+            assert shutdown_intent == SYNC_RESTART_SHUTDOWN
             response_tasks.append(
                 bot._response_runner.track_inbox_response(
                     response_owner(),
                     name="test_late_interactive_claim_owner",
                     recovery_proof_ready=lambda: False,
                     source_event_ids=("$reaction",),
+                    room_id="!room:example.org",
                 ),
             )
             await response_started.wait()
@@ -1779,16 +1815,19 @@ class TestAgentBot(AgentBotTestBase):
                     response,
                     response_target=target,
                     source_event_id="$reaction",
-                    user_id="@user:localhost",
+                    transport_sender_id="@user:localhost",
+                    requester_user_id="@user:localhost",
                     selected_value=selection.selected_value,
                 )
                 if failure_stage == "queued_cancel":
-                    assert await bot._response_runner.drain_inbox_responses(cancel_after_seconds=0.01) is False
+                    # This checks ownership recovery, not millisecond shutdown latency.
+                    # Allow queued acquisition cancellation and shielded reservation cleanup to finish.
+                    assert await bot._response_runner.drain_inbox_responses(cancel_after_seconds=1.0) is False
                 else:
                     await bot._response_runner.drain_inbox_responses()
 
             assert not response_entered.is_set()
-            retry_dispatch_sources.assert_called_with(("$reaction",))
+            retry_dispatch_sources.assert_called_with(target.room_id, ("$reaction",))
             if lock_owned_by_test:
                 lifecycle_lock.release()
                 lock_owned_by_test = False
@@ -1957,6 +1996,65 @@ class TestAgentBot(AgentBotTestBase):
             await bot._response_runner.drain_inbox_responses()
 
     @pytest.mark.asyncio
+    async def test_interactive_reaction_executes_as_canonical_human_requester(
+        self,
+        mock_agent_user: AgentMatrixUser,
+        tmp_path: Path,
+    ) -> None:
+        """A bridge reaction preserves transport identity but owns work as its canonical human."""
+        owner_id = "@owner:localhost"
+        bridge_id = "@bridge:localhost"
+        config = self._config_for_storage(tmp_path)
+        config.authorization.aliases = {owner_id: [bridge_id]}
+        config.agents[mock_agent_user.agent_name].access = ResponderAccessConfig(users=[owner_id])
+        runtime_paths = runtime_paths_for(config)
+        room = nio.MatrixRoom("!test:localhost", mock_agent_user.user_id)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot.client = make_matrix_client_mock(user_id=bot.agent_user.user_id)
+        reaction = _reaction_event("👍", "$alias-interactive-reaction", sender=bridge_id)
+        selection = interactive.InteractiveSelection(
+            question_event_id="$question",
+            question_text="Choose one",
+            selection_key="👍",
+            selected_label="Selected",
+            selected_value="Selected",
+            thread_id="$thread",
+        )
+        captured_requests: list[ResponseRequest] = []
+
+        async def generate_locked(
+            _self: ResponseRunner,
+            request: ResponseRequest,
+            *,
+            resolved_target: MessageTarget,
+            early_placeholder_state: object,
+        ) -> str:
+            del resolved_target, early_placeholder_state
+            captured_requests.append(request)
+            return "$response"
+
+        bot._conversation_resolver.fetch_thread_history = AsyncMock(
+            return_value=thread_history_result([], is_full_history=True),
+        )
+        bot._visible_responses.recovered_response_event_id = AsyncMock(return_value=None)
+        bot._visible_responses.deliver_recoverable_text = AsyncMock(return_value="$ack")
+        try:
+            with (
+                _mock_interactive_claim(bot, selection),
+                patch.object(ResponseRunner, "_generate_response_locked", new=generate_locked),
+            ):
+                await _dispatch_reaction(bot, room, reaction)
+                await bot._response_runner.drain_inbox_responses()
+
+            assert len(captured_requests) == 1
+            request = captured_requests[0]
+            assert request.user_id == owner_id
+            assert request.response_envelope.origin.transport_sender_id == bridge_id
+            assert request.response_envelope.origin.requester_id == owner_id
+        finally:
+            await bot._response_runner.drain_inbox_responses()
+
+    @pytest.mark.asyncio
     async def test_checkmark_interactive_reaction_reserves_before_tool_approval_lookup(
         self,
         mock_agent_user: AgentMatrixUser,
@@ -2030,7 +2128,7 @@ class TestAgentBot(AgentBotTestBase):
 
         approval_handler = AsyncMock(return_value=True)
         with (
-            patch("mindroom.turn_policy.is_sender_allowed_for_agent_reply", return_value=False),
+            patch("mindroom.turn_policy.is_sender_allowed_for_agent_reply_in_room", return_value=False),
             patch("mindroom.reaction_dispatch.handle_tool_approval_action", approval_handler),
             _mock_interactive_claim(bot, None) as interactive_handler,
         ):
@@ -2051,7 +2149,7 @@ class TestAgentBot(AgentBotTestBase):
         config = self._config_for_storage(tmp_path)
         runtime_paths = runtime_paths_for(config)
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
-        room = SimpleNamespace(room_id="!test:localhost", canonical_alias=None)
+        room = nio.MatrixRoom("!test:localhost", bot.matrix_id.full_id)
         event = nio.UnknownEvent.from_dict(
             {
                 "type": "io.mindroom.tool_approval_response",
@@ -2063,7 +2161,7 @@ class TestAgentBot(AgentBotTestBase):
         )
         with patch(
             "mindroom.approval_inbound.handle_matrix_approval_action",
-            new=AsyncMock(return_value=ApprovalActionResult(consumed=True, resolved=True, card_event_id="$approval")),
+            new=AsyncMock(return_value=ApprovalActionResult(consumed=True, card_event_id="$approval")),
         ) as handle_matrix_approval_action:
             await bot._on_unknown_event(room, event)
 
@@ -2096,11 +2194,7 @@ class TestAgentBot(AgentBotTestBase):
 
         try:
             cards = bot._journal_store.principal("router@shared")
-            transport = approval_transport.ApprovalMatrixTransport(
-                runtime_paths=runtime_paths,
-                bot_provider=lambda _name: router,
-                cards_provider=lambda: cards,
-            )
+            transport = approval_transport.ApprovalMatrixTransport(bot_provider=lambda _name: router)
             initialize_approval_store(
                 runtime_paths,
                 cards=cards,
@@ -2119,13 +2213,15 @@ class TestAgentBot(AgentBotTestBase):
             ignored = _approval_action_event("$legacy-action", status="approved")
             later = _approval_action_event("$later-action", status="invalid")
             with patch.object(approval_manager.logger, "warning") as warning:
-                await bot._journal_dispatcher.admit_out_of_band(
+                await admit_dispatch_event(
+                    bot._journal_dispatcher,
                     room,
                     ignored,
                     EventKind.APPROVAL,
                     EventClass.ACTIONABLE,
                 )
-                await bot._journal_dispatcher.admit_out_of_band(
+                await admit_dispatch_event(
+                    bot._journal_dispatcher,
                     room,
                     later,
                     EventKind.APPROVAL,
@@ -2148,6 +2244,7 @@ class TestAgentBot(AgentBotTestBase):
             router.client.room_get_event.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("enforce_turn_authorization")
     async def test_interrupted_approval_reply_replay_cannot_become_ai_input(
         self,
         mock_agent_user: AgentMatrixUser,
@@ -2155,9 +2252,26 @@ class TestAgentBot(AgentBotTestBase):
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A reply claimed by approval handling must retain that owner after a crash."""
-        config = self._config_for_storage(tmp_path)
-        runtime_paths = runtime_paths_for(config)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        legacy_config = self._config_for_storage(tmp_path)
+        runtime_paths = runtime_paths_for(legacy_config)
+        membership_payload = legacy_config.authored_model_dump()
+        membership_payload["authorization"] = {}
+        for agent in cast("dict[str, dict[str, object]]", membership_payload["agents"]).values():
+            agent["access"] = {"members_of_rooms": [], "users": []}
+        membership_payload["router"] = {
+            "access": {
+                "members_of_rooms": [],
+                "users": ["@user:localhost"],
+            },
+        }
+        config = Config.validate_with_runtime(membership_payload, runtime_paths)
+        router_user = replace(
+            mock_agent_user,
+            agent_name=ROUTER_AGENT_NAME,
+            user_id="@mindroom_router:localhost",
+            display_name="RouterAgent",
+        )
+        bot = make_test_agent_bot(router_user, tmp_path, config=config, runtime_paths=runtime_paths)
         room = nio.MatrixRoom("!test:localhost", bot.matrix_id.full_id)
         event = _approval_reply_event()
 
@@ -2169,7 +2283,8 @@ class TestAgentBot(AgentBotTestBase):
 
         journal = bot._journal_dispatcher.store
         with patch("mindroom.bot.maybe_handle_tool_approval_reply", side_effect=consume_then_crash):
-            await bot._journal_dispatcher.admit_out_of_band(
+            await admit_dispatch_event(
+                bot._journal_dispatcher,
                 room,
                 event,
                 EventKind.MESSAGE,
@@ -2183,47 +2298,80 @@ class TestAgentBot(AgentBotTestBase):
         pending = await journal.pending()
         assert pending[0].semantic_consumer is SemanticConsumer.APPROVAL_REPLY
 
-        restarted = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        restarted = make_test_agent_bot(
+            router_user,
+            tmp_path,
+            config=config,
+            runtime_paths=runtime_paths,
+        )
         handle_text_event = _install_text_dispatch_mock(monkeypatch, restarted)
+
+        async def reject_revoked_origin(
+            _action: MatrixApprovalAction,
+            *,
+            before_consume: Callable[[], Awaitable[None]] | None = None,
+            authorize_responder: Callable[[str], bool] | None = None,
+        ) -> ApprovalActionResult:
+            assert before_consume is None
+            assert authorize_responder is not None
+            assert authorize_responder("calculator") is False
+            return ApprovalActionResult(consumed=False)
+
         with patch(
-            "mindroom.bot.maybe_handle_tool_approval_reply",
-            new=AsyncMock(return_value=False),
-        ) as approval_reply:
+            "mindroom.approval_inbound.handle_matrix_approval_action",
+            new=AsyncMock(side_effect=reject_revoked_origin),
+        ) as approval_action:
             await restarted._journal_dispatcher.drain_once()
 
-        approval_reply.assert_awaited_once()
-        assert approval_reply.await_args.kwargs["before_consume"] is None
-        assert approval_reply.await_args.kwargs["authorization_prevalidated"] is True
+        approval_action.assert_awaited_once()
         handle_text_event.assert_not_awaited()
         assert await restarted._journal_dispatcher.store.pending() == ()
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("enforce_turn_authorization")
     async def test_interrupted_approval_reaction_replay_cannot_become_hook_input(
         self,
         mock_agent_user: AgentMatrixUser,
         tmp_path: Path,
     ) -> None:
         """A reaction claimed by approval handling must never fall through to hooks."""
-        config = self._config_for_storage(tmp_path)
-        runtime_paths = runtime_paths_for(config)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        legacy_config = self._config_for_storage(tmp_path)
+        runtime_paths = runtime_paths_for(legacy_config)
+        membership_payload = legacy_config.authored_model_dump()
+        membership_payload["authorization"] = {}
+        for agent in cast("dict[str, dict[str, object]]", membership_payload["agents"]).values():
+            agent["access"] = {"members_of_rooms": [], "users": []}
+        membership_payload["router"] = {
+            "access": {
+                "members_of_rooms": [],
+                "users": ["@user:localhost"],
+            },
+        }
+        config = Config.validate_with_runtime(membership_payload, runtime_paths)
+        router_user = replace(
+            mock_agent_user,
+            agent_name=ROUTER_AGENT_NAME,
+            user_id="@mindroom_router:localhost",
+            display_name="RouterAgent",
+        )
+        bot = make_test_agent_bot(router_user, tmp_path, config=config, runtime_paths=runtime_paths)
         bot.client = make_matrix_client_mock()
         room = nio.MatrixRoom("!test:localhost", bot.matrix_id.full_id)
         event = _reaction_event("✅", "$approval-reaction")
         failure = RuntimeError("crash after approval reaction side effect")
 
-        async def fail_after_claim(
-            _action: MatrixApprovalAction,
-            *,
-            before_consume: Callable[[], Awaitable[None]] | None = None,
-        ) -> ApprovalActionResult:
-            assert before_consume is not None
+        async def fail_after_claim(**kwargs: object) -> bool:
+            before_consume = cast("Callable[[], Awaitable[None]]", kwargs["before_consume"])
             await before_consume()
             raise failure
 
         with (
             patch(
-                "mindroom.approval_inbound.handle_matrix_approval_action",
+                "mindroom.reaction_dispatch.config_confirmation.resolve_reaction_pending_change",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "mindroom.reaction_dispatch.handle_tool_approval_action",
                 new=AsyncMock(side_effect=fail_after_claim),
             ),
         ):
@@ -2233,15 +2381,28 @@ class TestAgentBot(AgentBotTestBase):
             0
         ].semantic_consumer is SemanticConsumer.TOOL_APPROVAL_REACTION
 
-        restarted = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        restarted = make_test_agent_bot(router_user, tmp_path, config=config, runtime_paths=runtime_paths)
         restarted.client = make_matrix_client_mock()
         unexpected_hooks = _install_reaction_recorder(restarted)
+
+        async def reject_revoked_origin(
+            _action: MatrixApprovalAction,
+            *,
+            before_consume: Callable[[], Awaitable[None]] | None = None,
+            authorize_responder: Callable[[str], bool] | None = None,
+        ) -> ApprovalActionResult:
+            assert before_consume is None
+            assert authorize_responder is not None
+            assert authorize_responder("calculator") is False
+            return ApprovalActionResult(consumed=False)
+
         with patch(
             "mindroom.approval_inbound.handle_matrix_approval_action",
-            new=AsyncMock(return_value=ApprovalActionResult(consumed=False, resolved=False)),
-        ):
+            new=AsyncMock(side_effect=reject_revoked_origin),
+        ) as approval_action:
             await restarted._journal_dispatcher.drain_once()
 
+        approval_action.assert_awaited_once()
         assert unexpected_hooks == []
         assert await restarted._journal_dispatcher.store.pending() == ()
 
@@ -2279,7 +2440,8 @@ class TestAgentBot(AgentBotTestBase):
                 new=AsyncMock(side_effect=failure),
             ),
         ):
-            await bot._journal_dispatcher.admit_out_of_band(
+            await admit_dispatch_event(
+                bot._journal_dispatcher,
                 room,
                 event,
                 EventKind.REACTION,
@@ -2344,7 +2506,8 @@ class TestAgentBot(AgentBotTestBase):
                 new=AsyncMock(side_effect=RuntimeError("crash after stop claim")),
             ),
         ):
-            await bot._journal_dispatcher.admit_out_of_band(
+            await admit_dispatch_event(
+                bot._journal_dispatcher,
                 room,
                 event,
                 EventKind.REACTION,
@@ -2405,7 +2568,8 @@ class TestAgentBot(AgentBotTestBase):
                 new=AsyncMock(side_effect=RuntimeError("crash after stop claim")),
             ),
         ):
-            await bot._journal_dispatcher.admit_out_of_band(
+            await admit_dispatch_event(
+                bot._journal_dispatcher,
                 room,
                 event,
                 EventKind.REACTION,
@@ -2473,7 +2637,8 @@ class TestAgentBot(AgentBotTestBase):
                 new=AsyncMock(return_value=False),
             ),
         ):
-            await bot._journal_dispatcher.admit_out_of_band(
+            await admit_dispatch_event(
+                bot._journal_dispatcher,
                 room,
                 event,
                 EventKind.REACTION,
@@ -2536,7 +2701,7 @@ class TestAgentBot(AgentBotTestBase):
                 conversation_target=target,
             ),
         )
-        assert not await bot._turn_store.prepare_edit_response_source(
+        assert not await bot._turn_store._prepare_edit_response_source(
             target=target,
             source_event_ids=("$source",),
             response_event_id="$response",
@@ -2570,7 +2735,8 @@ class TestAgentBot(AgentBotTestBase):
             ),
             patch.object(turn_store, "get_turn_record", side_effect=tracked_lookup) as source_lookup,
         ):
-            await bot._journal_dispatcher.admit_out_of_band(
+            await admit_dispatch_event(
+                bot._journal_dispatcher,
                 room,
                 event,
                 EventKind.REACTION,
@@ -2625,6 +2791,7 @@ class TestAgentBot(AgentBotTestBase):
             stop_receipt_order: int,
             *,
             delivery_settled: bool = False,
+            deleted_turn_id: str | None = None,
         ) -> TurnRecord:
             nonlocal alias_claimed
             if not alias_claimed:
@@ -2640,6 +2807,7 @@ class TestAgentBot(AgentBotTestBase):
                 response_event_id,
                 stop_receipt_order,
                 delivery_settled=delivery_settled,
+                deleted_turn_id=deleted_turn_id,
             )
 
         on_current_stop_finalized = AsyncMock()
@@ -2700,7 +2868,8 @@ class TestAgentBot(AgentBotTestBase):
                 new=AsyncMock(side_effect=failure),
             ),
         ):
-            await bot._journal_dispatcher.admit_out_of_band(
+            await admit_dispatch_event(
+                bot._journal_dispatcher,
                 room,
                 event,
                 EventKind.REACTION,
@@ -2765,7 +2934,8 @@ class TestAgentBot(AgentBotTestBase):
         )
         assert admission is AdmissionResult.ADMITTED
 
-        await bot._journal_dispatcher.admit_out_of_band(
+        await admit_dispatch_event(
+            bot._journal_dispatcher,
             room,
             event,
             EventKind.REACTION,
@@ -2810,7 +2980,8 @@ class TestAgentBot(AgentBotTestBase):
 
         bot.hook_registry = HookRegistry.from_plugins([_hook_plugin("hooked", [emit_then_crash])])
         with _mock_interactive_claim(bot, None):
-            await bot._journal_dispatcher.admit_out_of_band(
+            await admit_dispatch_event(
+                bot._journal_dispatcher,
                 room,
                 event,
                 EventKind.REACTION,
@@ -2848,12 +3019,7 @@ class TestAgentBot(AgentBotTestBase):
         """A claimed hook must settle without running after its sender is revoked."""
         sender_id = "@user:localhost"
         config = self._config_for_storage(tmp_path)
-        config.authorization = AuthorizationConfig(
-            default_room_access=True,
-            agent_reply_permissions={
-                mock_agent_user.agent_name: AgentReplyPermission(users=[sender_id]),
-            },
-        )
+        config.agents[mock_agent_user.agent_name].access = ResponderAccessConfig(users=[sender_id])
         runtime_paths = runtime_paths_for(config)
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
         bot.client = make_matrix_client_mock()
@@ -2867,7 +3033,8 @@ class TestAgentBot(AgentBotTestBase):
 
         bot.hook_registry = HookRegistry.from_plugins([_hook_plugin("hooked", [crash_after_claim])])
         with _mock_interactive_claim(bot, None):
-            await bot._journal_dispatcher.admit_out_of_band(
+            await admit_dispatch_event(
+                bot._journal_dispatcher,
                 room,
                 event,
                 EventKind.REACTION,
@@ -2879,12 +3046,7 @@ class TestAgentBot(AgentBotTestBase):
         assert pending[0].semantic_consumer is SemanticConsumer.REACTION_HOOKS
 
         denied_config = config.model_copy(deep=True)
-        denied_config.authorization = AuthorizationConfig(
-            default_room_access=True,
-            agent_reply_permissions={
-                mock_agent_user.agent_name: AgentReplyPermission(users=[]),
-            },
-        )
+        denied_config.agents[mock_agent_user.agent_name].access = ResponderAccessConfig(users=[])
         restarted = make_test_agent_bot(
             mock_agent_user,
             tmp_path,
@@ -2915,7 +3077,7 @@ class TestAgentBot(AgentBotTestBase):
         runtime_paths = runtime_paths_for(config)
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
         bot.client = make_matrix_client_mock()
-        room = SimpleNamespace(room_id="!test:localhost", canonical_alias=None)
+        room = nio.MatrixRoom("!test:localhost", bot.matrix_id.full_id)
         event = MagicMock(spec=nio.ReactionEvent)
         event.key = "✅"
         event.reacts_to = "$approval"
@@ -2931,7 +3093,7 @@ class TestAgentBot(AgentBotTestBase):
         ) -> ApprovalActionResult:
             assert before_consume is not None
             await before_consume()
-            return ApprovalActionResult(consumed=True, resolved=True)
+            return ApprovalActionResult(consumed=True)
 
         with patch(
             "mindroom.approval_inbound.handle_matrix_approval_action",
@@ -2947,6 +3109,73 @@ class TestAgentBot(AgentBotTestBase):
             status="approved",
             reason=None,
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("configured_bot", "expected_sender"),
+        [(False, "@owner:localhost"), (True, "@bridge:localhost")],
+    )
+    async def test_approval_reaction_canonicalizes_only_human_aliases(
+        self,
+        configured_bot: bool,
+        expected_sender: str,
+        mock_agent_user: AgentMatrixUser,
+        tmp_path: Path,
+    ) -> None:
+        """Approval ownership uses a canonical human requester without remapping bots."""
+        owner_id = "@owner:localhost"
+        bridge_id = "@bridge:localhost"
+        config = self._config_for_storage(tmp_path)
+        config.authorization.aliases = {owner_id: [bridge_id]}
+        config.bot_accounts = [bridge_id] if configured_bot else []
+        runtime_paths = runtime_paths_for(config)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot.client = make_matrix_client_mock()
+        room = nio.MatrixRoom("!test:localhost", bot.matrix_id.full_id)
+        event = _reaction_event("✅", "$alias-approval", sender=bridge_id)
+
+        with patch(
+            "mindroom.approval_inbound.handle_matrix_approval_action",
+            new=AsyncMock(return_value=ApprovalActionResult(consumed=True)),
+        ) as handle_matrix_approval_action:
+            await _dispatch_reaction(bot, room, event)
+
+        action = handle_matrix_approval_action.await_args.args[0]
+        assert action.sender_id == expected_sender
+
+    @pytest.mark.asyncio
+    async def test_approval_denial_reply_uses_canonical_human_requester(
+        self,
+        mock_agent_user: AgentMatrixUser,
+        tmp_path: Path,
+    ) -> None:
+        """A bridge alias may deny the canonical human requester's pending approval."""
+        owner_id = "@owner:localhost"
+        bridge_id = "@bridge:localhost"
+        config = self._config_for_storage(tmp_path)
+        config.authorization.aliases = {owner_id: [bridge_id]}
+        runtime_paths = runtime_paths_for(config)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        room = nio.MatrixRoom("!test:localhost", bot.matrix_id.full_id)
+        event = _approval_reply_event(sender=bridge_id)
+
+        with patch(
+            "mindroom.approval_inbound.handle_matrix_approval_action",
+            new=AsyncMock(return_value=ApprovalActionResult(consumed=True)),
+        ) as handle_matrix_approval_action:
+            handled = await maybe_handle_tool_approval_reply(
+                room=room,
+                event=event,
+                config=config,
+                runtime_paths=runtime_paths,
+                orchestrator=None,
+                logger=bot.logger,
+                membership_index=bot._runtime_view.agent_reply_memberships,
+            )
+
+        assert handled
+        action = handle_matrix_approval_action.await_args.args[0]
+        assert action.sender_id == owner_id
 
     @pytest.mark.asyncio
     async def test_reaction_hooks_inherit_thread_for_promoted_plain_reply_target(

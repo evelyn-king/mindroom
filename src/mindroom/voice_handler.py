@@ -5,18 +5,22 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import re
+import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from agno.agent import Agent
 from agno.media import Audio
+from agno.metrics import MessageMetrics, RunMetrics
+from agno.models.message import Message
+from agno.run.agent import RunOutput
 
 from mindroom import model_loading
 from mindroom.attachments import register_audio_attachment
-from mindroom.authorization import responder_candidate_entities_for_room
+from mindroom.authorization import responder_candidate_entities_from_cached_room
 from mindroom.config.voice import normalize_speech_base_url
 from mindroom.constants import (
     ATTACHMENT_IDS_KEY,
@@ -29,6 +33,7 @@ from mindroom.constants import (
 from mindroom.credentials_sync import get_api_key_for_service
 from mindroom.dispatch_source import VOICE_SOURCE_KIND
 from mindroom.entity_resolution import EntityIdentityRegistry, entity_identity_registry
+from mindroom.helper_usage import record_system_usage
 from mindroom.logging_config import get_logger
 from mindroom.matrix.identity import parse_current_matrix_user_id
 from mindroom.matrix.media import AudioMessageEvent, download_media_bytes, extract_media_caption, media_mime_type
@@ -45,6 +50,10 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
 
 logger = get_logger(__name__)
+# Allow slow transcription without giving an unavailable service a second attempt.
+# The overall deadline also bounds upload time and responses that keep trickling data.
+_STT_TOTAL_TIMEOUT_SECONDS = 60.0
+_STT_HTTP_TIMEOUT = httpx.Timeout(_STT_TOTAL_TIMEOUT_SECONDS, connect=5.0, write=10.0, pool=5.0)
 _STT_AUDIO_EXTENSION_BY_MIME_TYPE = {
     "audio/aac": ".aac",
     "audio/flac": ".flac",
@@ -79,6 +88,16 @@ class _NormalizedVoiceMessage:
 
     attachment_id: str | None
     transcribed_message: str | None
+
+
+@dataclass(frozen=True)
+class _TranscriptionTokenUsage:
+    """Provider counters for one token-metered transcription request."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    audio_tokens: int | None = None
 
 
 _VOICE_NORMALIZATION_CACHE_MAX_ENTRIES = 128
@@ -417,8 +436,7 @@ async def _handle_voice_message(
 
         logger.info("voice_transcription_received", transcription=transcription)
 
-        available_agent_names, available_team_names = await _get_available_entities_for_sender(
-            client,
+        available_agent_names, available_team_names = _get_available_entities_for_sender(
             room,
             event.sender,
             config,
@@ -481,6 +499,72 @@ def _stt_upload_filename_and_mime_type(mime_type: str | None) -> tuple[str, str]
     return f"audio{extension}", normalized_mime_type
 
 
+def _token_counter(value: object) -> int | None:
+    """Reject booleans, negative values, and non-integer counters."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _transcription_token_usage(result: object) -> _TranscriptionTokenUsage | None:
+    """Accept only complete, consistent provider-reported token counters."""
+    if not isinstance(result, dict):
+        return None
+    usage = cast("dict[str, object]", result).get("usage")
+    if not isinstance(usage, dict) or cast("dict[str, object]", usage).get("type") != "tokens":
+        return None
+    token_usage = cast("dict[str, object]", usage)
+    input_tokens = _token_counter(token_usage.get("input_tokens"))
+    output_tokens = _token_counter(token_usage.get("output_tokens"))
+    total_tokens = _token_counter(token_usage.get("total_tokens"))
+    if (
+        input_tokens is None
+        or output_tokens is None
+        or total_tokens is None
+        or input_tokens + output_tokens != total_tokens
+    ):
+        return None
+    token_details = token_usage.get("input_token_details")
+    audio_tokens = (
+        cast("dict[str, object]", token_details).get("audio_tokens") if isinstance(token_details, dict) else None
+    )
+    if audio_tokens is not None:
+        audio_count = _token_counter(audio_tokens)
+        if audio_count is None or audio_count > input_tokens:
+            return None
+        return _TranscriptionTokenUsage(input_tokens, output_tokens, total_tokens, audio_count)
+    return _TranscriptionTokenUsage(input_tokens, output_tokens, total_tokens)
+
+
+def _transcription_usage_run(
+    usage: _TranscriptionTokenUsage,
+    *,
+    model: str | None,
+    provider: str | None,
+    created_at: int,
+) -> RunOutput:
+    """Represent one provider response without retaining transcription content."""
+    run_metrics = RunMetrics(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+    )
+    message_metrics = MessageMetrics(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+    )
+    if usage.audio_tokens is not None:
+        run_metrics.audio_input_tokens = run_metrics.audio_total_tokens = usage.audio_tokens
+        message_metrics.audio_input_tokens = message_metrics.audio_total_tokens = usage.audio_tokens
+    return RunOutput(
+        run_id=str(uuid.uuid4()),
+        model=model,
+        model_provider=provider,
+        created_at=created_at,
+        metrics=run_metrics,
+        messages=[Message(role="assistant", created_at=created_at, metrics=message_metrics)],
+    )
+
+
 async def _transcribe_audio(
     audio_data: bytes,
     config: Config,
@@ -523,7 +607,11 @@ async def _transcribe_audio(
         form_data: dict[str, object] = {"model": config.voice.stt.model}
         form_data.update(config.voice.stt.extra_kwargs)
 
-        async with httpx.AsyncClient() as http_client:
+        async with (
+            asyncio.timeout(_STT_TOTAL_TIMEOUT_SECONDS),
+            httpx.AsyncClient(timeout=_STT_HTTP_TIMEOUT) as http_client,
+        ):
+            request_started_at = int(time.time())
             response = await http_client.post(url, headers=headers, files=files, data=form_data)
             if response.status_code != 200:
                 logger.error(
@@ -534,8 +622,26 @@ async def _transcribe_audio(
                 return None
 
             result = response.json()
-            return result.get("text", "").strip()
 
+        usage = _transcription_token_usage(result)
+        if usage is not None:
+            model = form_data.get("model")
+            provider = "openai" if config.voice.stt.provider == "openai" and stt_base_url is None else None
+            await record_system_usage(
+                _transcription_usage_run(
+                    usage,
+                    model=model if isinstance(model, str) else None,
+                    provider=provider,
+                    created_at=request_started_at,
+                ),
+                runtime_paths=runtime_paths,
+                kind="voice_transcription",
+            )
+        return result.get("text", "").strip()
+
+    except TimeoutError:
+        logger.warning("stt_transcription_timeout", timeout_seconds=_STT_TOTAL_TIMEOUT_SECONDS)
+        return None
     except Exception:
         logger.exception("Error transcribing audio")
         return None
@@ -562,10 +668,9 @@ async def _process_transcription(
         Formatted message with proper mentions and cleanup
 
     """
+    agent_names = available_agent_names if available_agent_names is not None else list(config.agents.keys())
+    team_names = available_team_names if available_team_names is not None else list(config.teams.keys())
     try:
-        # Get list of available agents and teams
-        agent_names = available_agent_names if available_agent_names is not None else list(config.agents.keys())
-        team_names = available_team_names if available_team_names is not None else list(config.teams.keys())
         agent_display_names = {name: config.agents[name].display_name for name in agent_names if name in config.agents}
         team_display_names = {name: config.teams[name].display_name for name in team_names if name in config.teams}
         registry = entity_identity_registry(config, runtime_paths)
@@ -622,7 +727,10 @@ async def _process_transcription(
                 "voice_transcription_normalizer_timeout",
                 timeout_seconds=_VOICE_NORMALIZER_LLM_TIMEOUT_SECONDS,
             )
-            return transcription
+            response = None
+
+        if response is not None:
+            await record_system_usage(response, runtime_paths=runtime_paths, kind="voice_normalization")
 
         # Extract the content from the response
         if response and response.content:
@@ -633,19 +741,18 @@ async def _process_transcription(
                 runtime_paths=runtime_paths,
             )
 
-    except Exception as e:
+    except Exception:
         logger.exception("Error processing transcription")
-        # Return error message so user knows what happened
-        from mindroom.error_handling import get_user_friendly_error_message  # noqa: PLC0415
 
-        return get_user_friendly_error_message(e, "VoiceProcessor")
-    else:
-        # Return original transcription if no valid response from model
-        return transcription
+    return _sanitize_unavailable_mentions(
+        transcription,
+        allowed_entities=set(agent_names) | set(team_names),
+        config=config,
+        runtime_paths=runtime_paths,
+    )
 
 
-async def _get_available_entities_for_sender(
-    client: nio.AsyncClient,
+def _get_available_entities_for_sender(
     room: nio.MatrixRoom,
     sender_id: str,
     config: Config,
@@ -657,8 +764,7 @@ async def _get_available_entities_for_sender(
     available_team_names: list[str] = []
     registry = entity_identity_registry(config, runtime_paths)
 
-    for matrix_id in await responder_candidate_entities_for_room(
-        client,
+    for matrix_id in responder_candidate_entities_from_cached_room(
         room,
         sender_id,
         config,

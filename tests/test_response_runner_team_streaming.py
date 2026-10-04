@@ -17,13 +17,14 @@ from agno.run.team import TeamRunOutput
 from agno.session.team import TeamSession
 
 from mindroom.bot import AgentBot
+from mindroom.cancellation import current_task_is_process_shutdown, request_task_cancel
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
-from mindroom.config.auth import AgentReplyPermission, AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import (
     ROUTER_AGENT_NAME,
 )
+from mindroom.delivery_gateway import DeliveryGateway
 from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.hooks import (
@@ -37,8 +38,10 @@ from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.response_runner import (
     ResponseRunner,
 )
-from mindroom.streaming import StreamingDeliveryError
+from mindroom.runtime_shutdown import ORDERLY_SHUTDOWN
+from mindroom.streaming import StreamingDeliveryError, UnfinishedStreamedReply
 from mindroom.tool_system.events import ToolTraceEntry
+from tests.access_schema_support import with_current_room_member_access
 from tests.ai_user_id_helpers import (
     _build_response_runner,
     _config,
@@ -123,22 +126,31 @@ async def test_generate_team_response_helper_preserves_raw_prompt_when_model_pro
 
 
 @pytest.mark.asyncio
-async def test_team_response_rechecks_every_member_before_execution(tmp_path: Path) -> None:
-    """A revoked member must fence an already-planned ad-hoc team at the locked boundary."""
+async def test_process_shutdown_blocks_team_terminal_delivery_after_generation_consumes_cancel(
+    tmp_path: Path,
+) -> None:
+    """A team provider that consumes process cancellation must leave its durable turn for replay."""
     runtime_paths = _runtime_paths(tmp_path)
-    config = _config()
-    config.agents["worker"] = AgentConfig(display_name="Worker")
-    config.authorization = AuthorizationConfig(
-        default_room_access=True,
-        agent_reply_permissions={
-            "general": AgentReplyPermission(users=["@alice:localhost"]),
-            "worker": AgentReplyPermission(users=[]),
-        },
-    )
-    config = bind_runtime_paths(config, runtime_paths)
-    bot = _make_bot(tmp_path, config=config, runtime_paths=runtime_paths, agent_name="general")
+    config = bind_runtime_paths(_config_with_team(), runtime_paths)
+    bot = _make_bot(tmp_path, config=config, runtime_paths=runtime_paths, agent_name="ultimate")
+    generation_started = asyncio.Event()
 
-    with patch("mindroom.response_runner.team_response", new=AsyncMock(return_value="unexpected")) as response:
+    async def cancellation_resistant_team_response(*_args: object, **_kwargs: object) -> str:
+        generation_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            assert current_task_is_process_shutdown()
+        return "late team response"
+
+    with (
+        patch("mindroom.response_runner.should_use_streaming", new=AsyncMock(return_value=False)),
+        patch(
+            "mindroom.response_runner.team_response",
+            new=AsyncMock(side_effect=cancellation_resistant_team_response),
+        ),
+        patch("mindroom.response_lifecycle.apply_post_response_effects", new=AsyncMock(return_value=None)),
+    ):
         coordinator = _build_response_runner(
             bot,
             config=config,
@@ -147,57 +159,119 @@ async def test_team_response_rechecks_every_member_before_execution(tmp_path: Pa
             requester_id="@alice:localhost",
             message_target=MessageTarget.resolve("!test:localhost", "$thread-root", "$user_msg"),
             orchestrator=_team_orchestrator(config, runtime_paths),
-            enable_streaming=False,
         )
-
-        event_id = await coordinator.generate_team_response_helper(
-            _response_request(user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[
-                fixture_entity_matrix_id("general", "localhost", runtime_paths),
-                fixture_entity_matrix_id("worker", "localhost", runtime_paths),
-            ],
-            team_mode="coordinate",
+        deliver_final = AsyncMock(
+            return_value=FinalDeliveryOutcome(
+                terminal_status="completed",
+                event_id="$team-response",
+            ),
         )
+        _set_gateway_method(coordinator.deps.delivery_gateway, "deliver_final", deliver_final)
+        task = asyncio.create_task(
+            coordinator.generate_team_response_helper(
+                _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
+                team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
+                team_mode="coordinate",
+            ),
+        )
+        await generation_started.wait()
+        request_task_cancel(task, process_shutdown=True)
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    assert event_id is None
-    response.assert_not_awaited()
+    deliver_final.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_configured_team_response_rechecks_only_the_team_policy(tmp_path: Path) -> None:
-    """A configured team's explicit policy must override its members' policies."""
+@pytest.mark.parametrize(
+    ("boundary", "expected_phase"),
+    [
+        ("stream", "streaming_response"),
+        ("final", "final_delivery"),
+    ],
+)
+async def test_team_delivery_exposes_fixed_shutdown_phase(
+    tmp_path: Path,
+    boundary: str,
+    expected_phase: str,
+) -> None:
+    """Real team streaming and final gateway boundaries retain fixed labels."""
     runtime_paths = _runtime_paths(tmp_path)
-    config = _config_with_team()
-    config.authorization = AuthorizationConfig(
-        default_room_access=True,
-        agent_reply_permissions={
-            "ultimate": AgentReplyPermission(users=["@alice:localhost"]),
-            "general": AgentReplyPermission(users=[]),
-        },
-    )
-    config = bind_runtime_paths(config, runtime_paths)
+    config = bind_runtime_paths(_config_with_team(), runtime_paths)
     bot = _make_bot(tmp_path, config=config, runtime_paths=runtime_paths, agent_name="ultimate")
+    coordinator = _build_response_runner(
+        bot,
+        config=config,
+        runtime_paths=runtime_paths,
+        storage_path=tmp_path,
+        requester_id="@alice:localhost",
+        message_target=MessageTarget.resolve("!test:localhost", "$thread-root", "$user_msg"),
+        orchestrator=_team_orchestrator(config, runtime_paths),
+    )
+    _install_inert_post_response_effects(coordinator)
+    boundary_started = asyncio.Event()
+    boundary_cancelled = asyncio.Event()
+    release_boundary = asyncio.Event()
 
-    with patch("mindroom.response_runner.team_response", new=AsyncMock(return_value="Team answer")) as response:
-        coordinator = _build_response_runner(
-            bot,
-            config=config,
-            runtime_paths=runtime_paths,
-            storage_path=tmp_path,
-            requester_id="@alice:localhost",
-            message_target=MessageTarget.resolve("!test:localhost", "$thread-root", "$user_msg"),
-            orchestrator=_team_orchestrator(config, runtime_paths),
-            enable_streaming=False,
+    async def retained_boundary(_request: object) -> StreamTransportOutcome | FinalDeliveryOutcome:
+        boundary_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            boundary_cancelled.set()
+            await release_boundary.wait()
+            raise
+
+    gateway = coordinator.deps.delivery_gateway
+    if boundary == "stream":
+        _set_gateway_method(
+            gateway,
+            "deliver_stream",
+            DeliveryGateway.deliver_stream.__get__(gateway, DeliveryGateway),
         )
+        _set_gateway_method(gateway, "_deliver_stream", AsyncMock(side_effect=retained_boundary))
+    else:
+        _set_gateway_method(
+            gateway,
+            "deliver_stream",
+            AsyncMock(return_value=_stream_outcome("$team-stream", "Team answer")),
+        )
+        _set_gateway_method(gateway, "_finalize_streamed_response", AsyncMock(side_effect=retained_boundary))
 
-        event_id = await coordinator.generate_team_response_helper(
-            _response_request(user_id="@alice:localhost", thread_id="$thread-root"),
+    async def fake_team_response_stream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
+        yield "Team answer"
+
+    async def team_response_owner() -> None:
+        await coordinator.generate_team_response_helper(
+            _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
             team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
-    assert event_id is not None
-    response.assert_awaited_once()
+    with (
+        patch("mindroom.response_runner.should_use_streaming", new=AsyncMock(return_value=True)),
+        patch("mindroom.response_runner.team_response_stream", new=fake_team_response_stream),
+    ):
+        response_task = coordinator.track_inbox_response(
+            team_response_owner(),
+            name=f"test_team_{boundary}_shutdown_phase",
+            recovery_proof_ready=lambda: True,
+            room_id="!room:example.org",
+        )
+        await boundary_started.wait()
+        coordinator.begin_process_shutdown()
+        await boundary_cancelled.wait()
+
+        try:
+            assert coordinator.pending_response_phase_counts == {expected_phase: 1}
+        finally:
+            release_boundary.set()
+
+        assert await coordinator.drain_inbox_responses(
+            cancel_after_seconds=0.1,
+            shutdown_intent=ORDERLY_SHUTDOWN,
+        )
+        await asyncio.gather(response_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -250,16 +324,17 @@ async def test_generate_team_response_allows_explicit_private_ad_hoc_member(tmp_
     """ResponseRunner preflight should not reject direct private members before team_response."""
     runtime_paths = _runtime_paths(tmp_path)
     config = bind_runtime_paths(
-        Config(
-            agents={
-                "private_worker": AgentConfig(
-                    display_name="PrivateWorker",
-                    private=AgentPrivateConfig(per="user", root="private_worker_data"),
-                ),
-                "calculator": AgentConfig(display_name="Calculator"),
-            },
-            models={"default": ModelConfig(provider="openai", id="test-model")},
-            authorization=AuthorizationConfig(default_room_access=True),
+        with_current_room_member_access(
+            Config(
+                agents={
+                    "private_worker": AgentConfig(
+                        display_name="PrivateWorker",
+                        private=AgentPrivateConfig(per="user", root="private_worker_data"),
+                    ),
+                    "calculator": AgentConfig(display_name="Calculator"),
+                },
+                models={"default": ModelConfig(provider="openai", id="test-model")},
+            ),
         ),
         runtime_paths,
     )
@@ -305,7 +380,11 @@ async def test_generate_team_response_allows_explicit_private_ad_hoc_member(tmp_
 
 
 @pytest.mark.asyncio
-async def test_generate_team_response_passes_resolved_correlation_id_to_team_response(tmp_path: Path) -> None:
+@pytest.mark.parametrize("history_boundary_event_id", [None, "$selection"])
+async def test_generate_team_response_passes_resolved_correlation_id_to_team_response(
+    tmp_path: Path,
+    history_boundary_event_id: str | None,
+) -> None:
     """Team execution should share the lifecycle/tool-runtime correlation id."""
     runtime_paths = _runtime_paths(tmp_path)
     config = bind_runtime_paths(_config_with_team(), runtime_paths)
@@ -332,12 +411,15 @@ async def test_generate_team_response_passes_resolved_correlation_id_to_team_res
         _install_inert_post_response_effects(coordinator)
 
         await coordinator.generate_team_response_helper(
-            _response_request(
-                prompt="Regenerate team edit",
-                user_id="@alice:localhost",
-                thread_id="$thread-root",
-                reply_to_event_id="$original",
-                correlation_id="$edit",
+            replace(
+                _response_request(
+                    prompt="Regenerate team edit",
+                    user_id="@alice:localhost",
+                    thread_id="$thread-root",
+                    reply_to_event_id="$original",
+                    correlation_id="$edit",
+                ),
+                history_boundary_event_id=history_boundary_event_id,
             ),
             team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
@@ -346,6 +428,7 @@ async def test_generate_team_response_passes_resolved_correlation_id_to_team_res
     ctx = seen_kwargs["ctx"]
     assert ctx.reply_to_event_id == "$original"
     assert ctx.correlation_id == "$edit"
+    assert ctx.history_boundary_event_id == history_boundary_event_id
 
 
 @pytest.mark.asyncio
@@ -1270,6 +1353,7 @@ def test_record_stream_delivery_error_preserves_hidden_tool_state_when_visible_t
         recorder=recorder,
         accumulated_text="Partial answer\n\n**[Response interrupted by an error: boom]**",
         tool_trace=[],
+        resumed=None,
     )
 
     snapshot = recorder.interrupted_snapshot()
@@ -1283,6 +1367,7 @@ def test_record_stream_delivery_error_preserves_hidden_tool_state_when_visible_t
         recorder=paused_recorder,
         accumulated_text="delivery failed",
         tool_trace=[],
+        resumed=None,
     )
     assert paused_recorder.original_status is RunStatus.paused
 
@@ -1291,8 +1376,43 @@ def test_record_stream_delivery_error_preserves_hidden_tool_state_when_visible_t
         recorder=empty_recorder,
         accumulated_text="",
         tool_trace=[],
+        resumed=None,
     )
     assert empty_recorder.original_status is RunStatus.error
+
+
+def test_record_stream_delivery_error_leaves_out_the_resumed_attempt(tmp_path: Path) -> None:
+    """A continuation that fails to deliver records only its own work; the stopped attempt above it is in the saved account."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = bind_runtime_paths(_config(), runtime_paths)
+    bot = _make_bot(tmp_path, config=config, runtime_paths=runtime_paths)
+    coordinator = _build_response_runner(
+        bot,
+        config=config,
+        runtime_paths=runtime_paths,
+        storage_path=tmp_path,
+        requester_id="@alice:localhost",
+    )
+    stopped_call = ToolTraceEntry(
+        type="tool_call_completed",
+        tool_name="counter",
+        args_preview="{}",
+        result_preview="1",
+    )
+    new_call = ToolTraceEntry(type="tool_call_completed", tool_name="search", args_preview="q=x", result_preview="hit")
+    resumed = UnfinishedStreamedReply(visible_text="🔧 `counter` [1]\n\nHalf of the report", tool_trace=(stopped_call,))
+    recorder = TurnRecorder(user_message="Hello")
+
+    assert coordinator._record_stream_delivery_error(
+        recorder=recorder,
+        accumulated_text=f"{resumed.resumed_text}🔧 `search` [2]\n\nThe second half",
+        tool_trace=[stopped_call, new_call],
+        resumed=resumed,
+    )
+
+    snapshot = recorder.interrupted_snapshot()
+    assert snapshot.partial_text == "The second half"
+    assert [tool.tool_name for tool in snapshot.completed_tools] == ["search"]
 
 
 @pytest.mark.asyncio
