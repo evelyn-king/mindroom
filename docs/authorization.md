@@ -101,6 +101,7 @@ Credential managers do not gain responder access.
 
 `room_defaults` supplies the default `join_policy`, `listed`, `encrypted`, `invite_users`, and `admins` values for every managed room.
 
+`rooms.<key>` also accepts `display_name` for the Matrix room name and `description` (string, default `""`) for the room's purpose shown in the dashboard.
 An authored field under `rooms.<key>` replaces the corresponding default.
 List overrides replace the whole default list instead of merging with it.
 An explicit empty list therefore disables the inherited invitations or admins for that room.
@@ -108,6 +109,7 @@ MindRoom grants missing room admins but does not demote existing power-level 100
 Removing an admin from configuration therefore stops future grants; lowering an existing grant requires a Matrix authority with greater power.
 
 `join_policy` accepts `invite`, `knock`, or `public`.
+Publishing managed rooms to the room directory with `listed: true` requires the managing service account (typically the router) to have moderator or admin power in each room.
 MindRoom reconciles join policy, directory visibility, invitations, and power levels for existing managed rooms.
 Encryption can be enabled but never disabled because enabling Matrix room encryption is irreversible.
 
@@ -143,7 +145,8 @@ A scheduled task's text never runs as a chat command when it fires, so an agent 
 The replying entity stays the message's author in conversation history and prompts, and its unaddressed replies remain agent chatter that other entities ignore.
 A mention counts once the reply is finished, including a streamed reply whose final text replaces its placeholder, and never in a reply that was stopped or failed.
 A mention in an agent's or team's message wakes the mentioned entity only while the person it acts for is a joined member of the room; an invited or departed requester, or membership MindRoom cannot confirm, wakes nobody.
-Agents also stop waking each other once a conversation has `defaults.max_consecutive_agent_replies` consecutive agent or team messages since a person last wrote there, 50 by default, and continue after the next message from a person.
+Agents also stop waking each other once a conversation has `defaults.max_consecutive_agent_replies` consecutive agent or team messages since a person last wrote there, and continue after the next message from a person.
+The setting is global, defaults to `50`, and accepts any positive integer; `1` stops agents from waking each other, and a room-level conversation counts the room's messages outside threads.
 A team's `access` authorizes requests to the team as a whole: a requester the team admits reaches every member agent through that team, even members whose own `access` would not admit them directly.
 The authoritative membership index fails closed while a referenced room is missing, stale, unresolved, or unavailable.
 Invitations do not count as joined membership, and leave, kick, or ban events revoke membership grants.

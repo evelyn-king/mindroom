@@ -173,7 +173,7 @@ agents:
 | `compress_tool_results` | bool | `null` | Compress tool results in history to save context. Inherits from `defaults.compress_tool_results` (default: `false`). On Anthropic and Vertex Claude models, setting this to `true` can mutate replayed tool messages and invalidate prompt-cache prefixes |
 | `compaction` | object | `defaults.compaction` | Per-agent required-compaction overrides |
 | `max_tool_calls_from_history` | int | `null` | Limit tool call messages replayed from history (`null` = no limit) |
-| `max_tool_calls_per_turn` | int | `null` | Tool calls one turn may execute. Further calls return a tool error, and a turn that has made this many plus two model requests ends with the text produced so far, including loops of calls to unknown tools or with unparseable arguments (`null` = `defaults.max_tool_calls_per_turn`, 500) |
+| `max_tool_calls_per_turn` | int | `null` | Tool calls one turn may execute. Further calls return a tool error, and a turn that has made this many plus two model requests ends with the text produced so far, including loops of calls to unknown tools or with unparseable arguments (`null` = `defaults.max_tool_calls_per_turn`, 1000) |
 | `show_tool_calls` | bool | `null` | Show tool-call markers and trace metadata in Matrix messages. Inherits from `defaults.show_tool_calls` (default: `true`). When `false`, inline markers and `io.mindroom.tool_trace` are omitted from sent Matrix message content. Routed tools may still show generic worker warmup text such as `Preparing isolated worker...`, but that copy never includes tool identifiers or tool-trace metadata. Note: this flag is not currently enforced by the OpenAI-compatible `/v1/chat/completions` path. |
 | `worker_tools` | list | `null` | Tool names to run in the [sandbox proxy](https://docs.mindroom.chat/deployment/sandbox-proxy/) instead of the main process. Inherits from `defaults.worker_tools`. When omitted everywhere, MindRoom uses its built-in default. Set to `[]` to disable proxying for this agent |
 | `worker_scope` | string | `null` | How sandbox runtimes are shared for non-private agents. `shared`: one per agent. `user`: one per user (shared across agents). `user_agent`: one per user+agent pair. Inherits from `defaults.worker_scope`. Do not set this when the agent uses `private`, because `private.per` already defines the requester partition for that agent |
@@ -256,36 +256,142 @@ If the configured cap cannot contain the section heading plus all required per-f
 
 ## Adaptive Participation
 
-Set `agents.<name>.participation: {}` to enable adaptive participation with the defaults below.
-Omitting it or setting it to `null` disables adaptive participation for that agent.
-These settings follow the agent into all authorized rooms, including ad hoc rooms; they do not grant room access or recruit an agent into a thread it has not joined.
-Only untagged messages in threads with multiple humans and an earlier reply from that agent are eligible.
-See [Adaptive Agent Participation](https://docs.mindroom.chat/configuration/#adaptive-agent-participation) for the full eligibility rules and judgment backend examples.
+By default, threads with two or more human participants require explicit agent mentions.
+Set `agents.<name>.participation` to let an agent that already replied in such a thread decide whether to answer an untagged message or stay silent.
+`participation: {}` enables it with the defaults below, and omitting it or setting it to `null` keeps the default behavior.
+The setting follows the agent into every room where it may reply, including ad hoc rooms, and has no room-level overrides; the retired top-level `room_participation` setting is rejected.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `debounce_seconds` | number | `3.0` | Quiet window for eligible text; must be finite and between `0` and `30` seconds, inclusive |
 | `instructions` | string | `""` | Additional guidance for deciding whether the agent should participate |
 | `decline_reaction` | string or null | `null` | Reaction to a deliberate decline; nonblank and at most 64 characters, such as `"👍"`; `null` keeps declines invisible |
-| `judgment` | object or null | `null` | Optional separate judgment backend; `provider: llm` requires a configured `model` alias, while `provider: typesafe` selects System One; `null` uses the agent's reply model |
+| `judgment` | object or null | `null` | Optional separate [judgment backend](#judgment-backends); `null` uses the agent's reply model |
 
-The [judgment backend reference](https://docs.mindroom.chat/configuration/#participation-judgment-backends) documents provider-specific thresholds, timeouts, credentials, and fallback behavior.
-The retired top-level `room_participation` configuration is rejected; there are no room-level overrides.
+```yaml
+agents:
+  assistant:
+    display_name: Assistant
+    participation:
+      debounce_seconds: 3.0
+      instructions: "Reply when you can help; leave human conversation uninterrupted."
+      decline_reaction: "👀"
+```
+
+The check runs only when all of these hold:
+
+- The message is text in a thread with at least two human participants, including the sender.
+- The message does not mention an agent or another human; explicit mentions follow normal reply rules and end the sender's pending pause.
+- This agent has already replied in the thread and may still reply to the sender.
+
+Configured human aliases count as one participant, while registered agents, the internal service account, and `bot_accounts` do not count as humans.
+Agents that are merely present in the room never join the conversation: with 50 agents in a room and two already in a thread, only those two can judge, and only if each opted in.
+Each eligible agent decides separately.
+A burst of messages from one sender becomes one turn after `debounce_seconds`.
+Commands and scheduled work never use adaptive participation, and single-human conversations keep their usual behavior.
+
+A decision to stay silent sends no reply.
+With `decline_reaction` set, each declining agent reacts once to the latest message of the turn; failed checks never react, and a failed reaction send is only logged.
+Choose the emoji with care, because 👍 can read as agreement with the message.
+
+Without `judgment`, the agent's own reply model decides with tool execution disabled, and the agent stays quiet if that check fails.
+Gemini explicit context caches, OpenAI Chat search-only requests, OpenRouter automatic web search, and Groq Compound systems cannot be checked this way and stay quiet unless a separate judgment backend approves.
+
+### Judgment Backends
+
+`participation.judgment` and `mid_turn.judgment` select a separate decision model while the agent's configured model still writes the reply.
+
+| Field | Backend | Default | Description |
+|-------|---------|---------|-------------|
+| `provider` | both | Required | `llm` for a configured model alias, or `typesafe` for System One |
+| `model` | `llm` | Required | Existing alias under `models`, which can be cheaper than the reply model |
+| `threshold` | `typesafe` | `0.8` | Minimum probability from `0` to `1`; rejected for `llm` |
+| `timeout_seconds` | both | `5` for `llm`, `1.5` for `typesafe` | Positive deadline of at most `30` seconds; for participation it starts after `debounce_seconds` |
+
+Unknown fields are rejected.
+
+```yaml
+agents:
+  assistant:
+    display_name: Assistant
+    participation:
+      instructions: "Reply when you can help; leave human conversation uninterrupted."
+      judgment:
+        provider: llm
+        model: fast
+        timeout_seconds: 5
+```
+
+To use System One instead, set `TYPESAFE_API_KEY` in the process environment or config-adjacent `.env` and change the judgment:
+
+```yaml
+      judgment:
+        provider: typesafe
+        threshold: 0.8
+        timeout_seconds: 1.5
+```
+
+The LLM backend uses the alias's normal provider credentials and receives no tools, agent system prompt, or agent memory.
+A model alias whose provider adds native tools that cannot be disabled is refused.
+For participation, a TypeSafe probability at or above `threshold` approves; the default `0.8` has not been calibrated on representative conversations.
+The two backends get the same question and context, but their judgments can differ.
+
+Judgments share a process-wide limit of eight concurrent calls and one per agent, without a waiting queue.
+Judgment outcome logs record backend, model, decision, latency, token usage, input size, and failure category, plus probability and threshold for TypeSafe, without request text or credentials.
+[Mid-Turn Coalescing](#mid-turn-coalescing) describes what its judge sees and what happens when a judgment fails.
+
+#### Participation Context and Fallback
+
+A participation judgment sends the agent's guidance and up to eight recent user and assistant messages to the backend, with Matrix identities replaced by aliases.
+System prompts, memory, tool definitions and results, and media are not sent, but message text can still contain private information.
+When the context contains media, attachment references, detected secrets, or more than 16 KB of text, it is not sent and the reply model decides instead.
+Missing credentials, a full limit, a timeout, a provider error, malformed output, or an abstention falls back to the reply model's own decision, and the agent stays quiet if that also fails.
+After a judgment backend approves, the agent replies normally, including with provider modes that the reply-model check cannot use.
 
 ## Mid-Turn Coalescing
 
-Set `agents.<name>.mid_turn` to let a judge decide whether a queued message can wait for this agent's active task to finish.
-Like participation, the setting follows the agent's Matrix user across all authorized rooms, including ad hoc rooms.
-It is separate from participation eligibility and message debounce.
-Omitting the setting or using `null` keeps the normal wrap-up notice; teams do not inherit it from their members.
+When another human message arrives during an active response, MindRoom normally sends a wrap-up notice after the current tool batch, asking the agent to stop making new tool calls and summarize its progress.
+Set `agents.<name>.mid_turn` to let a judge decide whether the queued messages can wait until the active task finishes.
+The setting follows the agent into every authorized room, including ad hoc rooms, and has no room-level overrides; the retired `room_mid_turn` setting is rejected.
+Omitting it or setting it to `null` keeps the wrap-up notice, and teams do not inherit it from their members.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `judgment` | object | Required | Shared LLM model alias or TypeSafe backend |
+| `judgment` | object | Required | LLM model alias or TypeSafe backend; see [Judgment Backends](#judgment-backends) |
 | `instructions` | string | `""` | Extra guidance for the finish-or-wrap-up decision |
-| `defer_reaction` | string or null | `null` | Optional acknowledgement such as `"👀"` when a queued message can wait; the message remains queued |
+| `defer_reaction` | string or null | `null` | Reaction such as `"👀"` when a queued message can wait; nonblank and at most 64 characters |
 
-See [Mid-Turn Coalescing](https://docs.mindroom.chat/configuration/#mid-turn-coalescing) for backend configuration, context limits, and decision behavior.
+```yaml
+agents:
+  helper:
+    display_name: Helper
+    mid_turn:
+      instructions: Continue for acknowledgements; wrap up for corrections or changed requirements.
+      defer_reaction: "👀"
+      judgment:
+        provider: llm
+        model: fast  # An existing alias under models
+        timeout_seconds: 5
+```
+
+The judge asks whether any queued message requires an immediate change, pause, or stop.
+Acknowledgements, praise, thanks, "continue", and "do not interrupt" let the task continue, while corrections and relevant changes take priority even alongside praise.
+Unrelated requests wait for a later turn unless the user asks for an immediate switch.
+With TypeSafe, the task continues when `1 - P(interrupt) >= threshold`, so the default `0.8` tolerates interruption probabilities up to `0.2`.
+With the LLM backend, an explicit `false` answer lets the task continue.
+Abstentions, timeouts, missing credentials, a full judgment limit, and backend errors keep the wrap-up behavior.
+
+The check runs between completed tool batches and never interrupts a running tool.
+The judge sees the active request, the earlier public conversation, up to eight queued human messages, the configured guidance, and the agent's visible reply text as published when each message was queued.
+Private tool results and arguments, system prompts, memory, and attachment contents are not sent, but message text can still contain private information.
+Long threads are trimmed to the judge's 16 KB limit: older messages drop out first, keeping at most the newest 63, and long earlier messages and reply snapshots are shortened to their first and last 1,000 characters, while the active request and queued messages are always sent whole.
+The wrap-up notice is sent without a judgment when the conversation history is missing or incomplete or contains media, when the active request and queued messages alone exceed the limit, when a message contains attachments or text that looks like a credential, and for `thread_mode: room` turns.
+Each skipped judgment logs `Mid-turn judgment skipped` with a reason such as `history_unavailable` or `essential_input_too_large`, and judge timeouts and backend errors log `Mid-turn continuation evaluated` with a `failure`.
+
+Queued messages stay queued and are handled after the active response finishes.
+A finish decision covers only the messages it saw, so a later message needs a new decision, and a wrap-up notice once sent is not reversed.
+The wrap-up notice asks the model to hand off; it does not cancel tools, abort the response, or inject the queued text, and stop handling and tool approval are unchanged.
+With `defer_reaction` set, each deferred message gets the reaction once; wrap-up decisions and failed judgments never react.
 
 ## Per-Agent Tool Configuration
 
@@ -454,7 +560,7 @@ The supported `worker_scope` values are:
 - `user`: one runtime per user, shared across that user's agents.
 - `user_agent`: one runtime per user+agent pair.
 
-Leave `worker_scope` unset for unscoped execution — calls still run in the sandbox, but each call gets a fresh runtime instead of a persistent one.
+Leave `worker_scope` unset for unscoped execution: dedicated Docker and Kubernetes workers still keep one persistent worker per agent, while the shared `static_runner` uses no worker-specific storage.
 `worker_scope` also affects dashboard credential support and OpenAI-compatible agent eligibility.
 
 ### Filesystem Isolation
@@ -818,6 +924,7 @@ defaults:
   max_preload_chars: 50000              # Hard cap for preloaded context from context_files
   tool_output_auto_save_threshold_bytes: 51200  # Auto-save supported tool outputs larger than 50 KiB
   show_stop_button: true                # Show a stop button while agent is responding (global-only, cannot be overridden per-agent)
+  max_consecutive_agent_replies: 50    # Agent or team messages in a row before agents stop waking each other (global-only; see authorization.md)
   num_history_runs: null                # Number of prior runs to include (null = all)
   num_history_messages: null            # Max messages from history (null = use num_history_runs)
   enable_streaming: true                # Stream agent responses via progressive message edits
@@ -838,6 +945,16 @@ defaults:
   worker_tools: null                     # Tool names to route through workers (null = use MindRoom's default routing policy, [] = disable)
   worker_scope: null                     # Worker runtime reuse for proxied tools (shared, user, user_agent)
   allow_self_config: false               # Allow agents to read/modify their own config at runtime
+  file_access: workspace                 # workspace or unrestricted; see the file_access field above
+  worker_grantable_credentials: null     # Shared credential services leased to isolated workers (null denies all); Google OAuth client and token services and google_vertex_adc cannot be granted
+  large_message_strategy: sidecar        # Oversized replies: sidecar (preview plus full text as an attachment) or split (several complete messages); global-only
+  coalescing:
+    debounce_ms: 1000                    # Milliseconds to wait for more attachments or a trailing caption after media; text dispatches immediately
+  auto_resume_after_restart: true        # Resume interrupted threads after a restart; see configuration/index.md
+  thread_summary_model: null             # Model alias for automatic thread summaries (null = default)
+  thread_summary_temperature: 0.2        # null uses provider defaults
+  thread_summary_first_threshold: 1      # Messages before the first automatic summary (integer >= 1)
+  thread_summary_subsequent_interval: 10 # Messages between later automatic summaries (integer >= 1)
 ```
 
 `defaults.streaming` is global-only and controls the timing of progressive message edits for streaming responses.

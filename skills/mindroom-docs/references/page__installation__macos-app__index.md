@@ -16,7 +16,7 @@ The app bundles the official M SVG from `assets/logo/logo-mark.svg` and its gene
   Intel Macs are not supported because the MindRoom runtime depends on packages that no longer publish Intel macOS wheels.
 - Network access to install the MindRoom runtime and connect to your Matrix server.
 - For local agents, a configured model provider credential, local model, or supported provider login.
-- For computer access, an existing Desktop-enabled MindRoom agent; application access also needs the macOS permissions described in the [Desktop guide](../tools/desktop.md).
+- For computer access, an existing Desktop-enabled MindRoom agent; application access also needs the macOS permissions described in the [Desktop guide](https://docs.mindroom.chat/tools/desktop/).
 
 ## Install
 
@@ -152,14 +152,14 @@ Replacing the signed release with a local build can invalidate the saved approva
 In that case, reinstall the signed release or remove the old permission entry and approve the current copy in System Settings, then select **Check Again**.
 
 MindRoom itself is never offered in the application list, because its windows grant shell auto-approval and control leases.
-Controlling a terminal, a scripting or automation app, the primary screen, or a browser or Matrix client signed in as you hands the agent your own authority; see [Security Model](../tools/desktop.md#security-model).
+Controlling a terminal, a scripting or automation app, the primary screen, or a browser or Matrix client signed in as you hands the agent your own authority; see [Security Model](https://docs.mindroom.chat/tools/desktop/#security-model).
 Application observation and control are separate choices.
 **Grant Control…** shows the saved identities, allowed applications, and duration for explicit confirmation.
 **Revoke Now** immediately removes input authority while observation continues; **Stop Access** ends the bridge session.
 Control expires according to the helper's bounded lease and is never renewed automatically at app launch or restart.
 The menu also provides an immediate control-revoke action while a lease is active, and **Revoke Shell Access** while shell auto-approval or a shell command is active.
 Optional browser settings and redacted diagnostics are available in expandable sections.
-See the [Desktop guide](../tools/desktop.md) for macOS permissions, pairing recovery, and browser-extension setup.
+See the [Desktop guide](https://docs.mindroom.chat/tools/desktop/) for macOS permissions, pairing recovery, and browser-extension setup.
 
 ### Folders and Shell Commands
 
@@ -191,7 +191,7 @@ Without a waiting request, **Allow Without Asking…** offers the same durations
 While a command waits, a **Review Command** bar appears in every window section, and the menu bar shows **Command waiting** with **Review Command…**.
 The menu only opens the card; it never approves a command.
 Stopping computer access or quitting MindRoom also revokes auto-approval and stops every shell command.
-See [Shell Commands](../tools/desktop.md#shell-commands) for handles, output limits, the login-shell environment, and what the model provider receives.
+See [Shell Commands](https://docs.mindroom.chat/tools/desktop/#shell-commands) for handles, output limits, the login-shell environment, and what the model provider receives.
 
 ## Window, Menu Bar, and Login
 
