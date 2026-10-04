@@ -118,7 +118,7 @@ const DEFAULT_TAB = NAV_ITEMS[0].value;
 const NAV_VALUES = new Set(NAV_ITEMS.map((item) => item.value));
 
 const TAB_TRIGGER_CLASS =
-  "inline-flex items-center gap-1.5 rounded-lg data-[state=active]:bg-white/50 dark:data-[state=active]:bg-primary/20 data-[state=active]:text-primary data-[state=active]:shadow-sm data-[state=active]:backdrop-blur-xl data-[state=active]:border data-[state=active]:border-white/50 dark:data-[state=active]:border-primary/30 transition-all whitespace-nowrap";
+  "inline-flex items-center gap-1.5 rounded-lg data-[state=active]:bg-primary/15 data-[state=active]:text-primary data-[state=active]:shadow-sm data-[state=active]:backdrop-blur-xl data-[state=active]:border data-[state=active]:border-primary/30 transition-all whitespace-nowrap";
 const NAV_OVERFLOW_ENTER_PX = 1;
 const NAV_OVERFLOW_EXIT_BUFFER_PX = 24;
 
@@ -296,15 +296,15 @@ function AppContent() {
 
     if (!isAuthError && canRecoverInvalidConfig) {
       return (
-        <div className="flex items-center justify-center h-screen bg-gradient-to-br from-amber-50 via-orange-50/40 to-yellow-50/50 dark:from-stone-950 dark:via-stone-900 dark:to-amber-950/20">
-          <div className="max-w-4xl w-full mx-4 p-6 bg-white dark:bg-stone-900 rounded-lg shadow-lg space-y-4">
+        <div className="app-background flex items-center justify-center h-screen">
+          <div className="max-w-4xl w-full mx-4 p-6 bg-card/95 rounded-lg shadow-lg space-y-4">
             <div className="space-y-2">
-              <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
+              <h2 className="text-xl font-semibold text-foreground">
                 {validationIssues.length > 0
                   ? "Configuration Validation Failed"
                   : "Configuration Recovery"}
               </h2>
-              <p className="text-sm text-gray-600 dark:text-gray-300">
+              <p className="text-sm text-muted-foreground">
                 The current <code>config.yaml</code> could not be loaded. Edit
                 the raw configuration below and save it as a full replacement.
               </p>
@@ -342,7 +342,7 @@ function AppContent() {
             />
 
             <div className="flex items-center justify-between gap-3">
-              <p className="text-xs text-gray-500 dark:text-gray-400">
+              <p className="text-xs text-muted-foreground">
                 Saving here replaces the entire <code>config.yaml</code> with
                 the edited source.
               </p>
@@ -368,15 +368,15 @@ function AppContent() {
     }
 
     return (
-      <div className="flex items-center justify-center h-screen bg-gradient-to-br from-amber-50 via-orange-50/40 to-yellow-50/50 dark:from-stone-950 dark:via-stone-900 dark:to-amber-950/20">
-        <div className="max-w-md w-full mx-4 p-6 bg-white dark:bg-stone-900 rounded-lg shadow-lg">
+      <div className="app-background flex items-center justify-center h-screen">
+        <div className="max-w-md w-full mx-4 p-6 bg-card/95 rounded-lg shadow-lg">
           <div className="flex items-center mb-4">
             <span className="text-3xl mr-3">🔒</span>
-            <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
+            <h2 className="text-xl font-semibold text-foreground">
               {isAuthError ? "Access Required" : "Configuration Error"}
             </h2>
           </div>
-          <p className="text-gray-600 dark:text-gray-300 mb-6">{error}</p>
+          <p className="text-muted-foreground mb-6">{error}</p>
 
           {!isAuthError && validationIssues.length > 0 && (
             <div className="mb-6 rounded-md border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-destructive">
@@ -455,15 +455,15 @@ function AppContent() {
 
   return (
     <div className="flex flex-col h-screen relative overflow-hidden">
-      {/* Warm gradient background layers */}
-      <div className="absolute inset-0 bg-gradient-to-br from-amber-50 via-orange-50/40 to-yellow-50/50 dark:from-stone-950 dark:via-stone-900 dark:to-amber-950/20" />
-      <div className="absolute inset-0 bg-gradient-to-tl from-orange-100/30 via-transparent to-amber-100/20 dark:from-amber-950/10 dark:via-transparent dark:to-orange-950/10" />
+      {/* Theme background layers */}
+      <div className="app-background absolute inset-0" />
+      <div className="app-background-overlay absolute inset-0" />
       <div className="absolute inset-0 gradient-mesh" />
 
       {/* Content wrapper */}
       <div className="relative z-10 flex flex-col h-full">
         {/* Header */}
-        <header className="bg-white/80 dark:bg-stone-900/50 backdrop-blur-xl border-b border-gray-200/50 dark:border-white/10 shadow-sm dark:shadow-2xl">
+        <header className="bg-card/70 backdrop-blur-xl border-b border-border/70 shadow-sm dark:shadow-2xl">
           <div className="px-3 sm:px-6 py-2 sm:py-4 flex items-center justify-between gap-2">
             <h1 className="flex items-center gap-2 sm:gap-3">
               <img
@@ -472,10 +472,10 @@ function AppContent() {
                 className="h-8 w-8 sm:h-10 sm:w-10 shrink-0"
               />
               <div className="flex flex-col">
-                <span className="text-base sm:text-3xl font-bold tracking-tight text-gray-900 dark:text-white">
+                <span className="text-base sm:text-3xl font-bold tracking-tight text-foreground">
                   MindRoom
                 </span>
-                <span className="hidden sm:block text-xs sm:text-sm font-normal text-gray-600 dark:text-gray-400 -mt-1">
+                <span className="hidden sm:block text-xs sm:text-sm font-normal text-muted-foreground -mt-1">
                   Configuration
                 </span>
               </div>
@@ -488,19 +488,19 @@ function AppContent() {
                 aria-haspopup="dialog"
                 aria-expanded={mobileMenuOpen}
                 className={cn(
-                  "h-[30px] max-w-[8.5rem] sm:max-w-[11rem] rounded-lg border border-white/60 dark:border-white/10 bg-white/80 dark:bg-stone-900/70 backdrop-blur-xl px-2 py-1.5 items-center gap-1.5 min-w-0 text-left shadow-sm",
+                  "h-[30px] max-w-[8.5rem] sm:max-w-[11rem] rounded-lg border border-border/70 bg-card/80 backdrop-blur-xl px-2 py-1.5 items-center gap-1.5 min-w-0 text-left shadow-sm",
                   desktopCompactNav ? "flex" : "flex sm:hidden",
                 )}
               >
-                <CurrentNavIcon className="h-4 w-4 shrink-0 text-gray-700 dark:text-gray-200" />
-                <span className="text-xs font-medium text-gray-900 dark:text-gray-100 truncate">
+                <CurrentNavIcon className="h-4 w-4 shrink-0 text-foreground/80" />
+                <span className="text-xs font-medium text-foreground truncate">
                   {currentNavItem.label}
                 </span>
-                <Menu className="h-4 w-4 shrink-0 text-gray-600 dark:text-gray-300" />
+                <Menu className="h-4 w-4 shrink-0 text-muted-foreground" />
               </button>
               <ThemeToggle
                 className={cn(
-                  "h-[30px] w-[30px] rounded-lg border-white/60 dark:border-white/10 bg-white/80 dark:bg-stone-900/70 backdrop-blur-xl shadow-sm hover:bg-white/90 dark:hover:bg-stone-900/80",
+                  "h-[30px] w-[30px] rounded-lg border-border/70 bg-card/80 backdrop-blur-xl shadow-sm hover:bg-card",
                   desktopCompactNav
                     ? "sm:h-[30px] sm:w-[30px]"
                     : "sm:h-9 sm:w-9",
@@ -577,7 +577,7 @@ function AppContent() {
             <TabsList
               ref={tabsListRef}
               className={cn(
-                "hidden sm:flex px-3 sm:px-6 py-3 bg-white/70 dark:bg-stone-900/50 backdrop-blur-lg border-b border-gray-200/50 dark:border-white/10 flex-shrink-0 overflow-x-auto overflow-y-hidden",
+                "hidden sm:flex px-3 sm:px-6 py-3 bg-card/65 backdrop-blur-lg border-b border-border/70 flex-shrink-0 overflow-x-auto overflow-y-hidden",
                 desktopCompactNav &&
                   "sm:absolute sm:inset-x-0 sm:top-0 sm:opacity-0 sm:pointer-events-none sm:overflow-hidden",
               )}
@@ -598,19 +598,19 @@ function AppContent() {
             </TabsList>
 
             <Dialog open={mobileMenuOpen} onOpenChange={setMobileMenuOpen}>
-              <DialogContent className="w-[calc(100%-1.5rem)] max-w-sm p-0 border-white/60 dark:border-white/10 bg-white/95 dark:bg-stone-900/95 backdrop-blur-xl">
+              <DialogContent className="w-[calc(100%-1.5rem)] max-w-sm p-0 border-border/70 bg-card/95 backdrop-blur-xl">
                 <DialogHeader className="px-4 pt-4 pb-2 text-left">
-                  <DialogTitle className="text-base text-gray-900 dark:text-gray-100">
+                  <DialogTitle className="text-base text-foreground">
                     Navigate
                   </DialogTitle>
-                  <DialogDescription className="text-xs text-gray-600 dark:text-gray-400">
+                  <DialogDescription className="text-xs text-muted-foreground">
                     Choose a section
                   </DialogDescription>
                 </DialogHeader>
                 <div className="max-h-[70vh] overflow-y-auto px-2 pb-3">
                   {NAV_GROUPS.map((group) => (
                     <div key={group} className="mb-3 last:mb-0">
-                      <p className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                      <p className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                         {group}
                       </p>
                       <div className="space-y-1">
@@ -626,8 +626,8 @@ function AppContent() {
                                 aria-current={isActive ? "page" : undefined}
                                 className={`w-full rounded-lg px-3 py-2 text-sm flex items-center justify-between transition-colors ${
                                   isActive
-                                    ? "bg-primary/10 dark:bg-primary/20 text-primary"
-                                    : "text-gray-700 dark:text-gray-200 hover:bg-gray-100/80 dark:hover:bg-white/10"
+                                    ? "bg-primary/15 text-primary"
+                                    : "text-foreground/80 hover:bg-accent/70 hover:text-accent-foreground"
                                 }`}
                               >
                                 <span className="flex items-center gap-2">

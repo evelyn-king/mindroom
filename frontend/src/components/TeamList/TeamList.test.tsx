@@ -104,7 +104,7 @@ describe("TeamList", () => {
     render(<TeamList />);
 
     const devTeamCard = screen.getByText("Dev Team").closest(".rounded-xl");
-    expect(devTeamCard).toHaveClass("ring-2", "ring-orange-500");
+    expect(devTeamCard).toHaveClass("ring-2", "ring-primary");
   });
 
   it("shows create team form when plus button is clicked", () => {

@@ -1,0 +1,241 @@
+@layer base {
+  :root[data-theme="gruvbox-light"] {
+    --background: 48 86.7% 88.2%;
+    --foreground: 20 5.3% 22.4%;
+    --card: 47 89.2% 92.7%;
+    --card-foreground: 20 5.3% 22.4%;
+    --popover: 47 89.2% 92.7%;
+    --popover-foreground: 20 5.3% 22.4%;
+    --primary: 190 89% 24.9%;
+    --primary-foreground: 48 86.7% 88.2%;
+    --secondary: 43 58.8% 81%;
+    --secondary-foreground: 20 5.3% 22.4%;
+    --muted: 40 38.2% 73.3%;
+    --muted-foreground: 27 9.7% 36.5%;
+    --accent: 43 58.8% 81%;
+    --accent-foreground: 20 5.3% 22.4%;
+    --destructive: 358 100% 30.8%;
+    --destructive-foreground: 48 86.7% 88.2%;
+    --border: 39 24.1% 65.9%;
+    --input: 43 58.8% 81%;
+    --ring: 190 89% 24.9%;
+    --theme-gradient-from: 48 86.7% 88.2%;
+    --theme-gradient-via: 53 73.9% 91%;
+    --theme-gradient-to: 46 67.5% 84.3%;
+    --theme-overlay-from: 37 80.1% 39.4%;
+    --theme-overlay-to: 19 96.6% 34.9%;
+    --theme-mesh-primary: 37 80.1% 39.4%;
+    --theme-mesh-secondary: 143 30.2% 37.1%;
+    --theme-mesh-tertiary: 323 38.8% 40.4%;
+  }
+
+  :root[data-theme="catppuccin-latte"] {
+    --background: 220 23.1% 94.9%;
+    --foreground: 234 16% 35.5%;
+    --card: 220 27.3% 97.8%;
+    --card-foreground: 234 16% 35.5%;
+    --popover: 220 27.3% 97.8%;
+    --popover-foreground: 234 16% 35.5%;
+    --primary: 269 64.1% 49.2%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 20.7% 88.6%;
+    --secondary-foreground: 234 16% 35.5%;
+    --muted: 220 20.7% 88.6%;
+    --muted-foreground: 233 12.8% 41.4%;
+    --accent: 223 15.9% 82.7%;
+    --accent-foreground: 234 16% 35.5%;
+    --destructive: 347 86.7% 44.1%;
+    --destructive-foreground: 220 23.1% 94.9%;
+    --border: 227 12.2% 71%;
+    --input: 223 15.9% 82.7%;
+    --ring: 266 85% 58%;
+    --theme-gradient-from: 220 23.1% 94.9%;
+    --theme-gradient-via: 220 22% 92%;
+    --theme-gradient-to: 220 20.7% 88.6%;
+    --theme-overlay-from: 266 85% 58%;
+    --theme-overlay-to: 316 73.4% 69%;
+    --theme-mesh-primary: 266 85% 58%;
+    --theme-mesh-secondary: 197 96.6% 45.7%;
+    --theme-mesh-tertiary: 347 86.7% 44.1%;
+  }
+
+  :root[data-theme="tokyo-night-day"] {
+    --background: 230 11.1% 89.4%;
+    --foreground: 228 25.7% 27.5%;
+    --card: 228 20% 95.1%;
+    --card-foreground: 228 25.7% 27.5%;
+    --popover: 228 20% 95.1%;
+    --popover-foreground: 228 25.7% 27.5%;
+    --primary: 220 60.2% 46.3%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 229 22.9% 81.2%;
+    --secondary-foreground: 228 25.7% 27.5%;
+    --muted: 229 22.9% 81.2%;
+    --muted-foreground: 231 23.7% 40.6%;
+    --accent: 226 44% 80.4%;
+    --accent-foreground: 228 25.7% 27.5%;
+    --destructive: 343 91% 56.3%;
+    --destructive-foreground: 240 15.4% 10.2%;
+    --border: 227 24.1% 69%;
+    --input: 229 22.9% 81.2%;
+    --ring: 215 81% 54.7%;
+    --theme-gradient-from: 230 11.1% 89.4%;
+    --theme-gradient-via: 224 25.3% 85.3%;
+    --theme-gradient-to: 229 22.9% 81.2%;
+    --theme-overlay-from: 215 81% 54.7%;
+    --theme-overlay-to: 266 84.9% 63.7%;
+    --theme-mesh-primary: 215 81% 54.7%;
+    --theme-mesh-secondary: 195 100% 29.6%;
+    --theme-mesh-tertiary: 266 84.9% 63.7%;
+  }
+
+  :root[data-theme="nord-light"] {
+    --background: 218 26.7% 94.1%;
+    --foreground: 220 16.4% 21.6%;
+    --card: 210 20% 98%;
+    --card-foreground: 220 16.4% 21.6%;
+    --popover: 210 20% 98%;
+    --popover-foreground: 220 16.4% 21.6%;
+    --primary: 211 34.3% 41.8%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 219 27.9% 88%;
+    --secondary-foreground: 220 16.4% 21.6%;
+    --muted: 219 27.9% 88%;
+    --muted-foreground: 220 16.8% 31.6%;
+    --accent: 219 27.9% 88%;
+    --accent-foreground: 220 16.4% 21.6%;
+    --destructive: 354 42.3% 56.5%;
+    --destructive-foreground: 0 0% 6.7%;
+    --border: 216 18.2% 73.1%;
+    --input: 219 27.9% 88%;
+    --ring: 211 34.3% 41.8%;
+    --theme-gradient-from: 218 26.7% 94.1%;
+    --theme-gradient-via: 218 26.8% 92%;
+    --theme-gradient-to: 219 27.9% 88%;
+    --theme-overlay-from: 193 43.4% 67.5%;
+    --theme-overlay-to: 213 32% 52.2%;
+    --theme-mesh-primary: 193 43.4% 67.5%;
+    --theme-mesh-secondary: 179 25.1% 64.9%;
+    --theme-mesh-tertiary: 210 34% 63.1%;
+  }
+
+  .dark[data-theme="gruvbox"] {
+    --background: 0 0% 15.7%;
+    --foreground: 43 58.8% 81%;
+    --card: 20 5.3% 22.4%;
+    --card-foreground: 43 58.8% 81%;
+    --popover: 20 5.3% 22.4%;
+    --popover-foreground: 43 58.8% 81%;
+    --primary: 42 95.3% 58.2%;
+    --primary-foreground: 0 0% 15.7%;
+    --secondary: 22 7.4% 29.2%;
+    --secondary-foreground: 43 58.8% 81%;
+    --muted: 22 7.4% 29.2%;
+    --muted-foreground: 39 24.1% 65.9%;
+    --accent: 27 9.7% 36.5%;
+    --accent-foreground: 43 58.8% 81%;
+    --destructive: 6 96.1% 59.4%;
+    --destructive-foreground: 0 0% 15.7%;
+    --border: 27 9.7% 36.5%;
+    --input: 22 7.4% 29.2%;
+    --ring: 42 95.3% 58.2%;
+    --theme-gradient-from: 0 0% 15.7%;
+    --theme-gradient-via: 20 5.3% 22.4%;
+    --theme-gradient-to: 20 9.8% 12.2%;
+    --theme-overlay-from: 42 95.3% 58.2%;
+    --theme-overlay-to: 27 99.1% 54.7%;
+    --theme-mesh-primary: 42 95.3% 58.2%;
+    --theme-mesh-secondary: 157 15.9% 58%;
+    --theme-mesh-tertiary: 104 35.1% 62%;
+  }
+
+  .dark[data-theme="catppuccin"] {
+    --background: 240 21.1% 14.9%;
+    --foreground: 226 63.9% 88%;
+    --card: 237 16.2% 22.9%;
+    --card-foreground: 226 63.9% 88%;
+    --popover: 237 16.2% 22.9%;
+    --popover-foreground: 226 63.9% 88%;
+    --primary: 267 83.5% 81%;
+    --primary-foreground: 240 22.7% 8.6%;
+    --secondary: 234 13.2% 31.2%;
+    --secondary-foreground: 226 63.9% 88%;
+    --muted: 237 16.2% 22.9%;
+    --muted-foreground: 228 23.6% 71.8%;
+    --accent: 234 13.2% 31.2%;
+    --accent-foreground: 226 63.9% 88%;
+    --destructive: 343 81.3% 74.9%;
+    --destructive-foreground: 240 22.7% 8.6%;
+    --border: 234 13.2% 31.2%;
+    --input: 237 16.2% 22.9%;
+    --ring: 267 83.5% 81%;
+    --theme-gradient-from: 240 21.1% 14.9%;
+    --theme-gradient-via: 240 21.3% 12%;
+    --theme-gradient-to: 240 22.7% 8.6%;
+    --theme-overlay-from: 267 83.5% 81%;
+    --theme-overlay-to: 316 71.8% 86.1%;
+    --theme-mesh-primary: 267 83.5% 81%;
+    --theme-mesh-secondary: 189 71% 72.9%;
+    --theme-mesh-tertiary: 343 81.3% 74.9%;
+  }
+
+  .dark[data-theme="tokyo-night"] {
+    --background: 235 18.8% 12.5%;
+    --foreground: 229 72.6% 85.7%;
+    --card: 230 24.2% 18.6%;
+    --card-foreground: 229 72.6% 85.7%;
+    --popover: 230 24.2% 18.6%;
+    --popover-foreground: 229 72.6% 85.7%;
+    --primary: 221 88.7% 72.4%;
+    --primary-foreground: 240 15.4% 10.2%;
+    --secondary: 228 23.4% 21%;
+    --secondary-foreground: 229 72.6% 85.7%;
+    --muted: 228 23.4% 21%;
+    --muted-foreground: 229 35.4% 75.1%;
+    --accent: 229 24.4% 30.6%;
+    --accent-foreground: 229 72.6% 85.7%;
+    --destructive: 349 89% 71.6%;
+    --destructive-foreground: 240 15.4% 10.2%;
+    --border: 229 24.4% 30.6%;
+    --input: 228 23.4% 21%;
+    --ring: 221 88.7% 72.4%;
+    --theme-gradient-from: 235 18.8% 12.5%;
+    --theme-gradient-via: 240 15.4% 10.2%;
+    --theme-gradient-to: 230 24.2% 18.6%;
+    --theme-overlay-from: 221 88.7% 72.4%;
+    --theme-overlay-to: 261 85.3% 78.6%;
+    --theme-mesh-primary: 221 88.7% 72.4%;
+    --theme-mesh-secondary: 202 100% 74.5%;
+    --theme-mesh-tertiary: 261 85.3% 78.6%;
+  }
+
+  .dark[data-theme="nord"] {
+    --background: 220 16.4% 21.6%;
+    --foreground: 218 26.7% 94.1%;
+    --card: 222 16.3% 27.6%;
+    --card-foreground: 218 26.7% 94.1%;
+    --popover: 222 16.3% 27.6%;
+    --popover-foreground: 218 26.7% 94.1%;
+    --primary: 193 43.4% 67.5%;
+    --primary-foreground: 220 16.4% 21.6%;
+    --secondary: 220 16.8% 31.6%;
+    --secondary-foreground: 218 26.7% 94.1%;
+    --muted: 220 16.8% 31.6%;
+    --muted-foreground: 219 27.9% 88%;
+    --accent: 220 16.5% 35.7%;
+    --accent-foreground: 218 26.7% 94.1%;
+    --destructive: 354 42.3% 56.5%;
+    --destructive-foreground: 218 26.7% 94.1%;
+    --border: 220 16.5% 35.7%;
+    --input: 220 16.8% 31.6%;
+    --ring: 193 43.4% 67.5%;
+    --theme-gradient-from: 220 16.4% 21.6%;
+    --theme-gradient-via: 222 16.3% 27.6%;
+    --theme-gradient-to: 220 16.8% 31.6%;
+    --theme-overlay-from: 193 43.4% 67.5%;
+    --theme-overlay-to: 210 34% 63.1%;
+    --theme-mesh-primary: 193 43.4% 67.5%;
+    --theme-mesh-secondary: 179 25.1% 64.9%;
+    --theme-mesh-tertiary: 210 34% 63.1%;
+  }
+}

@@ -23,7 +23,7 @@ export const sharedStyles = {
   search: {
     container: "relative mt-2",
     input: "pl-8 h-10 sm:h-9",
-    icon: "absolute left-2 top-3 sm:top-2.5 h-4 w-4 text-gray-400",
+    icon: "absolute left-2 top-3 sm:top-2.5 h-4 w-4 text-muted-foreground",
     inputFullWidth: "w-full",
   },
 
@@ -31,19 +31,18 @@ export const sharedStyles = {
   item: {
     container:
       "w-full text-left px-3 py-3 sm:py-2 rounded-lg transition-all duration-200 min-h-[44px] sm:min-h-0",
-    containerHover: "hover:bg-gray-100 dark:hover:bg-white/5 hover:shadow-sm",
+    containerHover: "hover:bg-accent/70 hover:shadow-sm",
     containerCard: "cursor-pointer transition-all hover:shadow-md",
     selected:
-      "bg-amber-50 dark:bg-gradient-to-r dark:from-primary/20 dark:to-primary/10 hover:bg-amber-100 dark:hover:from-primary/30 dark:hover:to-primary/20 shadow-sm dark:shadow-lg backdrop-blur-xl",
-    selectedCard:
-      "ring-2 ring-orange-500 bg-gradient-to-r from-orange-500/10 to-amber-500/10",
+      "bg-primary/10 hover:bg-primary/15 shadow-sm dark:shadow-lg backdrop-blur-xl",
+    selectedCard: "ring-2 ring-primary bg-primary/10",
     iconContainer: "flex items-center gap-2 transition-all duration-200",
     icon: "h-4 w-4 transition-colors",
     iconSelected: "text-primary dark:text-primary",
-    iconDefault: "text-gray-500 dark:text-gray-400",
+    iconDefault: "text-muted-foreground",
     content: "flex-1 min-w-0",
     title: "font-medium text-sm",
-    subtitle: "text-xs text-gray-500 dark:text-gray-400 truncate",
+    subtitle: "text-xs text-muted-foreground truncate",
     cardContent: "p-3 sm:p-4",
     cardTitle: "font-medium text-sm",
     cardDescription: "text-xs text-muted-foreground mt-1",

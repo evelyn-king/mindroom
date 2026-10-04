@@ -276,10 +276,10 @@ export function Dashboard() {
       <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
         <div>
           <h2 className="text-xl sm:text-2xl font-bold">System Overview</h2>
-          <p className="text-sm sm:text-base text-amber-700 dark:text-amber-300">
+          <p className="text-sm sm:text-base text-muted-foreground">
             Monitor your MindRoom configuration and status
           </p>
-          <p className="text-xs text-amber-600 dark:text-amber-400 mt-1 flex items-center gap-1">
+          <p className="text-xs text-primary mt-1 flex items-center gap-1">
             <RefreshCw className="w-3 h-3" /> Last updated:{" "}
             {lastUpdated.toLocaleTimeString()}
           </p>
@@ -354,21 +354,21 @@ export function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-amber-100 dark:bg-yellow-900/30">
-                <Bot className="w-5 h-5 text-amber-700 dark:text-amber-300" />
+              <div className="p-2 rounded-lg bg-primary/10">
+                <Bot className="w-5 h-5 text-primary" />
               </div>
               <div>
-                <CardTitle className="text-2xl font-bold text-amber-900 dark:text-amber-100">
+                <CardTitle className="text-2xl font-bold text-foreground">
                   {stats.totalAgents}
                 </CardTitle>
-                <CardDescription className="text-amber-700 dark:text-amber-300">
+                <CardDescription className="text-primary">
                   Agents
                 </CardDescription>
               </div>
             </div>
           </CardHeader>
           <CardContent>
-            <div className="flex items-center gap-3 text-xs text-amber-700 dark:text-amber-300">
+            <div className="flex items-center gap-3 text-xs text-muted-foreground">
               <span className="flex items-center gap-1">
                 <div className="w-2 h-2 rounded-full bg-green-500"></div>{" "}
                 {stats.agentsOnline}
@@ -392,21 +392,21 @@ export function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-orange-100 dark:bg-orange-900/30">
-                <Home className="w-5 h-5 text-orange-700 dark:text-orange-300" />
+              <div className="p-2 rounded-lg bg-primary/10">
+                <Home className="w-5 h-5 text-primary" />
               </div>
               <div>
-                <CardTitle className="text-2xl font-bold text-orange-900 dark:text-orange-100">
+                <CardTitle className="text-2xl font-bold text-foreground">
                   {stats.totalRooms}
                 </CardTitle>
-                <CardDescription className="text-orange-700 dark:text-orange-300">
+                <CardDescription className="text-primary">
                   Rooms
                 </CardDescription>
               </div>
             </div>
           </CardHeader>
           <CardContent>
-            <p className="text-xs text-orange-700 dark:text-orange-300">
+            <p className="text-xs text-muted-foreground">
               {stats.activeConnections} configured
             </p>
           </CardContent>
@@ -415,21 +415,21 @@ export function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-yellow-100 dark:bg-yellow-900/30">
-                <Users className="w-5 h-5 text-yellow-700 dark:text-yellow-300" />
+              <div className="p-2 rounded-lg bg-primary/10">
+                <Users className="w-5 h-5 text-primary" />
               </div>
               <div>
-                <CardTitle className="text-2xl font-bold text-yellow-900 dark:text-yellow-100">
+                <CardTitle className="text-2xl font-bold text-foreground">
                   {stats.totalTeams}
                 </CardTitle>
-                <CardDescription className="text-yellow-700 dark:text-yellow-300">
+                <CardDescription className="text-primary">
                   Teams
                 </CardDescription>
               </div>
             </div>
           </CardHeader>
           <CardContent>
-            <p className="text-xs text-yellow-700 dark:text-yellow-300">
+            <p className="text-xs text-muted-foreground">
               {teams.reduce((acc, team) => acc + team.agents.length, 0)} members
             </p>
           </CardContent>
@@ -438,23 +438,21 @@ export function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-stone-100 dark:bg-stone-900/30">
-                <Settings className="w-5 h-5 text-stone-700 dark:text-stone-300" />
+              <div className="p-2 rounded-lg bg-muted">
+                <Settings className="w-5 h-5 text-muted-foreground" />
               </div>
               <div>
-                <CardTitle className="text-2xl font-bold text-stone-900 dark:text-stone-100">
+                <CardTitle className="text-2xl font-bold text-foreground">
                   {stats.modelsInUse}
                 </CardTitle>
-                <CardDescription className="text-stone-700 dark:text-stone-300">
+                <CardDescription className="text-muted-foreground">
                   Models
                 </CardDescription>
               </div>
             </div>
           </CardHeader>
           <CardContent>
-            <p className="text-xs text-stone-700 dark:text-stone-300">
-              in configuration
-            </p>
+            <p className="text-xs text-muted-foreground">in configuration</p>
           </CardContent>
         </Card>
 
@@ -464,25 +462,25 @@ export function Dashboard() {
               <div
                 className={`p-2 rounded-lg ${
                   stats.voiceEnabled
-                    ? "bg-purple-100 dark:bg-purple-900/30"
-                    : "bg-gray-100 dark:bg-gray-900/30"
+                    ? "bg-primary/10"
+                    : "bg-muted"
                 }`}
               >
                 {stats.voiceEnabled ? (
-                  <Mic className="w-5 h-5 text-purple-700 dark:text-purple-300" />
+                  <Mic className="w-5 h-5 text-primary" />
                 ) : (
-                  <MicOff className="w-5 h-5 text-gray-500 dark:text-gray-400" />
+                  <MicOff className="w-5 h-5 text-muted-foreground" />
                 )}
               </div>
               <div>
-                <CardTitle className="text-2xl font-bold text-purple-900 dark:text-purple-100">
+                <CardTitle className="text-2xl font-bold text-foreground">
                   Voice
                 </CardTitle>
                 <CardDescription
                   className={
                     stats.voiceEnabled
-                      ? "text-purple-700 dark:text-purple-300"
-                      : "text-gray-500 dark:text-gray-400"
+                      ? "text-primary"
+                      : "text-muted-foreground"
                   }
                 >
                   {stats.voiceEnabled ? "Enabled" : "Disabled"}
@@ -494,8 +492,8 @@ export function Dashboard() {
             <p
               className={`text-xs ${
                 stats.voiceEnabled
-                  ? "text-purple-700 dark:text-purple-300"
-                  : "text-gray-500 dark:text-gray-400"
+                  ? "text-primary"
+                  : "text-muted-foreground"
               }`}
             >
               {stats.voiceEnabled
@@ -510,11 +508,11 @@ export function Dashboard() {
       <div className="mb-4 hidden lg:block">
         <Card>
           <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-amber-900 dark:text-amber-100">
-              <BarChart3 className="w-6 h-6 text-amber-700 dark:text-amber-300" />
+            <CardTitle className="flex items-center gap-2 text-foreground">
+              <BarChart3 className="w-6 h-6 text-primary" />
               System Insights
             </CardTitle>
-            <CardDescription className="text-amber-700 dark:text-amber-300">
+            <CardDescription className="text-muted-foreground">
               Key metrics and actionable insights about your MindRoom
               configuration
             </CardDescription>
@@ -549,11 +547,11 @@ export function Dashboard() {
         <div className="col-span-1 lg:col-span-4">
           <Card>
             <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-amber-900 dark:text-amber-100">
-                <Bot className="w-6 h-6 text-amber-700 dark:text-amber-300" />
+              <CardTitle className="flex items-center gap-2 text-foreground">
+                <Bot className="w-6 h-6 text-primary" />
                 Agents
               </CardTitle>
-              <CardDescription className="text-amber-700 dark:text-amber-300">
+              <CardDescription className="text-muted-foreground">
                 Click an agent to see details
               </CardDescription>
             </CardHeader>
@@ -632,11 +630,11 @@ export function Dashboard() {
         <div className="col-span-1 lg:col-span-5">
           <Card>
             <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-amber-900 dark:text-amber-100">
-                <Home className="w-6 h-6 text-amber-700 dark:text-amber-300" />
+              <CardTitle className="flex items-center gap-2 text-foreground">
+                <Home className="w-6 h-6 text-primary" />
                 Rooms Overview
               </CardTitle>
-              <CardDescription className="text-amber-700 dark:text-amber-300">
+              <CardDescription className="text-muted-foreground">
                 Click a room to see details
               </CardDescription>
             </CardHeader>
@@ -713,8 +711,8 @@ export function Dashboard() {
                         </div>
 
                         {roomTeams.length > 0 && (
-                          <div className="mt-2 pt-2 border-t border-gray-200 dark:border-gray-700">
-                            <div className="text-xs text-amber-600 dark:text-amber-400 mb-1">
+                          <div className="mt-2 pt-2 border-t border-border">
+                            <div className="text-xs text-muted-foreground mb-1">
                               Teams:
                             </div>
                             <div className="flex flex-wrap gap-1">
@@ -722,7 +720,7 @@ export function Dashboard() {
                                 <Badge
                                   key={team.id}
                                   variant="outline"
-                                  className="text-xs px-1 py-0 bg-purple-50 dark:bg-purple-950 flex items-center gap-1"
+                                  className="text-xs px-1 py-0 bg-secondary flex items-center gap-1"
                                 >
                                   <Users className="w-3 h-3" />{" "}
                                   {team.display_name}
@@ -744,8 +742,8 @@ export function Dashboard() {
         <div className="col-span-1 lg:col-span-3">
           <Card>
             <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-amber-900 dark:text-amber-100">
-                <User className="w-6 h-6 text-amber-700 dark:text-amber-300" />
+              <CardTitle className="flex items-center gap-2 text-foreground">
+                <User className="w-6 h-6 text-primary" />
                 Details
               </CardTitle>
             </CardHeader>
@@ -757,7 +755,7 @@ export function Dashboard() {
                       {selectedRoom.display_name}
                     </h3>
                     {selectedRoom.description && (
-                      <p className="text-sm text-amber-700 dark:text-amber-300 mb-3">
+                      <p className="text-sm text-muted-foreground mb-3">
                         {selectedRoom.description}
                       </p>
                     )}
@@ -781,7 +779,7 @@ export function Dashboard() {
                         return (
                           <div
                             key={agentId}
-                            className="flex items-center justify-between p-2 bg-gray-50 dark:bg-gray-800 rounded text-sm"
+                            className="flex items-center justify-between p-2 bg-muted/60 rounded text-sm"
                           >
                             <span>{agent.display_name}</span>
                             <div className="flex items-center gap-2">
@@ -814,13 +812,13 @@ export function Dashboard() {
                           {roomTeams.map((team) => (
                             <div
                               key={team.id}
-                              className="p-2 bg-purple-50 dark:bg-purple-950 rounded text-sm"
+                              className="p-2 bg-secondary/70 rounded text-sm"
                             >
                               <div className="font-medium flex items-center gap-1">
                                 <Users className="w-4 h-4" />{" "}
                                 {team.display_name}
                               </div>
-                              <div className="text-xs text-amber-700 dark:text-amber-300">
+                              <div className="text-xs text-muted-foreground">
                                 {team.mode} mode •{" "}
                                 {pluralize(team.agents.length, "member")}
                               </div>
@@ -837,7 +835,7 @@ export function Dashboard() {
                     <h3 className="font-semibold text-lg mb-2">
                       {selectedAgent.display_name}
                     </h3>
-                    <p className="text-sm text-amber-700 dark:text-amber-300 mb-3">
+                    <p className="text-sm text-muted-foreground mb-3">
                       {selectedAgent.role}
                     </p>
                   </div>
@@ -911,7 +909,7 @@ export function Dashboard() {
                   })()}
                 </div>
               ) : (
-                <div className="text-center text-amber-600 dark:text-amber-400 dark:text-gray-400 mt-8">
+                <div className="text-center text-muted-foreground mt-8">
                   <p>Select a room or agent to see details</p>
                 </div>
               )}

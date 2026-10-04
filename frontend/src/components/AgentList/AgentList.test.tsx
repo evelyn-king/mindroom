@@ -65,7 +65,7 @@ describe("AgentList", () => {
     const selectedAgent = screen
       .getByText("Test Agent 1")
       .closest('div[role="button"]');
-    expect(selectedAgent).toHaveClass("ring-2", "ring-orange-500");
+    expect(selectedAgent).toHaveClass("ring-2", "ring-primary");
   });
 
   it("should call selectAgent when clicking an agent", () => {

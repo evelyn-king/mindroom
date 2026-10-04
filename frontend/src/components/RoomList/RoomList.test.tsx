@@ -100,7 +100,7 @@ describe("RoomList", () => {
     render(<RoomList />);
 
     const lobbyCard = screen.getByText("Lobby").closest(".cursor-pointer");
-    expect(lobbyCard).toHaveClass("ring-2", "ring-orange-500");
+    expect(lobbyCard).toHaveClass("ring-2", "ring-primary");
   });
 
   it("shows create room form when Add button is clicked", () => {

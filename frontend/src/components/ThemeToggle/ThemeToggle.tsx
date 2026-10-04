@@ -1,11 +1,19 @@
-import { Moon, Sun, Monitor } from "lucide-react";
-import { useTheme } from "@/contexts/ThemeContext";
+import { Monitor, Moon, Palette, Sun } from "lucide-react";
+import {
+  isPaletteTheme,
+  isTheme,
+  THEME_OPTIONS,
+  useTheme,
+} from "@/contexts/ThemeContext";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
@@ -13,8 +21,37 @@ interface ThemeToggleProps {
   className?: string;
 }
 
+const standardThemes = THEME_OPTIONS.filter(
+  ({ swatch }) => swatch === undefined,
+);
+const lightPaletteThemes = THEME_OPTIONS.filter(
+  ({ colorScheme, swatch }) => colorScheme === "light" && swatch !== undefined,
+);
+const darkPaletteThemes = THEME_OPTIONS.filter(
+  ({ colorScheme, swatch }) => colorScheme === "dark" && swatch !== undefined,
+);
+
+function PaletteThemeItems({ themes }: { themes: typeof THEME_OPTIONS }) {
+  return themes.map((option) => (
+    <DropdownMenuRadioItem key={option.value} value={option.value}>
+      <span
+        aria-hidden="true"
+        className="mr-2 h-3.5 w-3.5 rounded-full border border-foreground/20"
+        style={{ backgroundColor: option.swatch }}
+      />
+      {option.label}
+    </DropdownMenuRadioItem>
+  ));
+}
+
 export function ThemeToggle({ className }: ThemeToggleProps) {
   const { theme, setTheme, resolvedTheme } = useTheme();
+
+  const handleThemeChange = (value: string) => {
+    if (isTheme(value)) {
+      setTheme(value);
+    }
+  };
 
   return (
     <DropdownMenu>
@@ -24,39 +61,43 @@ export function ThemeToggle({ className }: ThemeToggleProps) {
           size="icon"
           className={cn("h-9 w-9", className)}
         >
-          {resolvedTheme === "dark" ? (
+          {isPaletteTheme(theme) ? (
+            <Palette className="h-4 w-4" />
+          ) : resolvedTheme === "dark" ? (
             <Moon className="h-4 w-4" />
           ) : (
             <Sun className="h-4 w-4" />
           )}
-          <span className="sr-only">Toggle theme</span>
+          <span className="sr-only">Change theme</span>
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuItem
-          onClick={() => setTheme("light")}
-          className="flex items-center gap-2"
-        >
-          <Sun className="h-4 w-4" />
-          Light
-          {theme === "light" && <span className="ml-auto">✓</span>}
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onClick={() => setTheme("dark")}
-          className="flex items-center gap-2"
-        >
-          <Moon className="h-4 w-4" />
-          Dark
-          {theme === "dark" && <span className="ml-auto">✓</span>}
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onClick={() => setTheme("system")}
-          className="flex items-center gap-2"
-        >
-          <Monitor className="h-4 w-4" />
-          System
-          {theme === "system" && <span className="ml-auto">✓</span>}
-        </DropdownMenuItem>
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuRadioGroup value={theme} onValueChange={handleThemeChange}>
+          {standardThemes.map((option) => {
+            const Icon =
+              option.value === "light"
+                ? Sun
+                : option.value === "dark"
+                  ? Moon
+                  : Monitor;
+            return (
+              <DropdownMenuRadioItem key={option.value} value={option.value}>
+                <Icon className="mr-2 h-4 w-4" />
+                {option.label}
+              </DropdownMenuRadioItem>
+            );
+          })}
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs text-muted-foreground">
+            Light palettes
+          </DropdownMenuLabel>
+          <PaletteThemeItems themes={lightPaletteThemes} />
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs text-muted-foreground">
+            Dark palettes
+          </DropdownMenuLabel>
+          <PaletteThemeItems themes={darkPaletteThemes} />
+        </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );

@@ -70,44 +70,44 @@ export function NetworkGraph({
       <div className="grid grid-cols-3 gap-4 h-full">
         {/* Left: System Stats */}
         <div className="space-y-4">
-          <div className="text-center p-4 bg-amber-50 dark:bg-amber-900/30 rounded-lg">
+          <div className="text-center p-4 bg-secondary/45 border border-border rounded-lg">
             <div className="flex justify-center mb-2">
-              <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/30">
-                <Bot className="w-5 h-5 text-amber-700 dark:text-amber-300" />
+              <div className="p-2 rounded-lg bg-primary/10">
+                <Bot className="w-5 h-5 text-primary" />
               </div>
             </div>
-            <div className="text-2xl font-bold text-amber-900 dark:text-amber-100">
+            <div className="text-2xl font-bold text-foreground">
               {agents.length}
             </div>
-            <div className="text-sm text-amber-700 dark:text-amber-300">
+            <div className="text-sm text-muted-foreground">
               Agents
             </div>
           </div>
 
-          <div className="text-center p-4 bg-amber-50 dark:bg-amber-900/30 rounded-lg">
+          <div className="text-center p-4 bg-secondary/45 border border-border rounded-lg">
             <div className="flex justify-center mb-2">
-              <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/30">
-                <Home className="w-5 h-5 text-amber-700 dark:text-amber-300" />
+              <div className="p-2 rounded-lg bg-primary/10">
+                <Home className="w-5 h-5 text-primary" />
               </div>
             </div>
-            <div className="text-2xl font-bold text-amber-900 dark:text-amber-100">
+            <div className="text-2xl font-bold text-foreground">
               {rooms.length}
             </div>
-            <div className="text-sm text-amber-700 dark:text-amber-300">
+            <div className="text-sm text-muted-foreground">
               Rooms
             </div>
           </div>
 
-          <div className="text-center p-4 bg-amber-50 dark:bg-amber-900/30 rounded-lg">
+          <div className="text-center p-4 bg-secondary/45 border border-border rounded-lg">
             <div className="flex justify-center mb-2">
-              <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/30">
-                <Users className="w-5 h-5 text-amber-700 dark:text-amber-300" />
+              <div className="p-2 rounded-lg bg-primary/10">
+                <Users className="w-5 h-5 text-primary" />
               </div>
             </div>
-            <div className="text-2xl font-bold text-amber-900 dark:text-amber-100">
+            <div className="text-2xl font-bold text-foreground">
               {teams.length}
             </div>
-            <div className="text-sm text-amber-700 dark:text-amber-300">
+            <div className="text-sm text-muted-foreground">
               Teams
             </div>
           </div>
@@ -115,17 +115,17 @@ export function NetworkGraph({
 
         {/* Center: Key Insights */}
         <div className="space-y-4">
-          <div className="p-4 bg-amber-50 dark:bg-amber-900/30 rounded-lg">
+          <div className="p-4 bg-secondary/45 border border-border rounded-lg">
             <div className="text-center mb-3">
               <div className="flex justify-center mb-2">
-                <div className="p-2 rounded-lg bg-amber-100 dark:bg-amber-900/30">
-                  <Link className="w-5 h-5 text-amber-700 dark:text-amber-300" />
+                <div className="p-2 rounded-lg bg-primary/10">
+                  <Link className="w-5 h-5 text-primary" />
                 </div>
               </div>
-              <div className="text-2xl font-bold text-amber-900 dark:text-amber-100">
+              <div className="text-2xl font-bold text-foreground">
                 {totalConnections}
               </div>
-              <div className="text-sm text-amber-700 dark:text-amber-300">
+              <div className="text-sm text-muted-foreground">
                 Total Connections
               </div>
             </div>
@@ -138,19 +138,19 @@ export function NetworkGraph({
                 "card",
               )} ${
                 selectedRoomId !== mostConnectedRoom.room.id
-                  ? "bg-amber-50 dark:bg-amber-900/30"
+                  ? "bg-secondary/45 border border-border"
                   : ""
               }`}
               onClick={() => onSelectRoom(mostConnectedRoom.room.id)}
             >
               <div className="text-center">
-                <div className="text-sm mb-2 flex items-center justify-center gap-1 text-amber-700 dark:text-amber-300">
+                <div className="text-sm mb-2 flex items-center justify-center gap-1 text-primary">
                   <Trophy className="w-4 h-4" /> Most Connected Room
                 </div>
-                <div className="font-semibold text-amber-900 dark:text-amber-100">
+                <div className="font-semibold text-foreground">
                   {mostConnectedRoom.room.display_name}
                 </div>
-                <div className="text-sm text-amber-700 dark:text-amber-300">
+                <div className="text-sm text-muted-foreground">
                   {mostConnectedRoom.connections} agents
                 </div>
               </div>
@@ -164,19 +164,19 @@ export function NetworkGraph({
                 "card",
               )} ${
                 selectedAgentId !== mostActiveAgent.id
-                  ? "bg-amber-50 dark:bg-amber-900/30"
+                  ? "bg-secondary/45 border border-border"
                   : ""
               }`}
               onClick={() => onSelectAgent(mostActiveAgent.id)}
             >
               <div className="text-center">
-                <div className="text-sm mb-2 flex items-center justify-center gap-1 text-amber-700 dark:text-amber-300">
+                <div className="text-sm mb-2 flex items-center justify-center gap-1 text-primary">
                   <Zap className="w-4 h-4" /> Most Active Agent
                 </div>
-                <div className="font-semibold text-amber-900 dark:text-amber-100">
+                <div className="font-semibold text-foreground">
                   {mostActiveAgent.display_name}
                 </div>
-                <div className="text-sm text-amber-700 dark:text-amber-300">
+                <div className="text-sm text-muted-foreground">
                   {pluralize(mostActiveAgent.tools.length, "tool")}
                 </div>
               </div>
@@ -186,33 +186,33 @@ export function NetworkGraph({
 
         {/* Right: Relationships */}
         <div className="space-y-4">
-          <div className="p-4 bg-amber-50 dark:bg-amber-900/30 rounded-lg">
-            <h4 className="font-semibold mb-3 text-center flex items-center justify-center gap-1 text-amber-900 dark:text-amber-100">
-              <BarChart3 className="w-4 h-4 text-amber-700 dark:text-amber-300" />{" "}
+          <div className="p-4 bg-secondary/45 border border-border rounded-lg">
+            <h4 className="font-semibold mb-3 text-center flex items-center justify-center gap-1 text-foreground">
+              <BarChart3 className="w-4 h-4 text-primary" />{" "}
               System Metrics
             </h4>
             <div className="space-y-3 text-sm">
               <div className="flex justify-between">
-                <span className="text-amber-700 dark:text-amber-300">
+                <span className="text-muted-foreground">
                   Avg. Tools/Agent:
                 </span>
-                <span className="font-semibold text-amber-900 dark:text-amber-100">
+                <span className="font-semibold text-foreground">
                   {averageToolsPerAgent.toFixed(1)}
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-amber-700 dark:text-amber-300">
+                <span className="text-muted-foreground">
                   Team Members:
                 </span>
-                <span className="font-semibold text-amber-900 dark:text-amber-100">
+                <span className="font-semibold text-foreground">
                   {teamMembership}
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-amber-700 dark:text-amber-300">
+                <span className="text-muted-foreground">
                   Avg. Agents/Room:
                 </span>
-                <span className="font-semibold text-amber-900 dark:text-amber-100">
+                <span className="font-semibold text-foreground">
                   {rooms.length > 0
                     ? (totalConnections / rooms.length).toFixed(1)
                     : "0"}
@@ -221,14 +221,14 @@ export function NetworkGraph({
             </div>
           </div>
 
-          <div className="p-4 bg-amber-50 dark:bg-amber-900/30 rounded-lg">
-            <h4 className="font-semibold mb-3 text-center text-amber-900 dark:text-amber-100 flex items-center justify-center gap-1">
-              <Activity className="w-4 h-4 text-amber-700 dark:text-amber-300" />{" "}
+          <div className="p-4 bg-secondary/45 border border-border rounded-lg">
+            <h4 className="font-semibold mb-3 text-center text-foreground flex items-center justify-center gap-1">
+              <Activity className="w-4 h-4 text-primary" />{" "}
               Quick Actions
             </h4>
             <div className="space-y-2 text-sm">
               <button
-                className="w-full p-2 text-left rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors text-amber-700 dark:text-amber-300 flex items-center"
+                className="w-full p-2 text-left rounded hover:bg-accent transition-colors text-primary flex items-center"
                 onClick={() => {
                   onSelectAgent(null);
                   onSelectRoom(null);
@@ -236,7 +236,7 @@ export function NetworkGraph({
               >
                 <X className="w-4 h-4 mr-2" /> Clear Selection
               </button>
-              <div className="text-xs text-amber-600 dark:text-amber-400 text-center mt-3">
+              <div className="text-xs text-muted-foreground text-center mt-3">
                 Click items above to explore relationships
               </div>
             </div>

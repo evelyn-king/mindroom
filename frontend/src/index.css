@@ -1,50 +1,59 @@
 @import "./styles/tokens.css";
 @import "./styles/animations.css";
+@import "./styles/themes.css";
 @import "tailwindcss";
 @config "../tailwind.config.js";
 
 @layer utilities {
   .glass {
-    @apply backdrop-blur-xl bg-white/70 border border-white/20;
+    @apply backdrop-blur-xl border;
+    background-color: hsl(var(--card) / 0.7);
+    border-color: hsl(var(--foreground) / 0.12);
   }
   .glass-subtle {
-    @apply backdrop-blur-md bg-white/50 border border-white/10;
+    @apply backdrop-blur-md border;
+    background-color: hsl(var(--card) / 0.5);
+    border-color: hsl(var(--foreground) / 0.08);
   }
   .glass-card {
-    @apply backdrop-blur-xl bg-white/60 border border-white/20 shadow-xl;
+    @apply backdrop-blur-xl border shadow-xl;
+    background-color: hsl(var(--card) / 0.6);
+    border-color: hsl(var(--foreground) / 0.12);
   }
-  .dark .glass {
-    @apply bg-stone-900/70 border-white/10;
+  .app-background {
+    background-color: hsl(var(--background));
+    background-image: linear-gradient(
+      to bottom right,
+      hsl(var(--theme-gradient-from)),
+      hsl(var(--theme-gradient-via) / 0.85),
+      hsl(var(--theme-gradient-to) / 0.75)
+    );
   }
-  .dark .glass-subtle {
-    @apply bg-stone-900/50 border-white/5;
-  }
-  .dark .glass-card {
-    @apply bg-stone-900/60 border-white/10;
+  .app-background-overlay {
+    background-image: linear-gradient(
+      to top left,
+      hsl(var(--theme-overlay-from) / 0.3),
+      transparent,
+      hsl(var(--theme-overlay-to) / 0.2)
+    );
   }
   .gradient-mesh {
     background-image:
       radial-gradient(
         at 27% 37%,
-        hsla(35, 90%, 48%, 0.25) 0px,
-        transparent 50%
-      ),
-      radial-gradient(at 97% 21%, hsla(30, 50%, 60%, 0.2) 0px, transparent 50%),
-      radial-gradient(at 52% 99%, hsla(35, 90%, 48%, 0.15) 0px, transparent 50%);
-  }
-  .gradient-mesh-dark {
-    background-image:
-      radial-gradient(
-        at 27% 37%,
-        hsla(35, 90%, 48%, 0.15) 0px,
+        hsl(var(--theme-mesh-primary) / 0.2) 0px,
         transparent 50%
       ),
       radial-gradient(
         at 97% 21%,
-        hsla(30, 50%, 60%, 0.12) 0px,
+        hsl(var(--theme-mesh-secondary) / 0.16) 0px,
         transparent 50%
       ),
-      radial-gradient(at 52% 99%, hsla(35, 90%, 48%, 0.1) 0px, transparent 50%);
+      radial-gradient(
+        at 52% 99%,
+        hsl(var(--theme-mesh-tertiary) / 0.13) 0px,
+        transparent 50%
+      );
   }
 }
 
@@ -63,13 +72,21 @@
     --secondary-foreground: 25 25% 15%;
     --muted: 30 10% 88%; /* Muted warm gray */
     --muted-foreground: 25 15% 40%;
-    --accent: 35 90% 48%; /* Same as primary for consistency */
-    --accent-foreground: 30 20% 98%;
+    --accent: 30 15% 92%;
+    --accent-foreground: 25 25% 15%;
     --destructive: 0 72% 51%; /* Warm red */
     --destructive-foreground: 30 20% 98%;
     --border: 30 15% 90%; /* Subtle warm gray border */
     --input: 30 15% 90%;
     --ring: 35 90% 48%;
+    --theme-gradient-from: 48 100% 96%;
+    --theme-gradient-via: 33 100% 96%;
+    --theme-gradient-to: 55 92% 95%;
+    --theme-overlay-from: 24 95% 90%;
+    --theme-overlay-to: 48 96% 89%;
+    --theme-mesh-primary: 35 90% 48%;
+    --theme-mesh-secondary: 30 50% 60%;
+    --theme-mesh-tertiary: 35 90% 48%;
     --radius: 0.5rem;
   }
 
@@ -87,14 +104,23 @@
     --secondary-foreground: 30 15% 88%;
     --muted: 25 8% 25%; /* Muted dark warm gray */
     --muted-foreground: 30 10% 65%;
-    --accent: 35 90% 48%; /* Same as primary for consistency */
-    --accent-foreground: 25 15% 10%;
+    --accent: 25 10% 20%;
+    --accent-foreground: 30 15% 88%;
     --destructive: 0 62% 45%; /* Warm red for dark mode */
     --destructive-foreground: 30 15% 88%;
     --border: 25 10% 22%; /* Subtle dark warm gray border */
     --input: 25 10% 22%;
     --ring: 35 90% 48%;
+    --theme-gradient-from: 24 10% 4%;
+    --theme-gradient-via: 25 10% 10%;
+    --theme-gradient-to: 25 30% 10%;
+    --theme-overlay-from: 35 90% 30%;
+    --theme-overlay-to: 24 80% 25%;
+    --theme-mesh-primary: 35 90% 48%;
+    --theme-mesh-secondary: 30 50% 60%;
+    --theme-mesh-tertiary: 35 90% 48%;
   }
+
 }
 
 @layer base {
@@ -142,31 +168,20 @@
   }
 
   ::-webkit-scrollbar-thumb {
-    @apply bg-gray-300/50 rounded-full;
+    @apply rounded-full;
+    background-color: hsl(var(--muted-foreground) / 0.5);
     border: 2px solid transparent;
     background-clip: padding-box;
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    @apply bg-gray-400/70;
-  }
-
-  .dark ::-webkit-scrollbar-thumb {
-    @apply bg-stone-700/50;
-  }
-
-  .dark ::-webkit-scrollbar-thumb:hover {
-    @apply bg-stone-600/70;
+    background-color: hsl(var(--foreground) / 0.55);
   }
 
   /* Firefox scrollbar styling */
   * {
     scrollbar-width: thin;
-    scrollbar-color: rgba(156, 163, 175, 0.5) transparent;
-  }
-
-  .dark * {
-    scrollbar-color: rgba(68, 64, 60, 0.5) transparent;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.5) transparent;
   }
 
   /* Mobile optimizations */

@@ -60,9 +60,9 @@ export function FilterSelector({
     <div
       className={cn(
         "inline-flex gap-1 rounded-lg p-1.5",
-        "bg-white dark:bg-stone-900/70",
+        "bg-card/75",
         "backdrop-blur-xl",
-        "border border-gray-200 dark:border-white/10",
+        "border border-border/70",
         className,
       )}
     >
@@ -72,17 +72,17 @@ export function FilterSelector({
           onClick={() => handleClick(option.value)}
           className={cn(
             "relative rounded-md font-medium transition-all duration-200",
-            "hover:bg-gray-100 dark:hover:bg-white/5",
+            "hover:bg-accent/70 hover:text-accent-foreground",
             sizeClasses[size],
             isSelected(option.value) && [
-              "bg-amber-500/20 dark:bg-amber-500/20",
-              "text-amber-900 dark:text-amber-200",
+              "bg-primary/20",
+              "text-primary",
               "shadow-sm",
-              "hover:bg-amber-500/30 dark:hover:bg-amber-500/30",
+              "hover:bg-primary/30 hover:text-primary",
             ],
             !isSelected(option.value) && [
-              "text-gray-600 dark:text-gray-400",
-              "hover:text-gray-900 dark:hover:text-gray-200",
+              "text-muted-foreground",
+              "hover:text-foreground",
             ],
           )}
         >
@@ -93,8 +93,7 @@ export function FilterSelector({
                   <Filter
                     className={cn(
                       "w-3.5 h-3.5",
-                      isSelected(option.value) &&
-                        "text-amber-600 dark:text-amber-400",
+                      isSelected(option.value) && "text-primary",
                     )}
                   />
                 )}
@@ -106,8 +105,8 @@ export function FilterSelector({
                   "min-w-[1.25rem] h-5 px-1 rounded-full",
                   "text-xs font-medium",
                   isSelected(option.value)
-                    ? "bg-amber-600/30 dark:bg-amber-400/30 text-amber-900 dark:text-amber-200"
-                    : "bg-gray-600/20 dark:bg-gray-600/30 text-gray-700 dark:text-gray-400",
+                    ? "bg-primary/20 text-primary"
+                    : "bg-muted text-muted-foreground",
                 )}
               >
                 {option.count}
